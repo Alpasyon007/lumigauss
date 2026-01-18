@@ -36,15 +36,15 @@ def update_lambdas(iteration, opt):
         env_loss_lambda = opt.env_loss_lambda
 
     # For small number of iterations, tune only SH_gauss
-    elif opt.warmup <= iteration <= opt.start_shadowed:  
+    elif opt.warmup <= iteration <= opt.start_shadowed:
         shadowed_image_loss_lambda = 0.0
         unshadowed_image_loss_lambda = 0.0
         consistency_loss_lambda = opt.consistency_loss_lambda_init
         sh_gauss_lambda = opt.gauss_loss_lambda
         shadow_loss_lambda = 0.0
         env_loss_lambda = 0.0
-        
-        #Turn off 2DGS regularization while tuning SH_gauss 
+
+        #Turn off 2DGS regularization while tuning SH_gauss
         lambda_normal = 0.0
         lambda_dist = 0.0
 
@@ -57,8 +57,8 @@ def update_lambdas(iteration, opt):
         env_loss_lambda = opt.env_loss_lambda
     else:
         raise ValueError("Iteration doesn't fit into any defined conditions - verify logic.")
-    
-    
+
+
 
     return {
         "shadowed_image_loss_lambda": shadowed_image_loss_lambda,
@@ -72,14 +72,14 @@ def update_lambdas(iteration, opt):
     }
 
 
-def prepare_output_and_logger(args):    
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-        
+
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
@@ -107,7 +107,8 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        test_cameras = scene.getTestCameras()
+        validation_configs = ({'name': 'test', 'cameras' : test_cameras[:5] if len(test_cameras) > 5 else test_cameras},
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
@@ -115,39 +116,98 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    
+
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    
+
                     #render albedo
                     rgb_precomp = scene.gaussians.get_albedo
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
                     image_albedo = torch.clamp(render_pkg["render"], 0.0, 1.0)
-                    
+
                     #get normals in world space
                     quaternions = scene.gaussians.get_rotation
                     scales = scene.gaussians.get_scaling
                     normal_vectors, multiplier = compute_normal_world_space(
                         quaternions, scales, viewpoint.world_view_transform, scene.gaussians.get_xyz)
 
-                    if config["name"]=="train":  
-                        # get env sh
+                    # Initialize variables
+                    image_shadowed = None
+                    image_unshadowed = None
+                    env_sh_learned = None
+
+                    if scene.gaussians.no_sh_env:
+                        # Directional sun lighting mode - no SH environment
+                        if config["name"] == "train":
+                            emb_idx = appearance_lut[viewpoint.image_name]
+                        else:
+                            # For test, use first training image's lighting
+                            emb_idx = list(appearance_lut.values())[0] if appearance_lut else 0
+
+                        # render shadowed with directional lighting
+                        rgb_precomp, _ = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, multiplier=multiplier, shadowed=True)
+                        render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
+                        image_shadowed = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
+
+                        # render unshadowed with directional lighting
+                        rgb_precomp, _ = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, multiplier=None, shadowed=False)
+                        render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
+                        image_unshadowed = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
+
+                        # No env_sh_learned visualization for directional mode
+                        env_sh_learned = None
+
+                    elif config["name"]=="train":
+                        # get env sh from this view's appearance
                         emb_idx = appearance_lut[viewpoint.image_name]
                         env_sh = scene.gaussians.compute_env_sh(emb_idx)
                         # vis env map
                         env_sh_learned = np.clip(shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy(), width=300), 0, None)
                         env_sh_learned = torch.clamp(torch.tensor(env_sh_learned**(1/ 2.2)).permute(2,0,1), 0.0, 1.0)
-                        
+
                         # render shadowed
                         rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
                         render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
                         image_shadowed = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
-                        
+
                         #render unshadowed
                         rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
                         render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
                         image_unshadowed = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
-                        
-                        # Appearance transfer - visualize render with lightning from other training image 
+                    else:
+                        # For test images, use first training image's environment
+                        if appearance_lut:
+                            first_emb_idx = list(appearance_lut.values())[0]
+                            env_sh = scene.gaussians.compute_env_sh(first_emb_idx)
+                        else:
+                            # Fallback to hardcoded environment if no appearance_lut
+                            env_sh = torch.tensor(np.array(
+                                    [[2.5, 2.389, 2.562],
+                                    [0.545, 0.436, 0.373],
+                                    [1.46, 1.724, 2.118],
+                                    [0.771, 0.623, 0.53],
+                                    [0.407, 0.355, 0.313],
+                                    [0.667, 0.516, 0.42],
+                                    [0.38, 0.314, 0.399],
+                                    [0.817, 0.637, 0.517],
+                                    [0.193, 0.151, 0.148]]),
+                                    dtype=torch.float32, device=scene.gaussians._albedo.device).T
+
+                        env_sh_learned = np.clip(shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy(), width=300), 0, None)
+                        env_sh_learned = torch.clamp(torch.tensor(env_sh_learned**(1/ 2.2)).permute(2,0,1), 0.0, 1.0)
+
+                        # render shadowed
+                        rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
+                        render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
+                        image_shadowed = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
+
+                        #render unshadowed
+                        rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
+                        render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
+                        image_unshadowed = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
+
+                    if config["name"]=="train" and not scene.gaussians.no_sh_env:
+                        # Appearance transfer - visualize render with lightning from other training image
+                        # (Not available for no_sh_env mode)
 
                         # BIG TODO remove hardcoded idx! For now, please do it yourself if needed
                         if "trevi" in source_path:
@@ -160,7 +220,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             emb_idx = appearance_lut["12-04_18_00_DSC_0483.jpg"]
                         else:
                             raise("Other datasets than trevi, lk2, lwp, st not implemented. Moreover, viewpoints are hardcoded. Please, for now, fix it by yourself.")
-                        
+
                         env_sh = scene.gaussians.compute_env_sh(emb_idx)
                         env_sh_transfer = shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy(), width=300)
                         env_sh_transfer = (torch.clamp(torch.tensor(env_sh_transfer** (1 / 2.2)).permute(2,0,1), 0.0, 1.0))
@@ -169,14 +229,14 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
                         render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
                         image_shadowed_transfer = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
-                        
+
                         #render unshadowed
                         rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
                         render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
                         image_unshadowed_transfer = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
 
 
-                        # Relightning - visualize render with lightning from external env map 
+                        # Relightning - visualize render with lightning from external env map
 
                         env_sh=torch.tensor(np.array(
                                 [[2.5, 2.389, 2.562],
@@ -189,7 +249,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                                 [0.817, 0.637, 0.517],
                                 [0.193, 0.151, 0.148]]),
                                 dtype=torch.float32, device=scene.gaussians._albedo.device).T
-                        
+
                         env_sh_external = shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy(), width=300)
                         env_sh_external = (torch.clamp(torch.tensor(env_sh_external** (1 / 2.2)).permute(2,0,1), 0.0, 1.0))
 
@@ -197,59 +257,54 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
                         render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
                         image_shadowed_external = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
-                        
+
                         #render unshadowed
                         rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
                         render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
                         image_unshadowed_external = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
 
 
-                    if tb_writer and (config["name"]=="train" or (idx < 5)):
+                    if tb_writer:
                         from utils.general_utils import colormap
                         depth = render_pkg["surf_depth"]
                         norm = depth.max()
                         depth = depth / norm
                         depth = colormap(depth.cpu().numpy()[0], cmap='turbo')
-                        tb_writer.add_images(config['name'] + "_view_{}/depth".format(viewpoint.image_name), depth[None], global_step=iteration)
-                        tb_writer.add_images(config['name'] + "_view_{}/albedo".format(viewpoint.image_name), image_albedo[None], global_step=iteration)
-                        if config["name"]=="train":
-                            tb_writer.add_images(config['name'] + "_view_{}/recreate_unshadowed".format(viewpoint.image_name), image_unshadowed[None], global_step=iteration)
-                            tb_writer.add_images(config['name'] + "_view_{}/recreate_shadowed".format(viewpoint.image_name), image_shadowed[None], global_step=iteration)
-                            tb_writer.add_images(config['name'] + "_view_{}/env_recreate".format(viewpoint.image_name), env_sh_learned[None], global_step=iteration)
-                            
-                            tb_writer.add_images(config['name'] + "_view_{}/transfer_unshadowed".format(viewpoint.image_name), image_unshadowed_transfer[None], global_step=iteration)
-                            tb_writer.add_images(config['name'] + "_view_{}/transfer_shadowed".format(viewpoint.image_name), image_shadowed_transfer[None], global_step=iteration)
-                            tb_writer.add_images(config['name'] + "_view_{}/env_transfer".format(viewpoint.image_name), env_sh_transfer[None], global_step=iteration)
 
-                            
-                            tb_writer.add_images(config['name'] + "_view_{}/relight_unshadowed".format(viewpoint.image_name), image_unshadowed_external[None], global_step=iteration)
-                            tb_writer.add_images(config['name'] + "_view_{}/relight_shadowed".format(viewpoint.image_name), image_shadowed_external[None], global_step=iteration)
-                            tb_writer.add_images(config['name'] + "_view_{}/env_relight".format(viewpoint.image_name), env_sh_external[None], global_step=iteration)
+                        # Use view tag for proper grouping in TensorBoard
+                        view_tag = "{}_view_{}".format(config['name'], viewpoint.image_name)
 
-                            
+                        tb_writer.add_images(view_tag + "/01_ground_truth", gt_image[None], global_step=iteration)
+                        tb_writer.add_images(view_tag + "/02_albedo", image_albedo[None], global_step=iteration)
+                        tb_writer.add_images(view_tag + "/03_recreate_unshadowed", image_unshadowed[None], global_step=iteration)
+                        tb_writer.add_images(view_tag + "/04_recreate_shadowed", image_shadowed[None], global_step=iteration)
+                        if env_sh_learned is not None:
+                            tb_writer.add_images(view_tag + "/05_env_recreate", env_sh_learned[None], global_step=iteration)
+                        tb_writer.add_images(view_tag + "/06_depth", depth[None], global_step=iteration)
+
+                        if config["name"]=="train" and not scene.gaussians.no_sh_env:
+                            tb_writer.add_images(view_tag + "/07_transfer_unshadowed", image_unshadowed_transfer[None], global_step=iteration)
+                            tb_writer.add_images(view_tag + "/08_transfer_shadowed", image_shadowed_transfer[None], global_step=iteration)
+                            tb_writer.add_images(view_tag + "/09_env_transfer", env_sh_transfer[None], global_step=iteration)
+                            tb_writer.add_images(view_tag + "/10_relight_unshadowed", image_unshadowed_external[None], global_step=iteration)
+                            tb_writer.add_images(view_tag + "/11_relight_shadowed", image_shadowed_external[None], global_step=iteration)
+                            tb_writer.add_images(view_tag + "/12_env_relight", env_sh_external[None], global_step=iteration)
 
                         try:
                             rend_alpha = render_pkg['rend_alpha']
-                            
-                            #rend_normal = render_pkg["rend_normal"] * 0.5 + 0.5
-                            #check ours normals - should be exactly the same
                             normals_precomp = (normal_vectors*0.5 + 0.5)
                             render_pkg = render(viewpoint, scene.gaussians,*renderArgs, override_color=normals_precomp)
                             rend_normal = render_pkg["render"]
-                            ##
                             surf_normal = render_pkg["surf_normal"] * 0.5 + 0.5
-                            tb_writer.add_images(config['name'] + "_view_{}/rend_normal".format(viewpoint.image_name), rend_normal[None], global_step=iteration)
-                            tb_writer.add_images(config['name'] + "_view_{}/surf_normal".format(viewpoint.image_name), surf_normal[None], global_step=iteration)
-                            tb_writer.add_images(config['name'] + "_view_{}/rend_alpha".format(viewpoint.image_name), rend_alpha[None], global_step=iteration)
+                            tb_writer.add_images(view_tag + "/13_rend_normal", rend_normal[None], global_step=iteration)
+                            tb_writer.add_images(view_tag + "/14_surf_normal", surf_normal[None], global_step=iteration)
+                            tb_writer.add_images(view_tag + "/15_rend_alpha", rend_alpha[None], global_step=iteration)
 
                             rend_dist = render_pkg["rend_dist"]
                             rend_dist = colormap(rend_dist.cpu().numpy()[0])
-                            tb_writer.add_images(config['name'] + "_view_{}/rend_dist".format(viewpoint.image_name), rend_dist[None], global_step=iteration)
+                            tb_writer.add_images(view_tag + "/16_rend_dist", rend_dist[None], global_step=iteration)
                         except:
                             pass
-
-                        if iteration in testing_iterations:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
 
                     l1_test += l1_loss(image_albedo, gt_image).mean().double()
                     psnr_test += psnr(image_albedo, gt_image).mean().double()

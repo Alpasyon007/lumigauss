@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -24,6 +24,7 @@ import imageio
 from utils.sh_vis_utils import shReconstructDiffuseMap, applyWindowing
 from utils.sh_rotate_utils import Rotation
 from utils.normal_utils import compute_normal_world_space
+from utils.sun_utils import load_sun_data
 import cv2
 
 
@@ -43,11 +44,11 @@ def rgb2greyscale(image):
     return ret_image
 
 def create_video_for_renders(output_path, shadowed_renders, unshadowed_renders, shadows, illumination):
-    
+
     writer = imageio.get_writer(output_path, fps=15)
 
     for i in range(min(len(illumination), len(shadows), len(unshadowed_renders), len(shadowed_renders))):
-        
+
         img_illumination = (np.array(illumination[i]) * 255).clip(0, 255).astype(np.uint8)
         img_shadows = (np.array(shadows[i]) * 255).clip(0, 255).astype(np.uint8)
         img_unshadowed = (np.array(unshadowed_renders[i]) * 255).clip(0, 255).astype(np.uint8)
@@ -84,23 +85,46 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
 
     with torch.no_grad():
         dataset.eval = False
-        gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
+
+        # Load sun data if use_sun is enabled
+        sun_data = None
+        image_names = None
+        if dataset.use_sun:
+            if not dataset.sun_json_path:
+                raise ValueError("--sun_json_path must be provided when --use_sun is enabled")
+            print(f"Loading sun position data from: {dataset.sun_json_path}")
+            sun_data = load_sun_data(dataset.sun_json_path)
+
+            # Get image names from the appearance LUT
+            with open(os.path.join(dataset.model_path, "appearance_lut.json")) as handle:
+                appearance_lut_temp = json.loads(handle.read())
+            # Sort by index to get correct order
+            image_names = [k for k, v in sorted(appearance_lut_temp.items(), key=lambda x: x[1])]
+            print(f"Found {len(image_names)} images for sun model")
+
+            gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
+                                       use_sun=True, sun_data=sun_data, image_names=image_names)
+        else:
+            gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
+
         scene = Scene(dataset, gaussians, load_iteration=iteration)
-            
-        if gaussians.with_mlp:
+
+        if gaussians.use_sun:
+            gaussians.sun_model.eval()
+        elif gaussians.with_mlp:
             gaussians.mlp.eval()
             gaussians.embedding.eval()
-        
+
         with open(os.path.join(dataset.model_path, "appearance_lut.json")) as handle:
             appearance_lut = json.loads(handle.read())
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-       
+
         cameras_tmp = scene.getTrainCameras()
         cameras = [c for c in cameras_tmp if any(n in c.image_name for n in viewpoints)]
         assert len(cameras)>0
-        
+
         # get train + external envmaps
         env_map_list = []
 
@@ -129,7 +153,7 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
             render_path_parent = os.path.join(dataset.model_path, "rotate_env_map", "ours_{}".format(scene.loaded_iter))
             render_path = os.path.join(render_path_parent, f"renders_axis{axis}")
             makedirs(render_path, exist_ok=True)
-                        
+
             for env_sh_idx, env_sh in enumerate(env_map_list):
 
                 rot_envs_list = []
@@ -137,7 +161,7 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
                 renders_shadowed = {i: [] for i in range(len(cameras))}
                 renders_lumi_diff = {i: [] for i in range(len(cameras))}
                 renders_illumination = {i: [] for i in range(len(cameras))}
-                
+
                 for angle in tqdm(interp_angle, desc=f"Rotating envmap {env_sh_idx}"):
                     angle_vec = np.array([0, 0, 0], dtype=np.float32)
                     angle_vec[axis] = angle.item()
@@ -149,34 +173,34 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
                     rot_env_sh_torch=torch.tensor(rot_env_sh.T, dtype=torch.float32).cuda().cuda()
 
                     for render_idx, view in enumerate(cameras):
-                        
+
                         #get normals in world space
                         quaternions = gaussians.get_rotation
                         scales = gaussians.get_scaling
                         normal_vectors, multiplier = compute_normal_world_space(quaternions, scales, view.world_view_transform, gaussians.get_xyz)
-       
+
                         # #albedo
                         # rgb_precomp_alb =gaussians.get_albedo
                         # render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_alb)
                         # albedo = render_pkg["render"]
-                        
+
                         # unshadowed relightning
                         rgb_precomp_unshadowed, lum_unshadowed_precomp =gaussians.compute_gaussian_rgb(rot_env_sh_torch, shadowed=False, normal_vectors=normal_vectors)
                         render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                         rendering = render_pkg["render"]
                         renders_unshadowed[render_idx].append(rendering.permute(1,2,0).cpu().numpy())
-                        
+
                         # unshadowed irradiance
                         lum_unshadowed = render(view, gaussians, pipeline, background, override_color=lum_unshadowed_precomp)["render"]
-                        
+
                         # shadowed relightning
                         rgb_precomp, lum_shadowed_precomp = gaussians.compute_gaussian_rgb(rot_env_sh_torch, multiplier=multiplier)
                         rendering = render(view, gaussians, pipeline, background, override_color=rgb_precomp)["render"]
                         renders_shadowed[render_idx].append(rendering.permute(1,2,0).cpu().numpy())
-                        
+
                         # shadowed irradiance
                         lum_shadowed = render(view, gaussians, pipeline, background, override_color=lum_shadowed_precomp)["render"]
-                        
+
                         # Compute luminance difference
                         luminance_diff = rgb2greyscale((lum_unshadowed - lum_shadowed).unsqueeze(0)).squeeze()
                         luminance_diff = 1 - torch.clamp(luminance_diff, min=0, max=1000)
@@ -193,14 +217,14 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
                 # Create videos
                 output_path = os.path.join(render_path, f'rotate_map{env_sh_idx}.mp4')
                 create_video_for_envmap(output_path, rot_envs_list)
-                
+
                 for idx in range(len(cameras)):
                     output_path = os.path.join(render_path, f'map{env_sh_idx}_campos{idx}.mp4')
-                    create_video_for_renders(output_path, 
+                    create_video_for_renders(output_path,
                                              unshadowed_renders=renders_unshadowed[idx], shadowed_renders=renders_shadowed[idx],
                                              shadows=renders_lumi_diff[idx], illumination=renders_illumination[idx])
-                    
-            
+
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")
@@ -208,9 +232,9 @@ if __name__ == "__main__":
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--envmaps", type=str, required=True, 
+    parser.add_argument("--envmaps", type=str, required=True,
                         help="Path to folder with environment map files (in .txt)")
-    parser.add_argument("--viewpoints", type=str, nargs='+', required=True, 
+    parser.add_argument("--viewpoints", type=str, nargs='+', required=True,
                         help="List of image names (e.g., IMAGE1.JPG IMAGE2.JPG)")
 
 

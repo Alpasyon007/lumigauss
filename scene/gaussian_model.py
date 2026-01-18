@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -22,6 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.mlp import MLP
 from utils.sh_utils import *
+from utils.sun_utils import SunModel, DirectionalSunModel, load_sun_data, get_sun_direction, compute_sun_sh_simple
 from collections import OrderedDict
 class GaussianModel:
 
@@ -31,7 +32,7 @@ class GaussianModel:
             actual_covariance = L @ L.transpose(1, 2)
             symm = strip_symmetric(actual_covariance)
             return symm
-        
+
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
 
@@ -39,20 +40,28 @@ class GaussianModel:
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
         self.rotation_activation = torch.nn.functional.normalize
-        if self.with_mlp:
+
+        if self.no_sh_env:
+            # Explicit directional lighting mode - no SH for environment
+            self.setup_directional_sun_model()
+        elif self.use_sun:
+            self.setup_sun_model()
+        elif self.with_mlp:
             self.setup_mlp()
         else:
             self.setup_env_params()
 
 
-    def __init__(self, sh_degree : int, with_mlp: bool = False, mlp_W=128, mlp_D=4, N_a = 32):
-        
-        # We only implement deg 2 for SH_gauss and SH_env. 
-        # More on environment map degree: https://cseweb.ucsd.edu/~ravir/papers/envmap/envmap.pdf 
+    def __init__(self, sh_degree : int, with_mlp: bool = False, mlp_W=128, mlp_D=4, N_a = 32,
+                 use_sun: bool = False, sun_data: dict = None, image_names: list = None,
+                 no_sh_env: bool = False):
+
+        # We only implement deg 2 for SH_gauss and SH_env.
+        # More on environment map degree: https://cseweb.ucsd.edu/~ravir/papers/envmap/envmap.pdf
         assert sh_degree == 2
 
         self.active_sh_degree = sh_degree
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)
         self._features_dc_positive = torch.empty(0)
         self._features_rest_positive = torch.empty(0)
@@ -72,18 +81,29 @@ class GaussianModel:
         self.mlp_W = mlp_W
         self.mlp_D = mlp_D
         self.N_a = N_a
+
+        # Sun model parameters
+        self.use_sun = use_sun
+        self.sun_data = sun_data
+        self.sun_model = None
+        self.image_names = image_names
+
+        # Explicit directional lighting mode (no SH for environment)
+        self.no_sh_env = no_sh_env
+        self.directional_sun_model = None
+
         self.setup_functions()
 
-        
+
 
 
     def setup_mlp(self):
         N_vocab=1700
         self.embedding = torch.nn.Embedding(N_vocab, self.N_a).cuda()
         self.mlp = MLP(2, self.mlp_W, self.mlp_D, self.N_a).cuda()
-        
+
         self.correct_gaussians_with_mlp = False
-    
+
     def setup_env_params(self):
         # init values from osr
         self.env_params = nn.ParameterDict(OrderedDict(
@@ -101,11 +121,48 @@ class GaussianModel:
                     [-7.2156233e-01, -6.4352357e-01, -3.7317836e-01]
             ],dtype=torch.float32).T
 
-            
-            )) for x in range(1700)])).cuda() 
-        
 
-    def capture(self): #MLP and embedding saved separately. 
+            )) for x in range(1700)])).cuda()
+
+    def setup_sun_model(self):
+        """
+        Initialize the sun model using physical sun positions from metadata.
+
+        The sun model uses fixed sun directions from metadata and learns:
+        - sun_intensity: Per-image sun intensity [n_images, 3] for RGB channels
+        - sky_color: Per-image ambient sky color [n_images, 3] for RGB channels
+        """
+        if self.sun_data is None or self.image_names is None:
+            raise ValueError("sun_data and image_names must be provided when use_sun=True")
+
+        self.sun_model = SunModel(
+            sun_data=self.sun_data,
+            image_names=self.image_names,
+            sh_degree=self.max_sh_degree,
+            device="cuda"
+        )
+
+    def setup_directional_sun_model(self):
+        """
+        Initialize the directional sun model for explicit lighting (no SH).
+
+        This model keeps sun as an explicit directional light for:
+        - Sharp shadow boundaries
+        - Accurate Lambert shading: albedo * sun_intensity * max(0, N·L) * shadow + ambient
+        - No band-limiting artifacts from SH representation
+        """
+        if self.sun_data is None or self.image_names is None:
+            raise ValueError("sun_data and image_names must be provided when no_sh_env=True")
+
+        self.directional_sun_model = DirectionalSunModel(
+            sun_data=self.sun_data,
+            image_names=self.image_names,
+            device="cuda"
+        )
+        print("Initialized DirectionalSunModel for explicit lighting (no SH environment)")
+
+
+    def capture(self): #MLP and embedding saved separately.
         return (
             self.active_sh_degree,
             self._xyz,
@@ -123,22 +180,22 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
-    
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
+        (self.active_sh_degree,
+        self._xyz,
         self._features_dc_positive,
         self._features_rest_positive,
         self._features_dc_negative,
         self._features_rest_negative,
         self._albedo,
-        self._scaling, 
-        self._rotation, 
+        self._scaling,
+        self._rotation,
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self.max_radii2D,
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
+        opt_dict,
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
@@ -148,21 +205,21 @@ class GaussianModel:
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
-    
+
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
-    
+
     @property
     def get_xyz(self):
         return self._xyz
-    
+
     # @property
     def get_features(self, multiplier):
-        """2DGS flips Gaussians to always face the camera by multiplying their normals by 1 or -1. 
+        """2DGS flips Gaussians to always face the camera by multiplying their normals by 1 or -1.
         For each Gaussian, two sets of SH_gauss are kept based on the normal direction:
         one for the default direction and another for the opposite direction."""
-       
+
         features_dc_pos = self._features_dc_positive
         features_rest_pos = self._features_rest_positive
         features_positive = torch.cat((features_dc_pos, features_rest_pos), dim=1)
@@ -174,19 +231,19 @@ class GaussianModel:
         # Select features based on the mask
         features = torch.where(mask.view(-1,1,1), features_positive, features_negative)
         return features
-    
+
     @property
     def get_albedo(self):
         return torch.clamp(SH2RGB(self._albedo), 0.0)
-    
+
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
+
     def compute_embedding(self, emb_idx):
         return self.embedding(torch.full((1,),emb_idx).cuda())
-    
-        
+
+
     def compute_gaussian_rgb(self, sh_scene, shadowed=True, multiplier=None, normal_vectors=None, env_hemisphere_lightning=True):
         #Computation of RGB could be implemented in CUDA. If you need it, please take care of it yourself.
         assert shadowed or (not shadowed and torch.is_tensor(normal_vectors))
@@ -207,16 +264,72 @@ class GaussianModel:
         intensity = intensity_hdr**(1 / 2.2)  # linear to srgb
         rgb = torch.clamp(intensity*albedo, 0.0)
 
-        return rgb, intensity     
-        
+        return rgb, intensity
+
+    def compute_directional_rgb(self, emb_idx, normal_vectors, multiplier=None, shadowed=True):
+        """
+        Compute RGB using explicit directional sun lighting (no SH).
+
+        This implements proper Lambert shading:
+            L = albedo * (sun_intensity * max(0, N·L) * shadow + ambient)
+
+        Args:
+            emb_idx: Image embedding index (for per-image lighting parameters)
+            normal_vectors: Surface normals [N, 3]
+            multiplier: Shadow visibility mask [N, 1] where 1=lit, 0=shadowed
+            shadowed: If True, applies shadow multiplier
+
+        Returns:
+            rgb: Final RGB values [N, 3]
+            intensity: Intensity values [N, 3]
+        """
+        assert self.no_sh_env and self.directional_sun_model is not None, \
+            "compute_directional_rgb requires no_sh_env=True"
+
+        albedo = self.get_albedo  # [N, 3]
+
+        # Get shadow mask
+        shadow_mask = None
+        if shadowed and multiplier is not None:
+            # Convert multiplier to [N, 1] shadow mask
+            if len(multiplier.shape) == 1:
+                shadow_mask = multiplier.unsqueeze(-1).float()  # [N, 1]
+            else:
+                shadow_mask = multiplier.float()
+
+        # Compute directional lighting
+        intensity_hdr, sun_dir, components = self.directional_sun_model(
+            emb_idx, normal_vectors, shadow_mask
+        )
+
+        # Apply gamma correction (linear to sRGB)
+        intensity_hdr = torch.clamp_min(intensity_hdr, 0.00001)
+        intensity = intensity_hdr ** (1 / 2.2)
+
+        # Final RGB = albedo * intensity
+        rgb = torch.clamp(intensity * albedo, 0.0)
+
+        return rgb, intensity
+
 
     def compute_env_sh(self, emb_idx):
-        if self.with_mlp:
+        if self.no_sh_env:
+            raise RuntimeError("compute_env_sh() should not be called when no_sh_env=True. Use compute_directional_rgb() instead.")
+        if self.use_sun:
+            return self.sun_model(emb_idx)
+        elif self.with_mlp:
             return self.mlp(self.compute_embedding(emb_idx))
         else:
             return self.env_params[str(emb_idx)]
-    
-    
+
+    def get_sun_direction(self, emb_idx):
+        """Get the sun direction for a specific image (only available when use_sun=True)."""
+        if self.use_sun:
+            return self.sun_model.get_sun_direction(emb_idx)
+        else:
+            return None
+
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
@@ -253,7 +366,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        
+
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -278,13 +391,30 @@ class GaussianModel:
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
 
-        if self.with_mlp:
+        if self.use_sun:
+            # Sun model: learn sun intensity, sky colors, and residual SH
+            sun_params = [
+                {'params': [self.sun_model.sun_intensity], 'lr': training_args.env_lr * 2.0, "name": "sun_intensity"},
+                {'params': [self.sun_model.sky_zenith], 'lr': training_args.env_lr * 2.0, "name": "sky_zenith"},
+                {'params': [self.sun_model.sky_horizon], 'lr': training_args.env_lr * 2.0, "name": "sky_horizon"},
+            ]
+            if self.sun_model.use_residual:
+                sun_params.append({'params': [self.sun_model.residual_sh], 'lr': training_args.env_lr, "name": "residual_sh"})
+            l_env = sun_params
+        elif self.no_sh_env:
+            # Directional sun model: explicit lighting without SH
+            l_env = [
+                {'params': [self.directional_sun_model.sun_intensity], 'lr': training_args.env_lr * 2.0, "name": "sun_intensity"},
+                {'params': [self.directional_sun_model.ambient_color], 'lr': training_args.env_lr * 2.0, "name": "ambient_color"},
+                {'params': [self.directional_sun_model.shadow_softness], 'lr': training_args.env_lr * 0.5, "name": "shadow_softness"},
+            ]
+        elif self.with_mlp:
             l_env = [{'params': [*self.embedding.parameters()], 'lr': training_args.embedding_lr, "name": "embedding"},
                      {'params': [*self.mlp.parameters()], 'lr': training_args.mlp_lr, "name": "mlp"},
                     ]
         else:
             l_env = [{'params': [*self.env_params.parameters()], 'lr': training_args.env_lr, "name": "env_params_lr"},]
-        
+
         self.optimizer_env = torch.optim.Adam(l_env, lr=0.0, eps=1e-15)
         print('Env optimizer has parameters: ', [p["name"] for p in self.optimizer_env.param_groups])
 
@@ -485,8 +615,8 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc_positive, new_features_rest_positive, 
-                              new_features_dc_negative, new_features_rest_negative, 
+    def densification_postfix(self, new_xyz, new_features_dc_positive, new_features_rest_positive,
+                              new_features_dc_negative, new_features_rest_negative,
                               new_albedo, new_opacities, new_scaling, new_rotation):
         d = {"xyz": new_xyz,
         "f_dc_positive": new_features_dc_positive,
@@ -547,7 +677,7 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc_positive = self._features_dc_positive[selected_pts_mask]
         new_features_rest_positive = self._features_rest_positive[selected_pts_mask]

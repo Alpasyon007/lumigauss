@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -25,7 +25,7 @@ class ParamGroup:
                 shorthand = True
                 key = key[1:]
             t = type(value)
-            value = value if not fill_none else None 
+            value = value if not fill_none else None
             if shorthand:
                 if t == bool:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
@@ -44,7 +44,7 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
-class ModelParams(ParamGroup): 
+class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 2 # degree for SH_gauss and SH_env
         self._source_path = ""
@@ -59,6 +59,11 @@ class ModelParams(ParamGroup):
         self.mlp_W = 64
         self.mlp_D = 3
         self.N_a = 24
+        # Sun position parameters
+        self.use_sun = False  # Enable physical sun position model
+        self.sun_json_path = ""  # Path to JSON file with sun positions per image
+        # Explicit directional lighting (no SH for environment)
+        self.no_sh_env = False  # Use explicit directional sun + ambient instead of SH environment
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -87,11 +92,11 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
-        self.opacity_cull = 0.05 
-        self.lambda_dist = 100 
-        self.lambda_normal = 0.05 
+        self.opacity_cull = 0.05
+        self.lambda_dist = 100
+        self.lambda_normal = 0.05
 
-        self.start_shadowed = 20500 
+        self.start_shadowed = 20500
         self.warmup = 20000
 
         self.start_regularization = 6000
@@ -111,9 +116,9 @@ class OptimizationParams(ParamGroup):
         self.gauss_loss_lambda = 0.001
         self.env_loss_lambda = 0.05
         self.consistency_loss_lambda_init = 1.0
-        self.consistency_loss_lambda_final_ratio = 1.0 
+        self.consistency_loss_lambda_final_ratio = 1.0
         self.shadow_loss_lambda=10.0
- 
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -27,17 +27,19 @@ import importlib
 from utils.sh_rotate_utils import Rotation
 from utils.sh_vis_utils import shReconstructDiffuseMap, applyWindowing
 from utils.normal_utils import compute_normal_world_space
+from utils.sun_utils import load_sun_data
 import imageio.v2 as im
 from skimage.metrics import structural_similarity as ssim_skimage
 from utils.loss_utils import mse2psnr, img2mae, img2mse, img2mse_image
 from utils.sh_vis_utils import getCoefficientsFromImage
 import matplotlib.pyplot as plt
+import json
 
 TINY_NUMBER = 1e-6
 
 
 def process_environment_map_image(img_path, scale_high, threshold):
-    
+
     img = plt.imread(img_path)
     img = torch.from_numpy(img).float() / 255
     img[img > threshold] *= scale_high
@@ -51,10 +53,33 @@ def process_environment_map_image(img_path, scale_high, threshold):
 def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams, opt: OptimizationParams, test_config: str):
 
     dataset.eval = True
-    gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
+
+    # Load sun data if use_sun is enabled
+    sun_data = None
+    image_names = None
+    if dataset.use_sun:
+        if not dataset.sun_json_path:
+            raise ValueError("--sun_json_path must be provided when --use_sun is enabled")
+        print(f"Loading sun position data from: {dataset.sun_json_path}")
+        sun_data = load_sun_data(dataset.sun_json_path)
+
+        # Get image names from the appearance LUT
+        with open(os.path.join(dataset.model_path, "appearance_lut.json")) as handle:
+            appearance_lut_temp = json.loads(handle.read())
+        # Sort by index to get correct order
+        image_names = [k for k, v in sorted(appearance_lut_temp.items(), key=lambda x: x[1])]
+        print(f"Found {len(image_names)} images for sun model")
+
+        gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
+                                   use_sun=True, sun_data=sun_data, image_names=image_names)
+    else:
+        gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
+
     scene = Scene(dataset, gaussians, load_iteration=iteration)
 
-    if gaussians.with_mlp:
+    if gaussians.use_sun:
+        gaussians.sun_model.eval()
+    elif gaussians.with_mlp:
         gaussians.mlp.eval()
         gaussians.embedding.eval()
 
@@ -70,7 +95,7 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
     # read test config
     sys.path.append(test_config)
     config = importlib.import_module("test_config").config
-    
+
     #get test cameras for eval with envmap
     tmp_cameras = scene.getTestCameras()
     test_cameras = [c for c in tmp_cameras if c.image_name in config.keys()]
@@ -92,7 +117,7 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
         scale = image_config["env_map_scaling"]["scale"]
         sun_angle_range = image_config["sun_angles"]
 
-        
+
         # get processed env map
         env_sh_gt = process_environment_map_image(envmap_img_path, scale, threshold)
 
@@ -100,7 +125,7 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
         rgb_precomp_alb =gaussians.get_albedo
         render_pkg = render(viewpoint_cam, gaussians, pipeline, background, override_color=rgb_precomp_alb)
         albedo = render_pkg["render"]
-        
+
         # get gt
         gt_image = viewpoint_cam.original_image.cuda()
         torchvision.utils.save_image(gt_image, os.path.join(gt_path, viewpoint_cam.image_name))
@@ -116,14 +141,14 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
         quaternions = gaussians.get_rotation
         scales = gaussians.get_scaling
         normal_vectors, multiplier = compute_normal_world_space(quaternions, scales, viewpoint_cam.world_view_transform, gaussians.get_xyz)
-            
+
         best_psnr = 0
         best_angle = None
-        
+
         n = 51
-        sun_angles_prepare_list = torch.linspace(sun_angle_range[0], sun_angle_range[1], n)  
+        sun_angles_prepare_list = torch.linspace(sun_angle_range[0], sun_angle_range[1], n)
         sun_angles = [torch.tensor([angle,0, 0]) for angle in sun_angles_prepare_list] #rotate only around y
-        
+
         for angle in tqdm(sun_angles):
 
             # first we adjust env map horizontally - match ground
@@ -146,7 +171,7 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
             if current_psnr > best_psnr:
                best_angle = angle
                best_psnr = current_psnr
-        
+
         # render all imgs for best angle
         rotation = Rotation()
         rot = np.float32(np.dot(rotation.rot_y(init_rot_y), np.dot(rotation.rot_x(init_rot_x), rotation.rot_z(init_rot_z))))
@@ -156,12 +181,12 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
         rot = np.float32(np.dot(rotation.rot_y(best_angle[0]), np.dot(rotation.rot_x(best_angle[1]), rotation.rot_z(best_angle[2]))))
         env_sh = np.matmul(rot, env_sh)
         env_sh_torch = torch.tensor(env_sh.T, dtype=torch.float32).cuda()
-    
+
         #unshadowed version
         rgb_precomp_unshadowed, lum_unshadowed_precomp =gaussians.compute_gaussian_rgb(env_sh_torch, shadowed=False, normal_vectors=normal_vectors)
         rendering_unshadowed = render(viewpoint_cam, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)["render"]
         rendering_unshadowed = torch.clamp(rendering_unshadowed, 0.0, 1.0)
-        
+
         illuminance_unshadowed = render(viewpoint_cam, gaussians, pipeline, background, override_color=lum_unshadowed_precomp)["render"]
 
         if illuminance_unshadowed.max()>1:
@@ -179,16 +204,16 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
             illuminance_shadowed /= illuminance_shadowed.max()
         torchvision.utils.save_image(torch.clamp(illuminance_shadowed*mask, 0.0, 1.0), os.path.join(render_path, "shadowed_luminance_"+viewpoint_cam.image_name))
         torchvision.utils.save_image(rendering_shadowed*mask, os.path.join(render_path, "shadowed_"+viewpoint_cam.image_name))
-        
+
 
         used_angles.append(best_angle)
         img_names.append(viewpoint_cam.image_name)
-        
+
         # Compute metrics
         psnrs_unshadowed.append(mse2psnr(img2mse(rendering_unshadowed, gt_image, mask=mask)))
         mae_unshadowed.append(img2mae(rendering_unshadowed, gt_image, mask=mask))
         mse_unshadowed.append(img2mse(rendering_unshadowed, gt_image, mask=mask))
-        
+
         psnrs_shadowed.append(mse2psnr(img2mse(rendering_shadowed, gt_image, mask=mask)))
         mae_shadowed.append(img2mae(rendering_shadowed, gt_image, mask=mask))
         mse_shadowed.append(img2mse(rendering_shadowed, gt_image, mask=mask))
@@ -196,7 +221,7 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
         unshadowed_np = rendering_unshadowed.cpu().detach().numpy().transpose(1, 2, 0)
         shadowed_np = rendering_shadowed.cpu().detach().numpy().transpose(1, 2, 0)
         gt_image_np = gt_image.cpu().detach().numpy().transpose(1, 2, 0)
-        
+
         _, full = ssim_skimage(unshadowed_np, gt_image_np, win_size=5, channel_axis=2, full=True, data_range=1.0)
         mssim_over_mask = (torch.tensor(full).cuda()*mask.unsqueeze(-1)).sum() / (3*mask.sum())
         ssims_unshadowed_scikit.append(mssim_over_mask)
@@ -204,7 +229,7 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
         mssim_over_mask = (torch.tensor(full).cuda()*mask.unsqueeze(-1)).sum() / (3*mask.sum())
         ssims_shadowed_scikit.append(mssim_over_mask)
 
-    # save metrics 
+    # save metrics
     with open(os.path.join(render_path, "metrics.txt"), 'w') as f:
         print("  PSNR unshadowed: {:>12.7f}".format(torch.tensor(psnrs_unshadowed).mean(), ".5"), file=f)
         print("  MSE unshadowed: {:>12.7f}".format(torch.tensor(mse_unshadowed).mean(), ".5"), file=f)
@@ -223,8 +248,8 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
     print("MAE shadowed: {:>12.7f}".format(torch.tensor(mae_shadowed).mean(), ".5"))
     print("SSIM skimage shadowed: {:>12.7f}".format(torch.tensor(ssims_shadowed_scikit).mean(), ".5"))
 
-    
-    
+
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")

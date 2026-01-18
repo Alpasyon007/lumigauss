@@ -1,0 +1,43 @@
+# Python packages for lumigauss
+# Converted from environment.yml
+
+# Core ML/DL frameworks
+plyfile
+tqdm
+matplotlib
+setuptools
+numpy<2.0.0
+tensorboard
+protobuf
+Pillow==9.5.0
+opencv-python-headless
+trimesh
+scipy
+lpips
+monai
+moviepy==1.0.3
+pandas
+matplotlib
+imageio[ffmpeg]
+
+# Computer vision and image processing
+opencv-python
+scikit-image
+lpips
+
+# Tensor operations
+einops
+
+# Object detection for dynamic object masking
+ultralytics>=8.0.0
+transformers>=4.30.0
+
+# Note: Local submodules are installed separately in Docker
+# For local development, install with:
+# pip install -e submodules/diff-surfel-rasterization
+# pip install -e submodules/simple-knn
+
+# Note: CUDA toolkit should be installed separately via conda or system package manager
+# conda install cuda-toolkit=12.1 -c nvidia/label/cuda-12.1.0
+
+pyvista

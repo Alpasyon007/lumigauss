@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -24,12 +24,13 @@ import json
 import torch
 from utils.sh_vis_utils import shReconstructDiffuseMap
 from utils.normal_utils import compute_normal_world_space
+from utils.sun_utils import load_sun_data
 import imageio.v2 as im
 import numpy as np
 
-def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussians, pipeline, background, 
+def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussians, pipeline, background,
                appearance_lut, appearance_list = None, only_from_appearence_list = False):
-    
+
     if only_from_appearence_list:
         assert appearance_list is not None, 'only_from_appearences_list requires appearance_list'
 
@@ -37,7 +38,7 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
     makedirs(render_path, exist_ok=True)
 
     if appearance_list:
-        appearance_df = pd.read_csv(appearance_list, delimiter=';', index_col=0)   
+        appearance_df = pd.read_csv(appearance_list, delimiter=';', index_col=0)
 
     for render_idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if only_from_appearence_list and view.image_name not in appearance_df.index.tolist():
@@ -45,7 +46,7 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
         quaternions = gaussians.get_rotation
         scales = gaussians.get_scaling
         normal_vectors, multiplier = compute_normal_world_space(quaternions, scales, view.world_view_transform, gaussians.get_xyz)
-    
+
         rgb_precomp = gaussians.get_albedo
         render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp)
         albedo = render_pkg["render"]
@@ -54,36 +55,53 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
         combined_rendering = torch.cat((view.original_image, torch.clamp(albedo, 0.0 ,1.0)), 2)
         torchvision.utils.save_image(combined_rendering, os.path.join(render_path, view.image_name + "_albedo.png"))
         torchvision.utils.save_image(normals*0.5+0.5, os.path.join(render_path, view.image_name + "_normals_world.png"))
-        
-        #if other convention needed: 
+
+        #if other convention needed:
         # torchvision.utils.save_image(normals_view*0.5+0.5, os.path.join(render_path, view.image_name + "_normals_view.png"))
         # normals_qual = normals_view.clone()
         # #normals_qual *=-1
-        # normals_qual[0]*=-1        
+        # normals_qual[0]*=-1
         # torchvision.utils.save_image(normals_qual*0.5+0.5, os.path.join(render_path, view.image_name + "_normals_view_qualitative.png"))
 
         # Recreate imgs is possible only for train cameras
         if "train" in imgs_subset:
 
-            # get sh env map
+            # get sh env map or use directional lighting
             appearance_idx = appearance_lut[view.image_name]
-            env_sh = gaussians.compute_env_sh(appearance_idx)
-            diffuse_map=shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy())
-            im.imwrite(os.path.join(render_path, view.image_name +'_diffuse_map.exr'), diffuse_map)
 
-            #unshadowed version
-            rgb_precomp_unshadowed, _ =gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
-            render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
-            rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
-            combined_rendering = torch.cat((view.original_image, rendering), 2)
-            torchvision.utils.save_image(combined_rendering, os.path.join(render_path, view.image_name + "_recreate_appearace_unshadowed.png"))
+            if gaussians.no_sh_env:
+                # Directional sun lighting mode - no diffuse map, use explicit lighting
+                # unshadowed version
+                rgb_precomp_unshadowed, _ = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, multiplier=None, shadowed=False)
+                render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
+                rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                combined_rendering = torch.cat((view.original_image, rendering), 2)
+                torchvision.utils.save_image(combined_rendering, os.path.join(render_path, view.image_name + "_recreate_appearace_unshadowed.png"))
 
-            #shadowed version
-            rgb_precomp_shadowed, _ = gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
-            render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
-            rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
-            combined_rendering = torch.cat((view.original_image, rendering), 2)
-            torchvision.utils.save_image(combined_rendering, os.path.join(render_path, view.image_name + "_recreate_appearace_shadowed.png"))
+                # shadowed version
+                rgb_precomp_shadowed, _ = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, multiplier=multiplier, shadowed=True)
+                render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
+                rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                combined_rendering = torch.cat((view.original_image, rendering), 2)
+                torchvision.utils.save_image(combined_rendering, os.path.join(render_path, view.image_name + "_recreate_appearace_shadowed.png"))
+            else:
+                env_sh = gaussians.compute_env_sh(appearance_idx)
+                diffuse_map=shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy())
+                im.imwrite(os.path.join(render_path, view.image_name +'_diffuse_map.exr'), diffuse_map)
+
+                #unshadowed version
+                rgb_precomp_unshadowed, _ =gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
+                render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
+                rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                combined_rendering = torch.cat((view.original_image, rendering), 2)
+                torchvision.utils.save_image(combined_rendering, os.path.join(render_path, view.image_name + "_recreate_appearace_unshadowed.png"))
+
+                #shadowed version
+                rgb_precomp_shadowed, _ = gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
+                render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
+                rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                combined_rendering = torch.cat((view.original_image, rendering), 2)
+                torchvision.utils.save_image(combined_rendering, os.path.join(render_path, view.image_name + "_recreate_appearace_shadowed.png"))
 
         if appearance_list:
 
@@ -98,39 +116,80 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                     continue
                 appearance_idx = appearance_lut[app_name]
                 app_image = [c.original_image for c in train_cameras if c.image_name == app_name][0]
-                
+
                 n_rows = view.original_image.shape[1]
                 n_cols = int(app_image.shape[2]*albedo.shape[1]/app_image.shape[1])
                 app_image = torch.nn.functional.interpolate(app_image.unsqueeze(0), (n_rows, n_cols))
                 app_image = torch.clamp(app_image, min=0.0, max = 1.0)
-                
-                #get new sh env, save it
-                env_sh = gaussians.compute_env_sh(appearance_idx)
-                diffuse_map=np.clip(shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy()), 0, None)**(1/ 2.2)
-                im.imwrite(os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + '_diffuse_map.exr'), diffuse_map)
-                
-                # unshadowed version
-                rgb_precomp_unshadowed, _ =gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
-                render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
-                rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
-                combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
-                torchvision.utils.save_image(combined_rendering, os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + "_unshadowed.png"))
 
-                # shadowed version
-                rgb_precomp_shadowed, _ = gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
-                render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
-                rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
-                combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
-                torchvision.utils.save_image(combined_rendering, os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + "_shadowed.png"))
+                if gaussians.no_sh_env:
+                    # Directional sun lighting mode
+                    # unshadowed version
+                    rgb_precomp_unshadowed, _ = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, multiplier=None, shadowed=False)
+                    render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
+                    rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                    combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
+                    torchvision.utils.save_image(combined_rendering, os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + "_unshadowed.png"))
+
+                    # shadowed version
+                    rgb_precomp_shadowed, _ = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, multiplier=multiplier, shadowed=True)
+                    render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
+                    rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                    combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
+                    torchvision.utils.save_image(combined_rendering, os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + "_shadowed.png"))
+                else:
+                    #get new sh env, save it
+                    env_sh = gaussians.compute_env_sh(appearance_idx)
+                    diffuse_map=np.clip(shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy()), 0, None)**(1/ 2.2)
+                    im.imwrite(os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + '_diffuse_map.exr'), diffuse_map)
+
+                    # unshadowed version
+                    rgb_precomp_unshadowed, _ =gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
+                    render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
+                    rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                    combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
+                    torchvision.utils.save_image(combined_rendering, os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + "_unshadowed.png"))
+
+                    # shadowed version
+                    rgb_precomp_shadowed, _ = gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
+                    render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
+                    rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                    combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
+                    torchvision.utils.save_image(combined_rendering, os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + "_shadowed.png"))
 
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, appearance_list = None, only_from_appearance_list = False):
     with torch.no_grad():
 
-        gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
+        # Load sun data if use_sun or no_sh_env is enabled
+        sun_data = None
+        image_names = None
+        if dataset.use_sun or dataset.no_sh_env:
+            if not dataset.sun_json_path:
+                raise ValueError("--sun_json_path must be provided when --use_sun or --no_sh_env is enabled")
+            print(f"Loading sun position data from: {dataset.sun_json_path}")
+            sun_data = load_sun_data(dataset.sun_json_path)
+
+            # Get image names from the appearance LUT
+            with open(os.path.join(dataset.model_path, "appearance_lut.json")) as handle:
+                appearance_lut = json.loads(handle.read())
+            # Sort by index to get correct order
+            image_names = [k for k, v in sorted(appearance_lut.items(), key=lambda x: x[1])]
+            print(f"Found {len(image_names)} images for sun/directional model")
+
+            gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
+                                       use_sun=dataset.use_sun, sun_data=sun_data, image_names=image_names,
+                                       no_sh_env=dataset.no_sh_env)
+        else:
+            gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
+
         scene = Scene(dataset, gaussians, load_iteration=iteration)
 
-        if gaussians.with_mlp:
+        if gaussians.no_sh_env:
+            gaussians.directional_sun_model.eval()
+        elif gaussians.use_sun:
+            gaussians.sun_model.eval()
+        elif gaussians.with_mlp:
             gaussians.mlp.eval()
             gaussians.embedding.eval()
 
@@ -148,7 +207,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
              render_set(dataset.model_path, "render_test", scene.loaded_iter, scene.getTestCameras(), scene.getTrainCameras(), gaussians,
                         pipeline, background, appearance_lut, appearance_list=appearance_list, only_from_appearence_list=only_from_appearance_list)
 
-       
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")
@@ -165,5 +224,5 @@ if __name__ == "__main__":
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, 
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test,
                 args.appearance_list, args.only_from_appearance_list)

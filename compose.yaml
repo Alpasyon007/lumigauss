@@ -1,0 +1,30 @@
+services:
+  compose:
+    build: .
+    image: lumigauss_sun2
+    volumes:
+      - ./:/workspace
+      - /etc/sudoers.d:/etc/sudoers.d:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - "D:/OneDrive - University of Surrey/Datasets/LumiGaussData/data:/workspace/data"
+    environment:
+      - DISPLAY=host.docker.internal:0.0
+      - CUDA_LAUNCH_BLOCKING=1
+      - PYTHONUNBUFFERED=1
+    network_mode: "host"
+    ipc: host
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack: 67108864
+    command: python ./train.py -s="./data/st_colmap/undistorted" -m="./output/st_mlp" --with_mlp
+    #command: python ./train.py -s="./data/st_colmap/undistorted" --sun_json_path="./data/st_colmap/sun_directions_blender.json" -m="./output/st_sun_no_sh" --no_sh_env
+    #command: python ./train.py -s="./data/lk2_colmap/undistorted" --sun_json_path="./data/lk2_colmap/sun_directions_blender.json" -m="./output/lk2_sun" --no_sh_env
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

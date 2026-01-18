@@ -15,8 +15,8 @@ This is the official implementation of **LumiGauss: Relightable Gaussian Splatti
 </p>
 
 
-### [UPDATE 18/05/2025] 
-Preprocessed and used data are available [here](https://zenodo.org/records/15455694). Place the data in `data` subfolder. All configs for evaluation with gt test envmaps are provided in `eval_files` folders (only paths to envmap jpgs need to be adjusted). `run_all.sh` script uses these configs now.  
+### [UPDATE 18/05/2025]
+Preprocessed and used data are available [here](https://zenodo.org/records/15455694). Place the data in `data` subfolder. All configs for evaluation with gt test envmaps are provided in `eval_files` folders (only paths to envmap jpgs need to be adjusted). `run_all.sh` script uses these configs now.
 
 ### Installation
 
@@ -31,7 +31,7 @@ Create the Environment:
 conda env create --file environment.yml
 conda activate lumigauss
 ```
-The environment.yml file includes pinned versions of key dependencies. However, please note that certain packages may require adjustments depending on your specific CUDA version and GPU setup. 
+The environment.yml file includes pinned versions of key dependencies. However, please note that certain packages may require adjustments depending on your specific CUDA version and GPU setup.
 
 For users on different hardware setups, it's possible to create a base environment using the original 2DGS repository and then manually install missing dependencies.
 
@@ -58,6 +58,76 @@ filename;split
 ### Usage
 Refer to `run_all.sh` for scripts to train, render, and test. We provide two implementations: one using MLP and another with direct SH_env optimization. Initial tests showed significantly worse results with direct optimization, so the parameters were not further tuned. If you choose to use this version, additional fine-tuning may be required.
 
+### Physical Sun Position Model (--use_sun)
+
+An improved lighting model that uses physical sun positions from image metadata instead of learned environment maps. This approach:
+
+- Uses exact sun positions computed from GPS coordinates and timestamps
+- Learns only sun intensity and ambient sky color per image
+- Provides physically grounded lighting that cannot produce implausible configurations
+
+**Prerequisites:**
+Prepare a JSON file with sun position data for each image. The format should be:
+```json
+{
+  "image_name.JPG": {
+    "datetime": "2021-09-01T14:09:15",
+    "location": {
+      "latitude": 49.23278,
+      "longitude": 6.98639
+    },
+    "sun_position": {
+      "azimuth_deg": 214.5715,
+      "elevation_deg": 44.0858
+    },
+    "sun_direction_vector": [
+      -0.40758712004214054,
+      -0.591461301238868,
+      0.6957343377414822
+    ]
+  }
+}
+```
+
+**Training with sun positions:**
+```bash
+python train.py -s data/your_scene -m output/your_model --use_sun --sun_json_path data/your_scene/sun_positions.json
+```
+
+**Rendering with sun positions:**
+```bash
+python render_simple.py -m output/your_model --use_sun --sun_json_path data/your_scene/sun_positions.json
+```
+
+The `sun_direction_vector` should be a unit vector pointing towards the sun in the world coordinate system aligned with your scene reconstruction.
+
+### Explicit Directional Lighting (--no_sh_env)
+
+An alternative lighting model that completely bypasses the SH (Spherical Harmonics) representation for environment lighting. This approach:
+
+- Uses **explicit Lambert shading**: `L = albedo * (sun_intensity * max(0, N·L) * shadow + ambient)`
+- Keeps the sun as a true directional light source
+- Provides **sharper shadow boundaries** without SH band-limiting artifacts
+- Better for scenes requiring accurate shadow representation
+
+**Training with explicit directional lighting:**
+```bash
+python train.py -s data/your_scene -m output/your_model --no_sh_env --sun_json_path data/your_scene/sun_positions.json
+```
+
+**Rendering with explicit directional lighting:**
+```bash
+python render_simple.py -m output/your_model --no_sh_env --sun_json_path data/your_scene/sun_positions.json
+```
+
+**Comparison with --use_sun:**
+| Feature | `--use_sun` | `--no_sh_env` |
+|---------|-------------|---------------|
+| Sun direction | Fixed from metadata | Fixed from metadata |
+| Lighting representation | Converted to SH | Explicit directional light |
+| Shadow sharpness | Limited by SH band | Sharp (analytical) |
+| Learnable parameters | sun_intensity, sky_zenith, sky_horizon, residual_sh | sun_intensity, ambient_color, shadow_softness |
+
 
 ### Notes on testing
 Use environment maps (JPG) and [test masks](https://github.com/r00tman/NeRF-OSR/issues/10) provided by NERF-OSR. We follow the evaluation protocol from [SOL-NERF](http://www.geometrylearning.com/SOL-NeRF/):
@@ -76,31 +146,31 @@ We don't optimize sky Gaussians separately; they are treated like other objects 
 
 We acknowledge the following useful resources and repositories we built upon while developing LumiGauss:
 
-- 2D Gaussian Splatting for Geometrically Accurate Radiance Fields  
+- 2D Gaussian Splatting for Geometrically Accurate Radiance Fields
 https://github.com/hbb1/2d-gaussian-splatting
 
-- NeRF for Outdoor Scene Relighting  
+- NeRF for Outdoor Scene Relighting
 https://github.com/r00tman/NeRF-OSR
-  
-- Spherical Harmonics Repository  
+
+- Spherical Harmonics Repository
 https://github.com/chalmersgit/SphericalHarmonics
 
-- Precomputed Radiance Transfer by Jan Kautz  
-https://jankautz.com/courses/ShadowCourse/09-RadianceTransfer.pdf 
+- Precomputed Radiance Transfer by Jan Kautz
+https://jankautz.com/courses/ShadowCourse/09-RadianceTransfer.pdf
 
-- Spherical Harmonic Lighting: The Gritty Details by Robin Green  
+- Spherical Harmonic Lighting: The Gritty Details by Robin Green
 https://3dvar.com/Green2003Spherical.pdf
 
-- Stupid Spherical Harmonics Tricks by Peter-Pike Sloan  
+- Stupid Spherical Harmonics Tricks by Peter-Pike Sloan
 https://www.ppsloan.org/publications/StupidSH36.pdf
 
-### Citation  
+### Citation
 If you find this work useful, please cite
   ```bibtex
  @misc{kaleta2024lumigaussrelightablegaussiansplatting,
-      title={LumiGauss: Relightable Gaussian Splatting in the Wild}, 
+      title={LumiGauss: Relightable Gaussian Splatting in the Wild},
       author={Joanna Kaleta and Kacper Kania and Tomasz Trzcinski and Marek Kowalski},
       booktitle = {Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision},
-      year = {2025} 
+      year = {2025}
 }
-  ``` 
+  ```
