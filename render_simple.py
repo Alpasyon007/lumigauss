@@ -69,7 +69,7 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
             # get sh env map or use directional lighting
             appearance_idx = appearance_lut[view.image_name]
 
-            if gaussians.no_sh_env:
+            if gaussians.use_sun:
                 # Directional sun lighting mode - no diffuse map, use explicit lighting
                 # unshadowed version
                 rgb_precomp_unshadowed, _ = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, multiplier=None, shadowed=False)
@@ -122,7 +122,7 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                 app_image = torch.nn.functional.interpolate(app_image.unsqueeze(0), (n_rows, n_cols))
                 app_image = torch.clamp(app_image, min=0.0, max = 1.0)
 
-                if gaussians.no_sh_env:
+                if gaussians.use_sun:
                     # Directional sun lighting mode
                     # unshadowed version
                     rgb_precomp_unshadowed, _ = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, multiplier=None, shadowed=False)
@@ -161,12 +161,12 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, appearance_list = None, only_from_appearance_list = False):
     with torch.no_grad():
 
-        # Load sun data if use_sun or no_sh_env is enabled
+        # Load sun data if use_sun is enabled
         sun_data = None
         image_names = None
-        if dataset.use_sun or dataset.no_sh_env:
+        if dataset.use_sun:
             if not dataset.sun_json_path:
-                raise ValueError("--sun_json_path must be provided when --use_sun or --no_sh_env is enabled")
+                raise ValueError("--sun_json_path must be provided when --use_sun is enabled")
             print(f"Loading sun position data from: {dataset.sun_json_path}")
             sun_data = load_sun_data(dataset.sun_json_path)
 
@@ -175,19 +175,16 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                 appearance_lut = json.loads(handle.read())
             # Sort by index to get correct order
             image_names = [k for k, v in sorted(appearance_lut.items(), key=lambda x: x[1])]
-            print(f"Found {len(image_names)} images for sun/directional model")
+            print(f"Found {len(image_names)} images for sun model")
 
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
-                                       use_sun=dataset.use_sun, sun_data=sun_data, image_names=image_names,
-                                       no_sh_env=dataset.no_sh_env)
+                                       use_sun=dataset.use_sun, sun_data=sun_data, image_names=image_names)
         else:
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
         scene = Scene(dataset, gaussians, load_iteration=iteration)
 
-        if gaussians.no_sh_env:
-            gaussians.directional_sun_model.eval()
-        elif gaussians.use_sun:
+        if gaussians.use_sun:
             gaussians.sun_model.eval()
         elif gaussians.with_mlp:
             gaussians.mlp.eval()

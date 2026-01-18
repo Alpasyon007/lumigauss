@@ -101,32 +101,19 @@ python render_simple.py -m output/your_model --use_sun --sun_json_path data/your
 
 The `sun_direction_vector` should be a unit vector pointing towards the sun in the world coordinate system aligned with your scene reconstruction.
 
-### Explicit Directional Lighting (--no_sh_env)
+### How --use_sun Works
 
-An alternative lighting model that completely bypasses the SH (Spherical Harmonics) representation for environment lighting. This approach:
+The `--use_sun` flag enables explicit directional lighting that completely bypasses the SH (Spherical Harmonics) representation for environment lighting. This approach:
 
 - Uses **explicit Lambert shading**: `L = albedo * (sun_intensity * max(0, N·L) * shadow + ambient)`
 - Keeps the sun as a true directional light source
 - Provides **sharper shadow boundaries** without SH band-limiting artifacts
 - Better for scenes requiring accurate shadow representation
 
-**Training with explicit directional lighting:**
-```bash
-python train.py -s data/your_scene -m output/your_model --no_sh_env --sun_json_path data/your_scene/sun_positions.json
-```
-
-**Rendering with explicit directional lighting:**
-```bash
-python render_simple.py -m output/your_model --no_sh_env --sun_json_path data/your_scene/sun_positions.json
-```
-
-**Comparison with --use_sun:**
-| Feature | `--use_sun` | `--no_sh_env` |
-|---------|-------------|---------------|
-| Sun direction | Fixed from metadata | Fixed from metadata |
-| Lighting representation | Converted to SH | Explicit directional light |
-| Shadow sharpness | Limited by SH band | Sharp (analytical) |
-| Learnable parameters | sun_intensity, sky_zenith, sky_horizon, residual_sh | sun_intensity, ambient_color, shadow_softness |
+**Learnable parameters:**
+- `sun_intensity`: Per-image sun intensity [RGB]
+- `ambient_color`: Per-image ambient/sky color [RGB]
+- `shadow_softness`: Optional soft shadow falloff
 
 
 ### Notes on testing

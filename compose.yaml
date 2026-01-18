@@ -18,9 +18,9 @@ services:
         soft: -1
         hard: -1
       stack: 67108864
-    command: python ./train.py -s="./data/st_colmap/undistorted" -m="./output/st_mlp" --with_mlp
-    #command: python ./train.py -s="./data/st_colmap/undistorted" --sun_json_path="./data/st_colmap/sun_directions_blender.json" -m="./output/st_sun_no_sh" --no_sh_env
-    #command: python ./train.py -s="./data/lk2_colmap/undistorted" --sun_json_path="./data/lk2_colmap/sun_directions_blender.json" -m="./output/lk2_sun" --no_sh_env
+    #command: python ./train.py -s="./data/st_colmap/undistorted" -m="./output/st_mlp" --with_mlp
+    command: python ./train.py -s="./data/st_colmap/undistorted" --sun_json_path="./data/st_colmap/sun_directions_blender.json" -m="./output/st_sun" --use_sun
+    #command: python ./train.py -s="./data/lk2_colmap/undistorted" --sun_json_path="./data/lk2_colmap/sun_directions_blender.json" -m="./output/lk2_sun" --use_sun
     deploy:
       resources:
         reservations:

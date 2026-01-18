@@ -93,9 +93,7 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
-            if self.gaussians.no_sh_env:
-                self.gaussians.directional_sun_model.load_state_dict(torch.load(self.model_path + "/chkpnt_directional_sun" + str(self.loaded_iter) + ".pth", weights_only=True))
-            elif self.gaussians.use_sun:
+            if self.gaussians.use_sun:
                 self.gaussians.sun_model.load_state_dict(torch.load(self.model_path + "/chkpnt_sun" + str(self.loaded_iter) + ".pth", weights_only=True))
             elif self.gaussians.with_mlp:
                 self.gaussians.mlp.load_state_dict(torch.load(self.model_path + "/chkpnt_mlp" + str(self.loaded_iter) + ".pth", weights_only=True))
@@ -109,9 +107,7 @@ class Scene:
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-        if self.gaussians.no_sh_env:
-            torch.save(self.gaussians.directional_sun_model.state_dict(), self.model_path + "/chkpnt_directional_sun" + str(iteration) + ".pth")
-        elif self.gaussians.use_sun:
+        if self.gaussians.use_sun:
             torch.save(self.gaussians.sun_model.state_dict(), self.model_path + "/chkpnt_sun" + str(iteration) + ".pth")
         elif self.gaussians.with_mlp:
             torch.save(self.gaussians.mlp.state_dict(), self.model_path + "/chkpnt_mlp" + str(iteration) + ".pth")

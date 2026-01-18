@@ -37,18 +37,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
 
-    # Load sun data if use_sun or no_sh_env is enabled
+    # Load sun data if use_sun is enabled
     sun_data = None
-    if dataset.use_sun or dataset.no_sh_env:
+    if dataset.use_sun:
         if not dataset.sun_json_path:
-            raise ValueError("--sun_json_path must be provided when --use_sun or --no_sh_env is enabled")
+            raise ValueError("--sun_json_path must be provided when --use_sun is enabled")
         print(f"Loading sun position data from: {dataset.sun_json_path}")
         sun_data = load_sun_data(dataset.sun_json_path)
         print(f"Loaded sun data for {len(sun_data)} images")
 
-    # For sun model or no_sh_env, we need image names upfront, so we create Scene first temporarily
+    # For sun model, we need image names upfront, so we create Scene first temporarily
     # to get image names, then create GaussianModel with sun data
-    if dataset.use_sun or dataset.no_sh_env:
+    if dataset.use_sun:
         # Create a temporary scene to get image names
         from scene.dataset_readers import sceneLoadTypeCallbacks
         import glob
@@ -68,11 +68,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Get image names from train cameras
         image_names = [cam.image_name for cam in scene_info.train_cameras]
-        print(f"Found {len(image_names)} training images for sun/directional model")
+        print(f"Found {len(image_names)} training images for sun model")
 
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
-                                   use_sun=dataset.use_sun, sun_data=sun_data, image_names=image_names,
-                                   no_sh_env=dataset.no_sh_env)
+                                   use_sun=dataset.use_sun, sun_data=sun_data, image_names=image_names)
     else:
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
@@ -83,9 +82,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         checkpoint_dir = os.path.dirname(checkpoint)
         gaussians.restore(model_params, opt)
-        if gaussians.no_sh_env:
-            gaussians.directional_sun_model.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_directional_sun" + str(first_iter) + ".pth")))
-        elif gaussians.use_sun:
+        if gaussians.use_sun:
             gaussians.sun_model.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_sun" + str(first_iter) + ".pth")))
         elif gaussians.with_mlp:
             gaussians.mlp.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_mlp" + str(first_iter) + ".pth")))
@@ -132,8 +129,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # compute env sh for given camera; like NerfOSR - add small random noise for env map
         emb_idx = appearance_lut[viewpoint_cam.image_name]
 
-        # For no_sh_env mode, we don't use SH environment representation
-        if not gaussians.no_sh_env:
+        # For use_sun mode, we don't use SH environment representation
+        if not gaussians.use_sun:
             sh_env = gaussians.compute_env_sh(emb_idx)
             sh_random_noise = torch.randn_like(sh_env)*0.025
         else:
@@ -158,7 +155,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # photometric loss for unshadowed
         if unshadowed_image_loss_lambda >0:
-            if gaussians.no_sh_env:
+            if gaussians.use_sun:
                 # Use explicit directional lighting (no SH)
                 rgb_precomp_unshadowed, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, multiplier=None, shadowed=False)
             else:
@@ -176,7 +173,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # photometric loss for shadowed
         if shadowed_image_loss_lambda >0:
-            if gaussians.no_sh_env:
+            if gaussians.use_sun:
                 # Use explicit directional lighting with shadow mask
                 rgb_precomp_shadowed, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, multiplier=multiplier, shadowed=True)
             else:
@@ -192,8 +189,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1_shadowed = torch.tensor(0.0, device="cuda", dtype=torch.float32)
             shadowed_image_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
 
-        # physical losses for SH_gauss (not applicable for no_sh_env mode)
-        if not gaussians.no_sh_env and (sh_gauss_lambda >0 or consistency_loss_lambda >0 or shadow_loss_lambda >0):
+        # physical losses for SH_gauss (not applicable for use_sun mode)
+        if not gaussians.use_sun and (sh_gauss_lambda >0 or consistency_loss_lambda >0 or shadow_loss_lambda >0):
             shs_gauss = gaussians.get_features(multiplier).transpose(1, 2).view(-1, 3, (gaussians.max_sh_degree+1)**2)
             shs_gauss_stacked = torch.cat([shs_gauss], dim=0)
             normal_vectors_stacked = torch.cat([normal_vectors], dim=0).detach()
@@ -207,17 +204,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             consistency_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
             shadow_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
 
-        #Environment map loss for SH_env, eq. 13 (not applicable for no_sh_env mode)
-        if not gaussians.no_sh_env and env_loss_lambda >0:
+        #Environment map loss for SH_env, eq. 13 (not applicable for use_sun mode)
+        if not gaussians.use_sun and env_loss_lambda >0:
             sh_env_loss = env_loss_lambda*compute_sh_env_loss(sh_env)
         else:
             sh_env_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
 
-        # Sun model regularization: encourage residual_sh to stay small
+        # Sun model regularization (currently no regularization needed for directional model)
         sun_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
-        if gaussians.use_sun and hasattr(gaussians.sun_model, 'use_residual') and gaussians.sun_model.use_residual:
-            residual = gaussians.sun_model.residual_sh[emb_idx]
-            sun_reg_loss = 0.01 * (residual ** 2).mean()
 
         # 2DGS original regularization
         if lambda_normal>0 or lambda_dist>0:
@@ -234,11 +228,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss
 
         # Only backward if we have a loss with gradients
-        # For no_sh_env mode during warmup->shadowed transition, SH losses are skipped and image losses may be 0
+        # For use_sun mode during warmup->shadowed transition, SH losses are skipped and image losses may be 0
         if total_loss.requires_grad:
             total_loss.backward()
         else:
-            # Skip backward if no gradients (happens during certain training phases with no_sh_env)
+            # Skip backward if no gradients (happens during certain training phases with use_sun)
             pass
 
         iter_end.record()
@@ -337,10 +331,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 scene.save(iteration)
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-                if gaussians.no_sh_env:
-                    torch.save(gaussians.directional_sun_model.state_dict(), scene.model_path + "/chkpnt_directional_sun" + str(iteration) + ".pth")
-                    torch.save(gaussians.optimizer_env.state_dict(), scene.model_path + "/chkpnt_optimizer_env" + str(iteration) + ".pth")
-                elif gaussians.use_sun:
+                if gaussians.use_sun:
                     torch.save(gaussians.sun_model.state_dict(), scene.model_path + "/chkpnt_sun" + str(iteration) + ".pth")
                     torch.save(gaussians.optimizer_env.state_dict(), scene.model_path + "/chkpnt_optimizer_env" + str(iteration) + ".pth")
                 elif gaussians.with_mlp:

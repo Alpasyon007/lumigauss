@@ -59,11 +59,9 @@ class ModelParams(ParamGroup):
         self.mlp_W = 64
         self.mlp_D = 3
         self.N_a = 24
-        # Sun position parameters
-        self.use_sun = False  # Enable physical sun position model
+        # Sun position parameters - explicit directional lighting without SH environment
+        self.use_sun = False  # Enable physical sun model with explicit directional lighting
         self.sun_json_path = ""  # Path to JSON file with sun positions per image
-        # Explicit directional lighting (no SH for environment)
-        self.no_sh_env = False  # Use explicit directional sun + ambient instead of SH environment
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

@@ -135,7 +135,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                     image_unshadowed = None
                     env_sh_learned = None
 
-                    if scene.gaussians.no_sh_env:
+                    if scene.gaussians.use_sun:
                         # Directional sun lighting mode - no SH environment
                         if config["name"] == "train":
                             emb_idx = appearance_lut[viewpoint.image_name]
@@ -205,9 +205,9 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
                         image_unshadowed = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
 
-                    if config["name"]=="train" and not scene.gaussians.no_sh_env:
+                    if config["name"]=="train" and not scene.gaussians.use_sun:
                         # Appearance transfer - visualize render with lightning from other training image
-                        # (Not available for no_sh_env mode)
+                        # (Not available for use_sun mode)
 
                         # BIG TODO remove hardcoded idx! For now, please do it yourself if needed
                         if "trevi" in source_path:
@@ -282,7 +282,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             tb_writer.add_images(view_tag + "/05_env_recreate", env_sh_learned[None], global_step=iteration)
                         tb_writer.add_images(view_tag + "/06_depth", depth[None], global_step=iteration)
 
-                        if config["name"]=="train" and not scene.gaussians.no_sh_env:
+                        if config["name"]=="train" and not scene.gaussians.use_sun:
                             tb_writer.add_images(view_tag + "/07_transfer_unshadowed", image_unshadowed_transfer[None], global_step=iteration)
                             tb_writer.add_images(view_tag + "/08_transfer_shadowed", image_shadowed_transfer[None], global_step=iteration)
                             tb_writer.add_images(view_tag + "/09_env_transfer", env_sh_transfer[None], global_step=iteration)

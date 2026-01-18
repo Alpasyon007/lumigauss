@@ -22,7 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.mlp import MLP
 from utils.sh_utils import *
-from utils.sun_utils import SunModel, DirectionalSunModel, load_sun_data, get_sun_direction, compute_sun_sh_simple
+from utils.sun_utils import SunModel, load_sun_data, get_sun_direction, compute_sun_sh_simple
 from collections import OrderedDict
 class GaussianModel:
 
@@ -41,10 +41,8 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
         self.rotation_activation = torch.nn.functional.normalize
 
-        if self.no_sh_env:
-            # Explicit directional lighting mode - no SH for environment
-            self.setup_directional_sun_model()
-        elif self.use_sun:
+        if self.use_sun:
+            # Explicit directional lighting mode with sun model
             self.setup_sun_model()
         elif self.with_mlp:
             self.setup_mlp()
@@ -53,8 +51,7 @@ class GaussianModel:
 
 
     def __init__(self, sh_degree : int, with_mlp: bool = False, mlp_W=128, mlp_D=4, N_a = 32,
-                 use_sun: bool = False, sun_data: dict = None, image_names: list = None,
-                 no_sh_env: bool = False):
+                 use_sun: bool = False, sun_data: dict = None, image_names: list = None):
 
         # We only implement deg 2 for SH_gauss and SH_env.
         # More on environment map degree: https://cseweb.ucsd.edu/~ravir/papers/envmap/envmap.pdf
@@ -82,15 +79,11 @@ class GaussianModel:
         self.mlp_D = mlp_D
         self.N_a = N_a
 
-        # Sun model parameters
+        # Sun model parameters (explicit directional lighting, no SH for environment)
         self.use_sun = use_sun
         self.sun_data = sun_data
         self.sun_model = None
         self.image_names = image_names
-
-        # Explicit directional lighting mode (no SH for environment)
-        self.no_sh_env = no_sh_env
-        self.directional_sun_model = None
 
         self.setup_functions()
 
@@ -126,11 +119,17 @@ class GaussianModel:
 
     def setup_sun_model(self):
         """
-        Initialize the sun model using physical sun positions from metadata.
+        Initialize the sun model for explicit directional lighting (no SH).
 
-        The sun model uses fixed sun directions from metadata and learns:
+        This model keeps sun as an explicit directional light for:
+        - Sharp shadow boundaries
+        - Accurate Lambert shading: albedo * sun_intensity * max(0, N·L) * shadow + ambient
+        - No band-limiting artifacts from SH representation
+
+        The sun direction is fixed from metadata and learns:
         - sun_intensity: Per-image sun intensity [n_images, 3] for RGB channels
-        - sky_color: Per-image ambient sky color [n_images, 3] for RGB channels
+        - ambient_color: Per-image ambient color [n_images, 3] for RGB channels
+        - shadow_softness: Per-image shadow softness for penumbra
         """
         if self.sun_data is None or self.image_names is None:
             raise ValueError("sun_data and image_names must be provided when use_sun=True")
@@ -138,28 +137,9 @@ class GaussianModel:
         self.sun_model = SunModel(
             sun_data=self.sun_data,
             image_names=self.image_names,
-            sh_degree=self.max_sh_degree,
             device="cuda"
         )
-
-    def setup_directional_sun_model(self):
-        """
-        Initialize the directional sun model for explicit lighting (no SH).
-
-        This model keeps sun as an explicit directional light for:
-        - Sharp shadow boundaries
-        - Accurate Lambert shading: albedo * sun_intensity * max(0, N·L) * shadow + ambient
-        - No band-limiting artifacts from SH representation
-        """
-        if self.sun_data is None or self.image_names is None:
-            raise ValueError("sun_data and image_names must be provided when no_sh_env=True")
-
-        self.directional_sun_model = DirectionalSunModel(
-            sun_data=self.sun_data,
-            image_names=self.image_names,
-            device="cuda"
-        )
-        print("Initialized DirectionalSunModel for explicit lighting (no SH environment)")
+        print("Initialized SunModel for explicit directional lighting")
 
 
     def capture(self): #MLP and embedding saved separately.
@@ -283,8 +263,8 @@ class GaussianModel:
             rgb: Final RGB values [N, 3]
             intensity: Intensity values [N, 3]
         """
-        assert self.no_sh_env and self.directional_sun_model is not None, \
-            "compute_directional_rgb requires no_sh_env=True"
+        assert self.use_sun and self.sun_model is not None, \
+            "compute_directional_rgb requires use_sun=True"
 
         albedo = self.get_albedo  # [N, 3]
 
@@ -298,7 +278,7 @@ class GaussianModel:
                 shadow_mask = multiplier.float()
 
         # Compute directional lighting
-        intensity_hdr, sun_dir, components = self.directional_sun_model(
+        intensity_hdr, sun_dir, components = self.sun_model(
             emb_idx, normal_vectors, shadow_mask
         )
 
@@ -313,10 +293,8 @@ class GaussianModel:
 
 
     def compute_env_sh(self, emb_idx):
-        if self.no_sh_env:
-            raise RuntimeError("compute_env_sh() should not be called when no_sh_env=True. Use compute_directional_rgb() instead.")
         if self.use_sun:
-            return self.sun_model(emb_idx)
+            raise RuntimeError("compute_env_sh() should not be called when use_sun=True. Use compute_directional_rgb() instead.")
         elif self.with_mlp:
             return self.mlp(self.compute_embedding(emb_idx))
         else:
@@ -392,21 +370,11 @@ class GaussianModel:
                                                     max_steps=training_args.position_lr_max_steps)
 
         if self.use_sun:
-            # Sun model: learn sun intensity, sky colors, and residual SH
-            sun_params = [
-                {'params': [self.sun_model.sun_intensity], 'lr': training_args.env_lr * 2.0, "name": "sun_intensity"},
-                {'params': [self.sun_model.sky_zenith], 'lr': training_args.env_lr * 2.0, "name": "sky_zenith"},
-                {'params': [self.sun_model.sky_horizon], 'lr': training_args.env_lr * 2.0, "name": "sky_horizon"},
-            ]
-            if self.sun_model.use_residual:
-                sun_params.append({'params': [self.sun_model.residual_sh], 'lr': training_args.env_lr, "name": "residual_sh"})
-            l_env = sun_params
-        elif self.no_sh_env:
-            # Directional sun model: explicit lighting without SH
+            # Sun model: explicit directional lighting
             l_env = [
-                {'params': [self.directional_sun_model.sun_intensity], 'lr': training_args.env_lr * 2.0, "name": "sun_intensity"},
-                {'params': [self.directional_sun_model.ambient_color], 'lr': training_args.env_lr * 2.0, "name": "ambient_color"},
-                {'params': [self.directional_sun_model.shadow_softness], 'lr': training_args.env_lr * 0.5, "name": "shadow_softness"},
+                {'params': [self.sun_model.sun_intensity], 'lr': training_args.env_lr * 2.0, "name": "sun_intensity"},
+                {'params': [self.sun_model.ambient_color], 'lr': training_args.env_lr * 2.0, "name": "ambient_color"},
+                {'params': [self.sun_model.shadow_softness], 'lr': training_args.env_lr * 0.5, "name": "shadow_softness"},
             ]
         elif self.with_mlp:
             l_env = [{'params': [*self.embedding.parameters()], 'lr': training_args.embedding_lr, "name": "embedding"},
