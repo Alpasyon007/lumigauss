@@ -27,7 +27,6 @@ import importlib
 from utils.sh_rotate_utils import Rotation
 from utils.sh_vis_utils import shReconstructDiffuseMap, applyWindowing
 from utils.normal_utils import compute_normal_world_space
-from utils.sun_utils import load_sun_data
 import imageio.v2 as im
 from skimage.metrics import structural_similarity as ssim_skimage
 from utils.loss_utils import mse2psnr, img2mae, img2mse, img2mse_image
@@ -54,31 +53,28 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
 
     dataset.eval = True
 
-    # Load sun data if use_sun is enabled
-    sun_data = None
-    image_names = None
+    # Create GaussianModel - sun data is loaded via Scene/cameras
     if dataset.use_sun:
-        if not dataset.sun_json_path:
-            raise ValueError("--sun_json_path must be provided when --use_sun is enabled")
-        print(f"Loading sun position data from: {dataset.sun_json_path}")
-        sun_data = load_sun_data(dataset.sun_json_path)
-
-        # Get image names from the appearance LUT
-        with open(os.path.join(dataset.model_path, "appearance_lut.json")) as handle:
-            appearance_lut_temp = json.loads(handle.read())
-        # Sort by index to get correct order
-        image_names = [k for k, v in sorted(appearance_lut_temp.items(), key=lambda x: x[1])]
-        print(f"Found {len(image_names)} images for sun model")
-
+        # Temporary n_images - will be updated after Scene creation
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
-                                   use_sun=True, sun_data=sun_data, image_names=image_names)
+                                   use_sun=True, n_images=1700)
     else:
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
     scene = Scene(dataset, gaussians, load_iteration=iteration)
 
-    if gaussians.use_sun:
+    # Update n_images and initialize sun_model with correct count
+    if dataset.use_sun:
+        n_images = len(scene.getTrainCameras())
+        # Verify cameras have sun data
+        missing_sun = [cam.image_name for cam in scene.getTrainCameras() if cam.sun_direction is None]
+        if missing_sun:
+            raise ValueError(f"Sun data missing for {len(missing_sun)} images. "
+                           f"First few missing: {missing_sun[:5]}")
+        gaussians.n_images = n_images
+        gaussians.setup_sun_model()
         gaussians.sun_model.eval()
+        print(f"Initialized SunModel for {n_images} images")
     elif gaussians.with_mlp:
         gaussians.mlp.eval()
         gaussians.embedding.eval()

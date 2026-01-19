@@ -17,6 +17,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.dataset_readers import load_sky_masks
 from utils.general_utils import safe_state
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -27,7 +28,7 @@ import os
 from utils.normal_utils import compute_normal_world_space
 from utils.loss_utils import compute_sh_gauss_losses, compute_sh_env_loss
 from utils.train_utils import prepare_output_and_logger, training_report, update_lambdas
-from utils.sun_utils import load_sun_data
+from utils.shadow_utils import compute_shadows_for_gaussians
 
 
 
@@ -37,45 +38,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
 
-    # Load sun data if use_sun is enabled
-    sun_data = None
+    # Create GaussianModel - sun data is loaded automatically in Scene via dataset_readers
+    # and stored in cameras. n_images is needed for use_sun mode.
     if dataset.use_sun:
-        if not dataset.sun_json_path:
-            raise ValueError("--sun_json_path must be provided when --use_sun is enabled")
-        print(f"Loading sun position data from: {dataset.sun_json_path}")
-        sun_data = load_sun_data(dataset.sun_json_path)
-        print(f"Loaded sun data for {len(sun_data)} images")
-
-    # For sun model, we need image names upfront, so we create Scene first temporarily
-    # to get image names, then create GaussianModel with sun data
-    if dataset.use_sun:
-        # Create a temporary scene to get image names
-        from scene.dataset_readers import sceneLoadTypeCallbacks
-        import glob
-        split_file_pattern = os.path.join(dataset.source_path, "*split.csv")
-        split_files = glob.glob(split_file_pattern)
-        if split_files:
-            eval_file = split_files[0]
-        else:
-            eval_file = None
-
-        if os.path.exists(os.path.join(dataset.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](dataset.source_path, dataset.images, dataset.eval, eval_file)
-        elif os.path.exists(os.path.join(dataset.source_path, "transforms_train.json")):
-            scene_info = sceneLoadTypeCallbacks["Blender"](dataset.source_path, dataset.white_background, dataset.eval, eval_file)
-        else:
-            raise ValueError("Could not recognize scene type!")
-
-        # Get image names from train cameras
-        image_names = [cam.image_name for cam in scene_info.train_cameras]
-        print(f"Found {len(image_names)} training images for sun model")
-
+        # We need to know the number of images upfront for the SunModel
+        # This will be set properly after Scene is created
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
-                                   use_sun=dataset.use_sun, sun_data=sun_data, image_names=image_names)
+                                   use_sun=dataset.use_sun, n_images=1700)  # Temporary, will be reset
     else:
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
     scene = Scene(dataset, gaussians)
+
+    # Now that Scene is created, update n_images with actual count and reinitialize sun_model
+    if dataset.use_sun:
+        n_images = len(scene.getTrainCameras())
+        # Check that all cameras have sun_direction
+        missing_sun = [cam.image_name for cam in scene.getTrainCameras() if cam.sun_direction is None]
+        if missing_sun:
+            raise ValueError(f"Sun data missing for {len(missing_sun)} images. "
+                           f"Place sun_data.json in dataset folder or provide --sun_json_path. "
+                           f"First few missing: {missing_sun[:5]}")
+
+        # Reinitialize with correct n_images
+        gaussians.n_images = n_images
+        gaussians.setup_sun_model()
+        print(f"Initialized SunModel for {n_images} training images")
+
+    # Load sky masks if path is provided (for marking sky gaussians as non-shadow-casting)
+    sky_masks = {}
+    if dataset.sky_mask_path:
+        image_names = [cam.image_name for cam in scene.getTrainCameras()]
+        sky_masks = load_sky_masks(dataset.sky_mask_path, image_names)
+        if sky_masks:
+            print(f"Sky mask classification will run during densification")
+
     gaussians.training_setup(opt)
 
     if checkpoint:
@@ -157,8 +154,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if unshadowed_image_loss_lambda >0:
             if gaussians.use_sun:
                 # Use explicit directional lighting (no SH)
+                # Get sun direction from camera
+                sun_dir = viewpoint_cam.sun_direction
+                if sun_dir is None:
+                    raise ValueError(f"Sun direction missing for camera {viewpoint_cam.image_name}")
                 # Shadows are not applied here - just unshadowed lighting
-                rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors)
+                rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir)
             else:
                 rgb_precomp_unshadowed, _ = gaussians.compute_gaussian_rgb(sh_env+sh_random_noise, shadowed=False, normal_vectors=normal_vectors)
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_unshadowed)
@@ -175,33 +176,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # photometric loss for shadowed
         if shadowed_image_loss_lambda >0:
             if gaussians.use_sun:
+                # Get sun direction from camera
+                sun_dir = viewpoint_cam.sun_direction
+                if sun_dir is None:
+                    raise ValueError(f"Sun direction missing for camera {viewpoint_cam.image_name}")
                 # Use explicit directional lighting
-                # Shadow will be applied externally via multiplier on the intensity
-                rgb_precomp_unshadowed_for_shadow, intensity_unshadowed, sun_dir, components = gaussians.compute_directional_rgb(emb_idx, normal_vectors)
+                rgb_precomp_unshadowed_for_shadow, intensity_unshadowed, sun_dir, components = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir)
 
-                # Apply shadow externally: modulate the direct lighting component by the shadow mask
-                # The multiplier represents visibility (1=lit, 0=shadowed)
-                if multiplier is not None:
-                    # Convert multiplier to proper shape
-                    if len(multiplier.shape) == 1:
-                        shadow_mask = multiplier.unsqueeze(-1).float()  # [N, 1]
-                    else:
-                        shadow_mask = multiplier.float()
+                # Compute shadow mask using selected method
+                shadow_mask, _, _ = compute_shadows_for_gaussians(
+                    gaussians,
+                    sun_dir,
+                    pipe,
+                    method=dataset.shadow_method,
+                    shadow_map_resolution=dataset.shadow_map_resolution,
+                    shadow_bias=dataset.shadow_bias,
+                    ray_march_steps=dataset.ray_march_steps,
+                    voxel_resolution=dataset.voxel_resolution,
+                    device="cuda"
+                )
+                shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 
-                    # Apply shadow to direct lighting only (ambient and residual remain unaffected)
-                    direct_light = components['direct']
-                    ambient_light = components['ambient']
-                    residual_light = components['residual']
+                # Apply shadow to direct lighting only (ambient and residual remain unaffected)
+                direct_light = components['direct']
+                ambient_light = components['ambient']
+                residual_light = components['residual']
 
-                    # Shadowed intensity = direct * shadow + ambient + residual
-                    intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
-                    intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
-                    intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)  # gamma correction
+                # Shadowed intensity = direct * shadow + ambient + residual
+                intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)  # gamma correction
 
-                    albedo = gaussians.get_albedo
-                    rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
-                else:
-                    rgb_precomp_shadowed = rgb_precomp_unshadowed_for_shadow
+                albedo = gaussians.get_albedo
+                rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
             else:
                 rgb_precomp_shadowed, _  = gaussians.compute_gaussian_rgb(sh_env+sh_random_noise, multiplier=multiplier)
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_shadowed)
@@ -309,6 +316,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
 
+                    # Update sky gaussian classification after densification
+                    if sky_masks and dataset.use_sun:
+                        gaussians.update_sky_gaussians(scene.getTrainCameras(), sky_masks, sky_vote_threshold=0.5)
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
@@ -380,7 +391,7 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    iter_list = [1000, 5000, 7500, *list(range(10000, 1000001, 2500))] #[30000]
+    iter_list = [1, 1000, 5000, 7500, *list(range(10000, 1000001, 2500))] #[30000]
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)

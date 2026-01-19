@@ -1,48 +1,33 @@
 """
 Sun position utilities for LumiGauss.
 
-This module provides functions to:
-1. Load sun position data from JSON files
-2. Convert sun direction vectors to SH coefficients
-3. Model directional sun lighting with ambient sky illumination
+This module provides:
+1. SunModel class for explicit directional sun lighting
+2. Helper functions for sun direction SH coefficients
+3. Directional lighting with ambient sky illumination
 
 The sun model follows the equation:
     Li(ωi) = Isun · δ(ωi − ωsun) + Lsky(ωi)
 
-where ωsun is the sun direction computed from metadata, Isun is the sun intensity,
+where ωsun is the sun direction from camera metadata, Isun is the sun intensity,
 and Lsky(ωi) represents ambient sky illumination.
 
-Enhanced version includes:
-- Learnable residual SH for additional environmental details
-- Hemisphere-based sky model with zenith/horizon gradients
-- Sun angular size modeling
+NOTE: Sun data is loaded in scene/dataset_readers.py and stored in Camera objects.
+The sun direction is passed to SunModel.forward() at runtime from the camera.
 """
 
-import json
 import torch
 import torch.nn as nn
 import numpy as np
 from typing import Dict, Optional, Tuple
 
 
-def load_sun_data(json_path: str) -> Dict:
-    """
-    Load sun position data from a JSON file.
-
-    Args:
-        json_path: Path to the JSON file containing sun position data.
-
-    Returns:
-        Dictionary mapping image names to their sun position data.
-    """
-    with open(json_path, 'r') as f:
-        sun_data = json.load(f)
-    return sun_data
-
-
 def get_sun_direction(sun_data: Dict, image_name: str) -> Optional[torch.Tensor]:
     """
     Get the sun direction vector for a specific image.
+
+    NOTE: This function is kept for backward compatibility but sun directions
+    should generally be accessed from Camera.sun_direction directly.
 
     Args:
         sun_data: Dictionary with sun position data for all images.
@@ -220,44 +205,31 @@ class SunModel(torch.nn.Module):
 
     Note: Shadowing is handled separately using geometry-based shadow computation.
 
-    The sun direction is fixed from metadata, but the following parameters are learnable:
+    The sun direction is obtained from Camera objects at forward time.
+    The following parameters are learnable (per-image):
     - sun_intensity: Per-image sun intensity [3] for RGB channels
     - ambient_color: Per-image ambient/sky color [3] for RGB channels
     - residual_sh: Per-image residual SH coefficients [3, 9] for environment details
     """
 
-    def __init__(self, sun_data: Dict, image_names: list, device: str = "cuda",
+    def __init__(self, n_images: int, device: str = "cuda",
                  use_residual_sh: bool = True, sh_degree: int = 2):
         """
         Initialize the directional sun model.
 
         Args:
-            sun_data: Dictionary mapping image names to sun position data.
-            image_names: List of all image names in the dataset.
+            n_images: Number of images in the dataset.
             device: Device to store tensors on.
             use_residual_sh: Whether to use residual SH for environment details.
             sh_degree: Degree of spherical harmonics (default 2 = 9 coefficients).
         """
         super().__init__()
 
-        self.n_images = len(image_names)
+        self.n_images = n_images
         self.device = device
         self.use_residual_sh = use_residual_sh
         self.sh_degree = sh_degree
         self.n_sh_coeffs = (sh_degree + 1) ** 2  # 9 for degree 2
-
-        # Store sun directions for each image (not learnable)
-        sun_directions = []
-        for img_name in image_names:
-            direction = get_sun_direction(sun_data, img_name)
-            if direction is None:
-                # Default to zenith if sun direction not found
-                direction = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
-                print(f"Warning: Using default zenith direction for {img_name}")
-            sun_directions.append(direction)
-
-        # Register as buffer (non-learnable)
-        self.register_buffer('sun_directions', torch.stack(sun_directions).to(device))
 
         # Learnable sun intensity per image (initialized for typical outdoor sun)
         # Shape: [n_images, 3] for RGB
@@ -323,7 +295,8 @@ class SunModel(torch.nn.Module):
 
         return result
 
-    def forward(self, image_idx: int, normal_vectors: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, image_idx: int, normal_vectors: torch.Tensor,
+                sun_direction: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute direct illumination for Gaussians using explicit directional lighting
         plus residual SH environment.
@@ -336,6 +309,7 @@ class SunModel(torch.nn.Module):
         Args:
             image_idx: Index of the image in the dataset.
             normal_vectors: Surface normals [N, 3] (should be normalized).
+            sun_direction: Sun direction vector [3] from camera. Required.
 
         Returns:
             Tuple of:
@@ -343,7 +317,15 @@ class SunModel(torch.nn.Module):
             - sun_direction: Sun direction vector [3] for shadow computation
             - lighting_components: Dict with 'direct', 'ambient', 'residual' for debugging
         """
-        sun_direction = self.sun_directions[image_idx]  # [3]
+        if sun_direction is None:
+            raise ValueError("sun_direction must be provided from camera")
+
+        # Ensure sun_direction is on correct device
+        if not isinstance(sun_direction, torch.Tensor):
+            sun_direction = torch.tensor(sun_direction, dtype=torch.float32, device=self.device)
+        elif sun_direction.device != self.device:
+            sun_direction = sun_direction.to(self.device)
+
         sun_int = torch.clamp(self.sun_intensity[image_idx], min=0.01)  # [3]
         ambient = torch.clamp(self.ambient_color[image_idx], min=0.01)  # [3]
 
@@ -382,10 +364,6 @@ class SunModel(torch.nn.Module):
         }
 
         return intensity, sun_dir_norm, lighting_components
-
-    def get_sun_direction(self, image_idx: int) -> torch.Tensor:
-        """Get the sun direction for a specific image."""
-        return self.sun_directions[image_idx]
 
     def get_sun_intensity(self, image_idx: int) -> torch.Tensor:
         """Get the sun intensity for a specific image."""

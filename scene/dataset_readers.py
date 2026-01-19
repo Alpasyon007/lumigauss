@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -12,7 +12,7 @@
 import os
 import sys
 from PIL import Image
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
@@ -35,7 +35,8 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
-    mask: np.array
+    mask: np.array = None
+    sun_direction: np.array = None  # Sun direction vector [3] for this image
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -43,6 +44,189 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+    sun_data: dict = None  # Dictionary mapping image names to sun data
+
+
+def load_sun_data_from_path(path: str) -> Optional[dict]:
+    """
+    Load sun data from a JSON file in the dataset directory.
+
+    Looks for files named: sun_data.json, sun_positions.json, or sun.json
+
+    Args:
+        path: Path to the dataset directory
+
+    Returns:
+        Dictionary with sun data, or None if not found
+    """
+    sun_file_names = ["sun_data.json", "sun_positions.json", "sun.json"]
+
+    for filename in sun_file_names:
+        sun_path = os.path.join(path, filename)
+        if os.path.exists(sun_path):
+            print(f"Loading sun data from: {sun_path}")
+            with open(sun_path, 'r') as f:
+                sun_data = json.load(f)
+            print(f"Loaded sun data for {len(sun_data)} images")
+            return sun_data
+
+    return None
+
+
+def load_sun_data(source_path: str = None, explicit_path: str = None) -> Optional[dict]:
+    """
+    Single entry point for loading sun data.
+
+    This is the canonical way to load sun data. It first tries to load from the
+    source_path directory (auto-discovery), then falls back to explicit_path.
+
+    Args:
+        source_path: Path to the dataset directory (will auto-discover sun_data.json, etc.)
+        explicit_path: Explicit path to a sun data JSON file
+
+    Returns:
+        Dictionary with sun data, or None if not found
+
+    Example:
+        # Auto-load from dataset folder
+        sun_data = load_sun_data(source_path="/path/to/dataset")
+
+        # Load from explicit path
+        sun_data = load_sun_data(explicit_path="/path/to/sun.json")
+
+        # Try auto-load first, fall back to explicit
+        sun_data = load_sun_data(source_path="/path/to/dataset",
+                                  explicit_path="/path/to/fallback.json")
+    """
+    sun_data = None
+
+    # First try auto-discovery from source path
+    if source_path is not None:
+        sun_data = load_sun_data_from_path(source_path)
+
+    # Fall back to explicit path if not found
+    if sun_data is None and explicit_path is not None:
+        if os.path.exists(explicit_path):
+            print(f"Loading sun data from explicit path: {explicit_path}")
+            with open(explicit_path, 'r') as f:
+                sun_data = json.load(f)
+            print(f"Loaded sun data for {len(sun_data)} images")
+        else:
+            print(f"Warning: Sun data file not found: {explicit_path}")
+
+    return sun_data
+
+
+def flip_sun_direction(direction: np.ndarray) -> np.ndarray:
+	"""
+	Apply coordinate system transformations to sun direction vector.
+
+	Args:
+		direction: Sun direction vector as numpy array [3]
+
+	Returns:
+		Transformed sun direction vector
+	"""
+	arr = np.array(direction, dtype=np.float32)
+	arr[0] = -arr[0]  # Flip x direction
+	return arr
+
+
+def get_sun_direction_for_image(sun_data: dict, image_name: str) -> Optional[np.ndarray]:
+	"""
+	Get the sun direction vector for a specific image.
+
+	Args:
+		sun_data: Dictionary with sun position data for all images
+		image_name: Name of the image to get sun direction for
+
+	Returns:
+		Sun direction vector as numpy array [3], or None if not found
+		Note: X component is flipped to match coordinate system
+	"""
+	# Try exact match first
+	if image_name in sun_data:
+		direction = sun_data[image_name].get("sun_direction_vector")
+		if direction is not None:
+			return flip_sun_direction(direction)
+
+	# Try with different extensions
+	base_name = image_name.rsplit('.', 1)[0] if '.' in image_name else image_name
+	extensions = [".JPG", ".jpg", ".png", ".PNG", ".jpeg", ".JPEG"]
+
+	for ext in extensions:
+		key = base_name + ext
+		if key in sun_data:
+			direction = sun_data[key].get("sun_direction_vector")
+			if direction is not None:
+				return flip_sun_direction(direction)
+
+	# Try to find a match by removing extension from keys
+	for key in sun_data:
+		key_base = key.rsplit('.', 1)[0] if '.' in key else key
+		if key_base == base_name:
+			direction = sun_data[key].get("sun_direction_vector")
+			if direction is not None:
+				return flip_sun_direction(direction)
+
+	return None
+
+
+def load_sky_masks(sky_mask_path: str, image_names: list = None) -> dict:
+    """
+    Load sky masks from a folder.
+
+    Sky masks are expected to be images where black (0) = sky, white (255) = not sky.
+    The mask filename should match the image filename (with potentially different extension).
+
+    Args:
+        sky_mask_path: Path to folder containing sky mask images
+        image_names: Optional list of image names to load masks for
+
+    Returns:
+        Dictionary mapping image_name to sky mask tensor [H, W] where 0=sky, 1=not sky
+    """
+    import torch
+
+    sky_masks = {}
+
+    if not sky_mask_path or not os.path.exists(sky_mask_path):
+        print(f"Sky mask path not found or not specified: {sky_mask_path}")
+        return sky_masks
+
+    print(f"Loading sky masks from: {sky_mask_path}")
+
+    # Get list of mask files
+    mask_extensions = ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG']
+    mask_files = {}
+    for f in os.listdir(sky_mask_path):
+        if any(f.endswith(ext) for ext in mask_extensions):
+            # Store by base name (without extension)
+            base_name = f.rsplit('.', 1)[0]
+            mask_files[base_name] = os.path.join(sky_mask_path, f)
+
+    # Load masks for each image
+    loaded_count = 0
+    for image_name in (image_names or mask_files.keys()):
+        base_name = image_name.rsplit('.', 1)[0] if '.' in image_name else image_name
+
+        if base_name in mask_files:
+            mask_path = mask_files[base_name]
+            try:
+                # Load mask as grayscale
+                mask_img = Image.open(mask_path).convert('L')
+                mask_np = np.array(mask_img, dtype=np.float32) / 255.0  # Normalize to [0, 1]
+                # Black (0) = sky, White (1) = not sky -> already correct!
+                # Convert to tensor
+                mask_tensor = torch.from_numpy(mask_np).cuda()
+                sky_masks[image_name] = mask_tensor
+                loaded_count += 1
+            except Exception as e:
+                print(f"Warning: Failed to load sky mask {mask_path}: {e}")
+
+    print(f"Loaded {loaded_count} sky masks")
+    return sky_masks
+
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -67,7 +251,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir, sun_data=None):
     images_folder=os.path.join(path, reading_dir)
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
@@ -99,7 +283,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir):
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path)
-        image = Image.open(image_path) 
+        image = Image.open(image_path)
 
         precomputed_mask=True
         if precomputed_mask:
@@ -113,8 +297,14 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir):
         else:
             mask = Image.fromarray(np.uint8(np.ones_like(image)*255)).convert('L')
 
+        # Get sun direction for this image if available
+        sun_direction = None
+        if sun_data is not None:
+            sun_direction = get_sun_direction_for_image(sun_data, image_name)
+
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height, mask=mask)
+                              image_path=image_path, image_name=image_name, width=width, height=height,
+                              mask=mask, sun_direction=sun_direction)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -133,7 +323,7 @@ def storePly(path, xyz, rgb):
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
             ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
-    
+
     normals = np.zeros_like(xyz)
 
     elements = np.empty(xyz.shape[0], dtype=dtype)
@@ -145,7 +335,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, eval_file, llffhold=20):
+def readColmapSceneInfo(path, images, eval, eval_file, llffhold=20, sun_json_path=None):
     # load cameras
     print(path)
     try:
@@ -158,14 +348,17 @@ def readColmapSceneInfo(path, images, eval, eval_file, llffhold=20):
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
-    
+
+    # Load sun data - try auto-discovery first, then explicit path
+    sun_data = load_sun_data(source_path=path, explicit_path=sun_json_path)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, path=path, reading_dir=reading_dir)
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics,
+                                            path=path, reading_dir=reading_dir, sun_data=sun_data)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
     train_cam_infos = cam_infos
 
-    if eval:        
+    if eval:
         if eval_file:
             import pandas as pd
             df = pd.read_csv(eval_file, sep=';', header=0, index_col=0)
@@ -202,7 +395,8 @@ def readColmapSceneInfo(path, images, eval, eval_file, llffhold=20):
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           sun_data=sun_data)
     return scene_info
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
@@ -239,12 +433,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovy 
+            FovY = fovy
             FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
-            
+
     return cam_infos
 
 def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
@@ -253,7 +447,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
     test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
-    
+
     if not eval:
         train_cam_infos.extend(test_cam_infos)
         test_cam_infos = []
@@ -265,7 +459,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
         # Since this data set has no colmap data, we start with random points
         num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")
-        
+
         # We create random points inside the bounds of the synthetic Blender scenes
         xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
         shs = np.random.random((num_pts, 3)) / 255.0

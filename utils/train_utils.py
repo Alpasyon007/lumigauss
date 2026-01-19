@@ -9,6 +9,7 @@ from argparse import ArgumentParser, Namespace
 import os
 from utils.sh_vis_utils import shReconstructDiffuseMap
 from utils.normal_utils import compute_normal_world_space
+from utils.shadow_utils import compute_shadows_for_gaussians, create_sun_camera_visualization_tensor
 from scene import Scene
 
 try:
@@ -137,6 +138,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                     residual_env_map = None
                     shadow_map_vis = None
                     direct_light_vis = None
+                    casts_shadow_vis = None
 
                     if scene.gaussians.use_sun:
                         # Directional sun lighting mode - no SH environment
@@ -147,46 +149,58 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             emb_idx = list(appearance_lut.values())[0] if appearance_lut else 0
 
                         # Get unshadowed lighting + components
-                        rgb_precomp_unshadowed, intensity, sun_dir, components = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors)
+                        rgb_precomp_unshadowed, intensity, sun_dir, components = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, viewpoint.sun_direction)
 
                         # render unshadowed with directional lighting
                         render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp_unshadowed)
                         image_unshadowed = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
 
-                        # render shadowed with directional lighting (apply shadow externally)
-                        if multiplier is not None:
-                            if len(multiplier.shape) == 1:
-                                shadow_mask = multiplier.unsqueeze(-1).float()
-                            else:
-                                shadow_mask = multiplier.float()
+                        # Compute shadow mask using selected method (shadow_map for TensorBoard visualization)
+                        shadow_mask, shadow_depth_map, sun_camera = compute_shadows_for_gaussians(
+                            scene.gaussians,
+                            sun_dir,
+                            renderArgs[0],  # pipe
+                            method="shadow_map",  # Always use shadow_map for viz to get depth map
+                            shadow_map_resolution=512,
+                            shadow_bias=0.1,
+                            device="cuda"
+                        )
+                        shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 
-                            direct_light = components['direct']
-                            ambient_light = components['ambient']
-                            residual_light = components['residual']
+                        direct_light = components['direct']
+                        ambient_light = components['ambient']
+                        residual_light = components['residual']
 
-                            intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
-                            intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
-                            intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
+                        intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                        intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                        intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
 
-                            albedo = scene.gaussians.get_albedo
-                            rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+                        albedo = scene.gaussians.get_albedo
+                        rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
 
-                            # Render shadow map for visualization
-                            # shadow_mask is [N, 1], render it as grayscale repeated to RGB
-                            shadow_rgb = shadow_mask.expand(-1, 3)  # [N, 3]
-                            render_pkg_shadow = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=shadow_rgb)
-                            shadow_map_vis = torch.clamp(render_pkg_shadow["render"], 0.0, 1.0)
+                        # Render shadow map for visualization
+                        # shadow_mask is [N, 1], render it as grayscale repeated to RGB
+                        shadow_rgb = shadow_mask.expand(-1, 3)  # [N, 3]
+                        render_pkg_shadow = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=shadow_rgb)
+                        shadow_map_vis = torch.clamp(render_pkg_shadow["render"], 0.0, 1.0)
 
-                            # Render direct light only (with shadow applied) - shows sun contribution before ambient/residual
-                            # This will be black in shadowed areas
-                            direct_shadowed = direct_light * shadow_mask  # [N, 3]
-                            direct_shadowed_gamma = torch.clamp_min(direct_shadowed, 0.00001) ** (1 / 2.2)
-                            direct_shadowed_rgb = torch.clamp(direct_shadowed_gamma * albedo, 0.0)
-                            render_pkg_direct = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=direct_shadowed_rgb)
-                            direct_light_vis = torch.clamp(render_pkg_direct["render"], 0.0, 1.0)
-                        else:
-                            rgb_precomp_shadowed = rgb_precomp_unshadowed
-                            direct_light_vis = None
+                        # Render direct light only (with shadow applied) - shows sun contribution before ambient/residual
+                        # This will be black in shadowed areas
+                        direct_shadowed = direct_light * shadow_mask  # [N, 3]
+                        direct_shadowed_gamma = torch.clamp_min(direct_shadowed, 0.00001) ** (1 / 2.2)
+                        direct_shadowed_rgb = torch.clamp(direct_shadowed_gamma * albedo, 0.0)
+                        render_pkg_direct = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=direct_shadowed_rgb)
+                        direct_light_vis = torch.clamp(render_pkg_direct["render"], 0.0, 1.0)
+
+                        # Render casts_shadow visualization (green=shadow casting, red=sky/non-casting)
+                        casts_shadow = scene.gaussians.get_casts_shadow  # [N]
+                        # Create RGB: green for shadow-casting (1), red for non-shadow-casting (0)
+                        casts_shadow_rgb = torch.zeros(casts_shadow.shape[0], 3, device=casts_shadow.device)
+                        casts_shadow_rgb[:, 0] = 1.0 - casts_shadow  # Red channel = 1 for sky gaussians
+                        casts_shadow_rgb[:, 1] = casts_shadow  # Green channel = 1 for shadow-casting
+                        render_pkg_casts_shadow = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=casts_shadow_rgb)
+                        casts_shadow_vis = torch.clamp(render_pkg_casts_shadow["render"], 0.0, 1.0)
+
                         render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp_shadowed)
                         image_shadowed = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
 
@@ -336,6 +350,26 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                                 tb_writer.add_images(view_tag + "/08_shadow_map", shadow_map_vis[None], global_step=iteration)
                             if direct_light_vis is not None:
                                 tb_writer.add_images(view_tag + "/09_direct_sun_only", direct_light_vis[None], global_step=iteration)
+                            if casts_shadow_vis is not None:
+                                tb_writer.add_images(view_tag + "/10_casts_shadow_mask", casts_shadow_vis[None], global_step=iteration)
+
+                            # 3D visualization of sun direction and camera
+                            try:
+                                # Get camera forward direction from view matrix
+                                view_matrix = viewpoint.world_view_transform
+                                cam_forward = -view_matrix[:3, 2]  # Forward is -Z in camera space
+
+                                sun_cam_vis = create_sun_camera_visualization_tensor(
+                                    gaussian_positions=scene.gaussians.get_xyz,
+                                    sun_direction=sun_dir,
+                                    camera_position=viewpoint.camera_center,
+                                    camera_forward=cam_forward,
+                                    shadow_mask=shadow_mask.squeeze() if shadow_mask is not None else None,
+                                    max_points=3000
+                                )
+                                tb_writer.add_images(view_tag + "/10_sun_camera_3d", sun_cam_vis[None], global_step=iteration)
+                            except Exception as e:
+                                print(f"Warning: Could not create sun/camera visualization: {e}")
 
                         if config["name"]=="train" and not scene.gaussians.use_sun:
                             tb_writer.add_images(view_tag + "/07_transfer_unshadowed", image_unshadowed_transfer[None], global_step=iteration)

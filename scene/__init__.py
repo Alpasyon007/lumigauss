@@ -27,8 +27,10 @@ class Scene:
         :param path: Path to colmap scene main folder.
         """
         self.model_path = args.model_path
+        self.source_path = args.source_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        self.sun_data = None  # Will be populated from scene_info
 
         if load_iteration:
             if load_iteration == -1:
@@ -50,13 +52,19 @@ class Scene:
             args.eval_file = None
             print("WARNING: No split file found. Please check if one exists in the directory or modify scene/init.py.")
 
+        # Get sun_json_path if available
+        sun_json_path = getattr(args, 'sun_json_path', None)
+
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.eval_file)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.eval_file, sun_json_path=sun_json_path)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args.eval_file)
         else:
             assert False, "Could not recognize scene type!"
+
+        # Store sun data from scene_info (single source of truth)
+        self.sun_data = scene_info.sun_data
 
         if shuffle:
             random.Random(567464).shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
@@ -121,3 +129,7 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    def getSunData(self):
+        """Get sun data loaded from the dataset. Returns None if no sun data available."""
+        return self.sun_data

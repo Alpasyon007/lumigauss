@@ -24,12 +24,19 @@ import json
 import torch
 from utils.sh_vis_utils import shReconstructDiffuseMap
 from utils.normal_utils import compute_normal_world_space
-from utils.sun_utils import load_sun_data
+from utils.shadow_utils import compute_shadows_for_gaussians
 import imageio.v2 as im
 import numpy as np
 
 def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussians, pipeline, background,
-               appearance_lut, appearance_list = None, only_from_appearence_list = False):
+               appearance_lut, appearance_list = None, only_from_appearence_list = False, args=None):
+
+    # Shadow method parameters with defaults
+    shadow_method = getattr(args, 'shadow_method', 'shadow_map') if args else 'shadow_map'
+    shadow_map_resolution = getattr(args, 'shadow_map_resolution', 1024) if args else 1024
+    shadow_bias = getattr(args, 'shadow_bias', 0.1) if args else 0.1
+    ray_march_steps = getattr(args, 'ray_march_steps', 64) if args else 64
+    voxel_resolution = getattr(args, 'voxel_resolution', 128) if args else 128
 
     if only_from_appearence_list:
         assert appearance_list is not None, 'only_from_appearences_list requires appearance_list'
@@ -70,39 +77,56 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
             appearance_idx = appearance_lut[view.image_name]
 
             if gaussians.use_sun:
+                # Get sun direction from camera
+                sun_dir = view.sun_direction
+                if sun_dir is None:
+                    print(f"Warning: No sun direction for {view.image_name}, skipping")
+                    continue
+
                 # Directional sun lighting mode - no diffuse map, use explicit lighting
                 # unshadowed version
-                rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors)
+                rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir)
                 render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                 rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                 combined_rendering = torch.cat((view.original_image, rendering), 2)
                 torchvision.utils.save_image(combined_rendering, os.path.join(render_path, view.image_name + "_recreate_appearace_unshadowed.png"))
 
-                # shadowed version - apply shadow externally
-                if multiplier is not None:
-                    # Convert multiplier to proper shape
-                    if len(multiplier.shape) == 1:
-                        shadow_mask = multiplier.unsqueeze(-1).float()  # [N, 1]
-                    else:
-                        shadow_mask = multiplier.float()
+                # shadowed version - compute shadows using selected method
+                shadow_mask, shadow_depth_map, _ = compute_shadows_for_gaussians(
+                    gaussians,
+                    sun_dir,
+                    pipeline,
+                    method=shadow_method,
+                    shadow_map_resolution=shadow_map_resolution,
+                    shadow_bias=shadow_bias,
+                    ray_march_steps=ray_march_steps,
+                    voxel_resolution=voxel_resolution,
+                    device="cuda"
+                )
+                shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 
-                    # Apply shadow to direct lighting only
-                    direct_light = components['direct']
-                    ambient_light = components['ambient']
-                    residual_light = components['residual']
+                # Apply shadow to direct lighting only
+                direct_light = components['direct']
+                ambient_light = components['ambient']
+                residual_light = components['residual']
 
-                    intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
-                    intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
-                    intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
+                intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
 
-                    albedo = gaussians.get_albedo
-                    rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
-                else:
-                    rgb_precomp_shadowed = rgb_precomp_unshadowed
+                albedo = gaussians.get_albedo
+                rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+
                 render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
                 rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                 combined_rendering = torch.cat((view.original_image, rendering), 2)
                 torchvision.utils.save_image(combined_rendering, os.path.join(render_path, view.image_name + "_recreate_appearace_shadowed.png"))
+
+                # Save shadow map visualization
+                shadow_rgb = shadow_mask.expand(-1, 3)
+                render_pkg_shadow = render(view, gaussians, pipeline, background, override_color=shadow_rgb)
+                shadow_vis = torch.clamp(render_pkg_shadow["render"], 0.0, 1.0)
+                torchvision.utils.save_image(shadow_vis, os.path.join(render_path, view.image_name + "_shadow_map.png"))
             else:
                 env_sh = gaussians.compute_env_sh(appearance_idx)
                 diffuse_map=shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy())
@@ -136,6 +160,13 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                 appearance_idx = appearance_lut[app_name]
                 app_image = [c.original_image for c in train_cameras if c.image_name == app_name][0]
 
+                # Get sun direction from source appearance camera
+                app_camera = [c for c in train_cameras if c.image_name == app_name][0]
+                sun_dir = app_camera.sun_direction
+                if sun_dir is None:
+                    print(f"Warning: No sun direction for {app_name}, skipping")
+                    continue
+
                 n_rows = view.original_image.shape[1]
                 n_cols = int(app_image.shape[2]*albedo.shape[1]/app_image.shape[1])
                 app_image = torch.nn.functional.interpolate(app_image.unsqueeze(0), (n_rows, n_cols))
@@ -144,31 +175,37 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                 if gaussians.use_sun:
                     # Directional sun lighting mode
                     # unshadowed version
-                    rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors)
+                    rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir)
                     render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                     rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
                     torchvision.utils.save_image(combined_rendering, os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + "_unshadowed.png"))
 
-                    # shadowed version - apply shadow externally
-                    if multiplier is not None:
-                        if len(multiplier.shape) == 1:
-                            shadow_mask = multiplier.unsqueeze(-1).float()
-                        else:
-                            shadow_mask = multiplier.float()
+                    # shadowed version - compute shadows using selected method
+                    shadow_mask, _, _ = compute_shadows_for_gaussians(
+                        gaussians,
+                        sun_dir,
+                        pipeline,
+                        method=shadow_method,
+                        shadow_map_resolution=shadow_map_resolution,
+                        shadow_bias=shadow_bias,
+                        ray_march_steps=ray_march_steps,
+                        voxel_resolution=voxel_resolution,
+                        device="cuda"
+                    )
+                    shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 
-                        direct_light = components['direct']
-                        ambient_light = components['ambient']
-                        residual_light = components['residual']
+                    direct_light = components['direct']
+                    ambient_light = components['ambient']
+                    residual_light = components['residual']
 
-                        intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
-                        intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
-                        intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
+                    intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                    intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                    intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
 
-                        albedo = gaussians.get_albedo
-                        rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
-                    else:
-                        rgb_precomp_shadowed = rgb_precomp_unshadowed
+                    albedo = gaussians.get_albedo
+                    rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+
                     render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
                     rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
@@ -194,34 +231,31 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                     torchvision.utils.save_image(combined_rendering, os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + "_shadowed.png"))
 
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, appearance_list = None, only_from_appearance_list = False):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, appearance_list = None, only_from_appearance_list = False, args=None):
     with torch.no_grad():
 
-        # Load sun data if use_sun is enabled
-        sun_data = None
-        image_names = None
+        # Create GaussianModel - sun data is loaded via Scene/cameras
         if dataset.use_sun:
-            if not dataset.sun_json_path:
-                raise ValueError("--sun_json_path must be provided when --use_sun is enabled")
-            print(f"Loading sun position data from: {dataset.sun_json_path}")
-            sun_data = load_sun_data(dataset.sun_json_path)
-
-            # Get image names from the appearance LUT
-            with open(os.path.join(dataset.model_path, "appearance_lut.json")) as handle:
-                appearance_lut = json.loads(handle.read())
-            # Sort by index to get correct order
-            image_names = [k for k, v in sorted(appearance_lut.items(), key=lambda x: x[1])]
-            print(f"Found {len(image_names)} images for sun model")
-
+            # Temporary n_images - will be updated after Scene creation
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
-                                       use_sun=dataset.use_sun, sun_data=sun_data, image_names=image_names)
+                                       use_sun=dataset.use_sun, n_images=1700)
         else:
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
         scene = Scene(dataset, gaussians, load_iteration=iteration)
 
-        if gaussians.use_sun:
+        # Update n_images and initialize sun_model with correct count
+        if dataset.use_sun:
+            n_images = len(scene.getTrainCameras())
+            # Verify cameras have sun data
+            missing_sun = [cam.image_name for cam in scene.getTrainCameras() if cam.sun_direction is None]
+            if missing_sun:
+                raise ValueError(f"Sun data missing for {len(missing_sun)} images. "
+                               f"First few missing: {missing_sun[:5]}")
+            gaussians.n_images = n_images
+            gaussians.setup_sun_model()
             gaussians.sun_model.eval()
+            print(f"Initialized SunModel for {n_images} images")
         elif gaussians.with_mlp:
             gaussians.mlp.eval()
             gaussians.embedding.eval()
@@ -234,11 +268,11 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         if not skip_train:
              render_set(dataset.model_path, "render_train", scene.loaded_iter, scene.getTrainCameras(), scene.getTrainCameras(), gaussians,
-                        pipeline, background, appearance_lut, appearance_list=appearance_list, only_from_appearence_list=only_from_appearance_list)
+                        pipeline, background, appearance_lut, appearance_list=appearance_list, only_from_appearence_list=only_from_appearance_list, args=args)
 
         if not skip_test:
              render_set(dataset.model_path, "render_test", scene.loaded_iter, scene.getTestCameras(), scene.getTrainCameras(), gaussians,
-                        pipeline, background, appearance_lut, appearance_list=appearance_list, only_from_appearence_list=only_from_appearance_list)
+                        pipeline, background, appearance_lut, appearance_list=appearance_list, only_from_appearence_list=only_from_appearance_list, args=args)
 
 
 if __name__ == "__main__":
@@ -258,4 +292,4 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
     render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test,
-                args.appearance_list, args.only_from_appearance_list)
+                args.appearance_list, args.only_from_appearance_list, args=args)

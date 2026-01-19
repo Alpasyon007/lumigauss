@@ -62,6 +62,13 @@ class ModelParams(ParamGroup):
         # Sun position parameters - explicit directional lighting without SH environment
         self.use_sun = False  # Enable physical sun model with explicit directional lighting
         self.sun_json_path = ""  # Path to JSON file with sun positions per image
+        self.sky_mask_path = ""  # Path to folder with sky masks (black=sky, white=not sky)
+        # Shadow computation method: 'none', 'shadow_map', 'ray_march', 'voxel'
+        self.shadow_method = "shadow_map"
+        self.shadow_map_resolution = 512  # Resolution for shadow mapping
+        self.shadow_bias = 0.1  # Depth bias for shadow comparison
+        self.ray_march_steps = 64  # Number of steps for ray marching
+        self.voxel_resolution = 128  # Resolution for voxel grid
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

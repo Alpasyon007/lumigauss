@@ -22,8 +22,10 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.mlp import MLP
 from utils.sh_utils import *
-from utils.sun_utils import SunModel, load_sun_data, get_sun_direction, compute_sun_sh_simple
+from utils.sun_utils import SunModel
 from collections import OrderedDict
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -42,8 +44,9 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
         if self.use_sun:
-            # Explicit directional lighting mode with sun model
-            self.setup_sun_model()
+            # Sun model will be initialized later when n_images is known
+            # Call setup_sun_model() explicitly after Scene is created
+            pass
         elif self.with_mlp:
             self.setup_mlp()
         else:
@@ -51,7 +54,7 @@ class GaussianModel:
 
 
     def __init__(self, sh_degree : int, with_mlp: bool = False, mlp_W=128, mlp_D=4, N_a = 32,
-                 use_sun: bool = False, sun_data: dict = None, image_names: list = None):
+                 use_sun: bool = False, n_images: int = None):
 
         # We only implement deg 2 for SH_gauss and SH_env.
         # More on environment map degree: https://cseweb.ucsd.edu/~ravir/papers/envmap/envmap.pdf
@@ -68,6 +71,7 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._casts_shadow = torch.empty(0)  # Per-gaussian shadow casting flag (1=casts shadow, 0=sky/transparent)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -81,9 +85,8 @@ class GaussianModel:
 
         # Sun model parameters (explicit directional lighting, no SH for environment)
         self.use_sun = use_sun
-        self.sun_data = sun_data
+        self.n_images = n_images
         self.sun_model = None
-        self.image_names = image_names
 
         self.setup_functions()
 
@@ -126,22 +129,22 @@ class GaussianModel:
         - Accurate Lambert shading: albedo * sun_intensity * max(0, N·L) + ambient
         - Residual SH for sky gradients and indirect lighting
 
-        The sun direction is fixed from metadata and learns:
+        Sun direction is obtained from Camera objects at runtime.
+        The model learns:
         - sun_intensity: Per-image sun intensity [n_images, 3] for RGB channels
         - ambient_color: Per-image ambient color [n_images, 3] for RGB channels
         - residual_sh: Per-image residual SH for environment details
 
         Note: Shadowing is handled separately using geometry-based shadow computation.
         """
-        if self.sun_data is None or self.image_names is None:
-            raise ValueError("sun_data and image_names must be provided when use_sun=True")
+        if self.n_images is None:
+            raise ValueError("n_images must be provided when use_sun=True")
 
         self.sun_model = SunModel(
-            sun_data=self.sun_data,
-            image_names=self.image_names,
+            n_images=self.n_images,
             device="cuda"
         )
-        print("Initialized SunModel for explicit directional lighting")
+        print(f"Initialized SunModel for {self.n_images} images")
 
 
     def capture(self): #MLP and embedding saved separately.
@@ -222,6 +225,11 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
 
+    @property
+    def get_casts_shadow(self):
+        """Get per-gaussian shadow casting flag (1=casts shadow, 0=sky/transparent)"""
+        return self._casts_shadow
+
     def compute_embedding(self, emb_idx):
         return self.embedding(torch.full((1,),emb_idx).cuda())
 
@@ -248,7 +256,7 @@ class GaussianModel:
 
         return rgb, intensity
 
-    def compute_directional_rgb(self, emb_idx, normal_vectors):
+    def compute_directional_rgb(self, emb_idx, normal_vectors, sun_direction):
         """
         Compute RGB using explicit directional sun lighting (no SH).
 
@@ -256,17 +264,17 @@ class GaussianModel:
             L = albedo * (sun_intensity * max(0, N·L) + ambient + residual_sh)
 
         Note: Shadows should be applied externally by multiplying the direct component
-        with a geometry-based shadow mask. Use get_sun_direction() to get the sun
-        direction for shadow computation.
+        with a geometry-based shadow mask.
 
         Args:
             emb_idx: Image embedding index (for per-image lighting parameters)
             normal_vectors: Surface normals [N, 3]
+            sun_direction: Sun direction vector [3] from camera
 
         Returns:
             rgb: Final RGB values [N, 3]
             intensity: Intensity values [N, 3]
-            sun_direction: Sun direction vector [3] for external shadow computation
+            sun_direction: Sun direction vector [3] (normalized)
             lighting_components: Dict with 'direct', 'ambient', 'residual' for debugging
         """
         assert self.use_sun and self.sun_model is not None, \
@@ -276,7 +284,7 @@ class GaussianModel:
 
         # Compute directional lighting (unshadowed)
         intensity_hdr, sun_dir, components = self.sun_model(
-            emb_idx, normal_vectors
+            emb_idx, normal_vectors, sun_direction=sun_direction
         )
 
         # Apply gamma correction (linear to sRGB)
@@ -289,6 +297,90 @@ class GaussianModel:
         return rgb, intensity, sun_dir, components
 
 
+    def update_sky_gaussians(self, cameras, sky_masks, sky_vote_threshold=0.5):
+        """
+        Update _casts_shadow based on sky mask voting across multiple camera views.
+
+        For each gaussian, project into camera views and check if it falls in sky region.
+        If a gaussian is in the sky region in more than sky_vote_threshold fraction of
+        visible views, mark it as non-shadow-casting.
+
+        Args:
+            cameras: List of Camera objects with projection matrices
+            sky_masks: Dict mapping image_name to sky mask tensor [H, W] where 0=sky, 1=not sky
+            sky_vote_threshold: Fraction of views where gaussian must be in sky to be marked (default 0.5)
+        """
+        N = self._xyz.shape[0]
+        positions = self._xyz.detach()  # [N, 3]
+
+        sky_votes = torch.zeros(N, device="cuda", dtype=torch.float32)
+        visible_count = torch.zeros(N, device="cuda", dtype=torch.float32)
+
+        for cam in cameras:
+            if cam.image_name not in sky_masks:
+                continue
+
+            sky_mask = sky_masks[cam.image_name]  # [H, W], 0=sky, 1=not sky
+            if sky_mask is None:
+                continue
+
+            H, W = sky_mask.shape
+
+            # Project gaussian centers to camera image coordinates
+            # Add homogeneous coordinate
+            ones = torch.ones(N, 1, device="cuda", dtype=positions.dtype)
+            positions_homo = torch.cat([positions, ones], dim=1)  # [N, 4]
+
+            # Apply full projection transform
+            clip_coords = positions_homo @ cam.full_proj_transform  # [N, 4]
+
+            # Perspective divide
+            w = clip_coords[:, 3:4]
+            ndc = clip_coords[:, :3] / (w + 1e-8)  # [N, 3]
+
+            # Check if in front of camera (w > 0)
+            in_front = (w.squeeze() > 0)
+
+            # NDC to pixel coordinates
+            # NDC is in [-1, 1], convert to [0, W-1] and [0, H-1]
+            px = ((ndc[:, 0] + 1) * 0.5 * (W - 1)).long()
+            py = ((ndc[:, 1] + 1) * 0.5 * (H - 1)).long()
+
+            # Check if in image bounds
+            in_bounds = (px >= 0) & (px < W) & (py >= 0) & (py < H)
+
+            # Combined visibility mask
+            visible = in_front & in_bounds
+
+            # Update visible count
+            visible_count += visible.float()
+
+            # Check sky mask for visible gaussians
+            # sky_mask: 0=sky (black), 1=not sky
+            valid_px = px.clamp(0, W - 1)
+            valid_py = py.clamp(0, H - 1)
+
+            # Sample sky mask at projected positions
+            is_sky = (sky_mask[valid_py, valid_px] == 0)  # 0 = sky region
+
+            # Add sky votes for visible gaussians that are in sky region
+            sky_votes += (visible & is_sky).float()
+
+        # Compute sky fraction
+        sky_fraction = torch.where(
+            visible_count > 0,
+            sky_votes / visible_count,
+            torch.zeros_like(sky_votes)
+        )
+
+        # Mark gaussians as non-shadow-casting if sky_fraction > threshold
+        is_sky_gaussian = sky_fraction > sky_vote_threshold
+        self._casts_shadow = torch.where(is_sky_gaussian, torch.zeros_like(self._casts_shadow), torch.ones_like(self._casts_shadow))
+
+        num_sky = is_sky_gaussian.sum().item()
+        print(f"[Sky Classification] {num_sky}/{N} gaussians marked as sky (non-shadow-casting)")
+
+
     def compute_env_sh(self, emb_idx):
         if self.use_sun:
             raise RuntimeError("compute_env_sh() should not be called when use_sun=True. Use compute_directional_rgb() instead.")
@@ -296,13 +388,6 @@ class GaussianModel:
             return self.mlp(self.compute_embedding(emb_idx))
         else:
             return self.env_params[str(emb_idx)]
-
-    def get_sun_direction(self, emb_idx):
-        """Get the sun direction for a specific image (only available when use_sun=True)."""
-        if self.use_sun:
-            return self.sun_model.get_sun_direction(emb_idx)
-        else:
-            return None
 
 
     def get_covariance(self, scaling_modifier = 1):
@@ -340,6 +425,8 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        # Initialize all gaussians as shadow-casting (will be updated by sky mask classification)
+        self._casts_shadow = torch.ones((fused_point_cloud.shape[0],), dtype=torch.float32, device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
 
@@ -555,6 +642,7 @@ class GaussianModel:
         self._albedo = optimizable_tensors["albedo"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._casts_shadow = self._casts_shadow[valid_points_mask]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -585,7 +673,7 @@ class GaussianModel:
 
     def densification_postfix(self, new_xyz, new_features_dc_positive, new_features_rest_positive,
                               new_features_dc_negative, new_features_rest_negative,
-                              new_albedo, new_opacities, new_scaling, new_rotation):
+                              new_albedo, new_opacities, new_scaling, new_rotation, new_casts_shadow=None):
         d = {"xyz": new_xyz,
         "f_dc_positive": new_features_dc_positive,
         "f_rest_positive": new_features_rest_positive,
@@ -606,6 +694,13 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        # Handle casts_shadow - new gaussians inherit from parent or default to 1
+        if new_casts_shadow is not None:
+            self._casts_shadow = torch.cat([self._casts_shadow, new_casts_shadow], dim=0)
+        else:
+            # Default new gaussians to shadow-casting
+            self._casts_shadow = torch.cat([self._casts_shadow, torch.ones(new_xyz.shape[0], device="cuda")], dim=0)
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -634,8 +729,9 @@ class GaussianModel:
         new_features_rest_negative = self._features_rest_negative[selected_pts_mask].repeat(N,1,1)
         new_albedo = self._albedo[selected_pts_mask].repeat(N,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_casts_shadow = self._casts_shadow[selected_pts_mask].repeat(N)  # Inherit shadow-casting from parent
 
-        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacity, new_scaling, new_rotation, new_casts_shadow)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -655,8 +751,9 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        new_casts_shadow = self._casts_shadow[selected_pts_mask]  # Inherit shadow-casting from parent
 
-        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacities, new_scaling, new_rotation, new_casts_shadow)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
 
