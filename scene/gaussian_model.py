@@ -122,14 +122,16 @@ class GaussianModel:
         Initialize the sun model for explicit directional lighting (no SH).
 
         This model keeps sun as an explicit directional light for:
-        - Sharp shadow boundaries
-        - Accurate Lambert shading: albedo * sun_intensity * max(0, N·L) * shadow + ambient
-        - No band-limiting artifacts from SH representation
+        - Sharp shadow boundaries (computed separately using geometry)
+        - Accurate Lambert shading: albedo * sun_intensity * max(0, N·L) + ambient
+        - Residual SH for sky gradients and indirect lighting
 
         The sun direction is fixed from metadata and learns:
         - sun_intensity: Per-image sun intensity [n_images, 3] for RGB channels
         - ambient_color: Per-image ambient color [n_images, 3] for RGB channels
-        - shadow_softness: Per-image shadow softness for penumbra
+        - residual_sh: Per-image residual SH for environment details
+
+        Note: Shadowing is handled separately using geometry-based shadow computation.
         """
         if self.sun_data is None or self.image_names is None:
             raise ValueError("sun_data and image_names must be provided when use_sun=True")
@@ -246,40 +248,35 @@ class GaussianModel:
 
         return rgb, intensity
 
-    def compute_directional_rgb(self, emb_idx, normal_vectors, multiplier=None, shadowed=True):
+    def compute_directional_rgb(self, emb_idx, normal_vectors):
         """
         Compute RGB using explicit directional sun lighting (no SH).
 
-        This implements proper Lambert shading:
-            L = albedo * (sun_intensity * max(0, N·L) * shadow + ambient)
+        This implements proper Lambert shading without shadows:
+            L = albedo * (sun_intensity * max(0, N·L) + ambient + residual_sh)
+
+        Note: Shadows should be applied externally by multiplying the direct component
+        with a geometry-based shadow mask. Use get_sun_direction() to get the sun
+        direction for shadow computation.
 
         Args:
             emb_idx: Image embedding index (for per-image lighting parameters)
             normal_vectors: Surface normals [N, 3]
-            multiplier: Shadow visibility mask [N, 1] where 1=lit, 0=shadowed
-            shadowed: If True, applies shadow multiplier
 
         Returns:
             rgb: Final RGB values [N, 3]
             intensity: Intensity values [N, 3]
+            sun_direction: Sun direction vector [3] for external shadow computation
+            lighting_components: Dict with 'direct', 'ambient', 'residual' for debugging
         """
         assert self.use_sun and self.sun_model is not None, \
             "compute_directional_rgb requires use_sun=True"
 
         albedo = self.get_albedo  # [N, 3]
 
-        # Get shadow mask
-        shadow_mask = None
-        if shadowed and multiplier is not None:
-            # Convert multiplier to [N, 1] shadow mask
-            if len(multiplier.shape) == 1:
-                shadow_mask = multiplier.unsqueeze(-1).float()  # [N, 1]
-            else:
-                shadow_mask = multiplier.float()
-
-        # Compute directional lighting
+        # Compute directional lighting (unshadowed)
         intensity_hdr, sun_dir, components = self.sun_model(
-            emb_idx, normal_vectors, shadow_mask
+            emb_idx, normal_vectors
         )
 
         # Apply gamma correction (linear to sRGB)
@@ -289,7 +286,7 @@ class GaussianModel:
         # Final RGB = albedo * intensity
         rgb = torch.clamp(intensity * albedo, 0.0)
 
-        return rgb, intensity
+        return rgb, intensity, sun_dir, components
 
 
     def compute_env_sh(self, emb_idx):
@@ -370,12 +367,15 @@ class GaussianModel:
                                                     max_steps=training_args.position_lr_max_steps)
 
         if self.use_sun:
-            # Sun model: explicit directional lighting
+            # Sun model: explicit directional lighting + residual SH
+            # Note: Shadow handling is done separately using geometry-based shadow computation
             l_env = [
                 {'params': [self.sun_model.sun_intensity], 'lr': training_args.env_lr * 2.0, "name": "sun_intensity"},
                 {'params': [self.sun_model.ambient_color], 'lr': training_args.env_lr * 2.0, "name": "ambient_color"},
-                {'params': [self.sun_model.shadow_softness], 'lr': training_args.env_lr * 0.5, "name": "shadow_softness"},
             ]
+            # Add residual SH parameters if enabled
+            if self.sun_model.use_residual_sh:
+                l_env.append({'params': [self.sun_model.residual_sh], 'lr': training_args.env_lr, "name": "residual_sh"})
         elif self.with_mlp:
             l_env = [{'params': [*self.embedding.parameters()], 'lr': training_args.embedding_lr, "name": "embedding"},
                      {'params': [*self.mlp.parameters()], 'lr': training_args.mlp_lr, "name": "mlp"},

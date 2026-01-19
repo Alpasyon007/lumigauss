@@ -134,6 +134,9 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                     image_shadowed = None
                     image_unshadowed = None
                     env_sh_learned = None
+                    residual_env_map = None
+                    shadow_map_vis = None
+                    direct_light_vis = None
 
                     if scene.gaussians.use_sun:
                         # Directional sun lighting mode - no SH environment
@@ -143,15 +146,58 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             # For test, use first training image's lighting
                             emb_idx = list(appearance_lut.values())[0] if appearance_lut else 0
 
-                        # render shadowed with directional lighting
-                        rgb_precomp, _ = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, multiplier=multiplier, shadowed=True)
-                        render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
-                        image_shadowed = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
+                        # Get unshadowed lighting + components
+                        rgb_precomp_unshadowed, intensity, sun_dir, components = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors)
 
                         # render unshadowed with directional lighting
-                        rgb_precomp, _ = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, multiplier=None, shadowed=False)
-                        render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
+                        render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp_unshadowed)
                         image_unshadowed = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
+
+                        # render shadowed with directional lighting (apply shadow externally)
+                        if multiplier is not None:
+                            if len(multiplier.shape) == 1:
+                                shadow_mask = multiplier.unsqueeze(-1).float()
+                            else:
+                                shadow_mask = multiplier.float()
+
+                            direct_light = components['direct']
+                            ambient_light = components['ambient']
+                            residual_light = components['residual']
+
+                            intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                            intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                            intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
+
+                            albedo = scene.gaussians.get_albedo
+                            rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+
+                            # Render shadow map for visualization
+                            # shadow_mask is [N, 1], render it as grayscale repeated to RGB
+                            shadow_rgb = shadow_mask.expand(-1, 3)  # [N, 3]
+                            render_pkg_shadow = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=shadow_rgb)
+                            shadow_map_vis = torch.clamp(render_pkg_shadow["render"], 0.0, 1.0)
+
+                            # Render direct light only (with shadow applied) - shows sun contribution before ambient/residual
+                            # This will be black in shadowed areas
+                            direct_shadowed = direct_light * shadow_mask  # [N, 3]
+                            direct_shadowed_gamma = torch.clamp_min(direct_shadowed, 0.00001) ** (1 / 2.2)
+                            direct_shadowed_rgb = torch.clamp(direct_shadowed_gamma * albedo, 0.0)
+                            render_pkg_direct = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=direct_shadowed_rgb)
+                            direct_light_vis = torch.clamp(render_pkg_direct["render"], 0.0, 1.0)
+                        else:
+                            rgb_precomp_shadowed = rgb_precomp_unshadowed
+                            direct_light_vis = None
+                        render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp_shadowed)
+                        image_shadowed = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
+
+                        # Visualize residual SH environment map
+                        if scene.gaussians.sun_model.use_residual_sh:
+                            # residual_sh shape: [n_images, 3, n_sh_coeffs] -> need [n_sh_coeffs, 3] for shReconstructDiffuseMap
+                            residual_sh_coeffs = scene.gaussians.sun_model.residual_sh[emb_idx]  # [3, 9]
+                            residual_sh_for_vis = residual_sh_coeffs.T.cpu().detach().numpy()  # [9, 3]
+                            residual_env_map = np.clip(shReconstructDiffuseMap(residual_sh_for_vis, width=300), 0, None)
+                            # Apply gamma correction and convert to tensor
+                            residual_env_map = torch.clamp(torch.tensor(residual_env_map ** (1 / 2.2)).permute(2, 0, 1), 0.0, 1.0)
 
                         # No env_sh_learned visualization for directional mode
                         env_sh_learned = None
@@ -281,6 +327,15 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         if env_sh_learned is not None:
                             tb_writer.add_images(view_tag + "/05_env_recreate", env_sh_learned[None], global_step=iteration)
                         tb_writer.add_images(view_tag + "/06_depth", depth[None], global_step=iteration)
+
+                        # Visualizations for use_sun mode
+                        if scene.gaussians.use_sun:
+                            if residual_env_map is not None:
+                                tb_writer.add_images(view_tag + "/07_residual_env_map", residual_env_map[None], global_step=iteration)
+                            if shadow_map_vis is not None:
+                                tb_writer.add_images(view_tag + "/08_shadow_map", shadow_map_vis[None], global_step=iteration)
+                            if direct_light_vis is not None:
+                                tb_writer.add_images(view_tag + "/09_direct_sun_only", direct_light_vis[None], global_step=iteration)
 
                         if config["name"]=="train" and not scene.gaussians.use_sun:
                             tb_writer.add_images(view_tag + "/07_transfer_unshadowed", image_unshadowed_transfer[None], global_step=iteration)

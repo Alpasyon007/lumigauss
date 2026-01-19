@@ -72,14 +72,33 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
             if gaussians.use_sun:
                 # Directional sun lighting mode - no diffuse map, use explicit lighting
                 # unshadowed version
-                rgb_precomp_unshadowed, _ = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, multiplier=None, shadowed=False)
+                rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors)
                 render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                 rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                 combined_rendering = torch.cat((view.original_image, rendering), 2)
                 torchvision.utils.save_image(combined_rendering, os.path.join(render_path, view.image_name + "_recreate_appearace_unshadowed.png"))
 
-                # shadowed version
-                rgb_precomp_shadowed, _ = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, multiplier=multiplier, shadowed=True)
+                # shadowed version - apply shadow externally
+                if multiplier is not None:
+                    # Convert multiplier to proper shape
+                    if len(multiplier.shape) == 1:
+                        shadow_mask = multiplier.unsqueeze(-1).float()  # [N, 1]
+                    else:
+                        shadow_mask = multiplier.float()
+
+                    # Apply shadow to direct lighting only
+                    direct_light = components['direct']
+                    ambient_light = components['ambient']
+                    residual_light = components['residual']
+
+                    intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                    intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                    intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
+
+                    albedo = gaussians.get_albedo
+                    rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+                else:
+                    rgb_precomp_shadowed = rgb_precomp_unshadowed
                 render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
                 rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                 combined_rendering = torch.cat((view.original_image, rendering), 2)
@@ -125,14 +144,31 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                 if gaussians.use_sun:
                     # Directional sun lighting mode
                     # unshadowed version
-                    rgb_precomp_unshadowed, _ = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, multiplier=None, shadowed=False)
+                    rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors)
                     render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                     rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
                     torchvision.utils.save_image(combined_rendering, os.path.join(render_path, '{}_to_{}'.format(view.image_name, app_name) + "_unshadowed.png"))
 
-                    # shadowed version
-                    rgb_precomp_shadowed, _ = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, multiplier=multiplier, shadowed=True)
+                    # shadowed version - apply shadow externally
+                    if multiplier is not None:
+                        if len(multiplier.shape) == 1:
+                            shadow_mask = multiplier.unsqueeze(-1).float()
+                        else:
+                            shadow_mask = multiplier.float()
+
+                        direct_light = components['direct']
+                        ambient_light = components['ambient']
+                        residual_light = components['residual']
+
+                        intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                        intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                        intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
+
+                        albedo = gaussians.get_albedo
+                        rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+                    else:
+                        rgb_precomp_shadowed = rgb_precomp_unshadowed
                     render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
                     rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)

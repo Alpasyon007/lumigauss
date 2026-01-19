@@ -209,20 +209,25 @@ def create_sun_sh_with_color(direction: torch.Tensor,
 
 class SunModel(torch.nn.Module):
     """
-    Explicit directional sun model that does NOT use SH representation.
+    Explicit directional sun model with residual SH environment map.
 
-    This model keeps the sun as an explicit directional light source, enabling:
-    - Sharp shadow boundaries (no SH band-limiting)
-    - Accurate specular highlights
-    - Physically correct Lambert shading: albedo * sun_intensity * max(0, N·L) * shadow + ambient
+    This model combines:
+    1. Explicit directional sun light (Lambert shading)
+    2. Residual SH environment map for sky gradients and indirect lighting
+
+    The lighting equation is:
+        L = sun_intensity * max(0, N·L) + ambient + SH_residual(N)
+
+    Note: Shadowing is handled separately using geometry-based shadow computation.
 
     The sun direction is fixed from metadata, but the following parameters are learnable:
     - sun_intensity: Per-image sun intensity [3] for RGB channels
     - ambient_color: Per-image ambient/sky color [3] for RGB channels
-    - shadow_softness: Optional soft shadow falloff parameter
+    - residual_sh: Per-image residual SH coefficients [3, 9] for environment details
     """
 
-    def __init__(self, sun_data: Dict, image_names: list, device: str = "cuda"):
+    def __init__(self, sun_data: Dict, image_names: list, device: str = "cuda",
+                 use_residual_sh: bool = True, sh_degree: int = 2):
         """
         Initialize the directional sun model.
 
@@ -230,11 +235,16 @@ class SunModel(torch.nn.Module):
             sun_data: Dictionary mapping image names to sun position data.
             image_names: List of all image names in the dataset.
             device: Device to store tensors on.
+            use_residual_sh: Whether to use residual SH for environment details.
+            sh_degree: Degree of spherical harmonics (default 2 = 9 coefficients).
         """
         super().__init__()
 
         self.n_images = len(image_names)
         self.device = device
+        self.use_residual_sh = use_residual_sh
+        self.sh_degree = sh_degree
+        self.n_sh_coeffs = (sh_degree + 1) ** 2  # 9 for degree 2
 
         # Store sun directions for each image (not learnable)
         sun_directions = []
@@ -261,30 +271,77 @@ class SunModel(torch.nn.Module):
             torch.ones(self.n_images, 3, device=device) * 0.3
         )
 
-        # Optional: learnable shadow softness (for penumbra)
-        # Higher values = softer shadow edges
-        self.shadow_softness = nn.Parameter(
-            torch.ones(self.n_images, 1, device=device) * 0.0
-        )
+        # Residual SH coefficients for environment details
+        # Shape: [n_images, 3, n_sh_coeffs] - initialized to zero (no residual initially)
+        if use_residual_sh:
+            self.residual_sh = nn.Parameter(
+                torch.zeros(self.n_images, 3, self.n_sh_coeffs, device=device)
+            )
+            print(f"SunModel: Using residual SH with {self.n_sh_coeffs} coefficients per channel")
 
-    def forward(self, image_idx: int, normal_vectors: torch.Tensor,
-                shadow_mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def evaluate_sh(self, sh_coeffs: torch.Tensor, normals: torch.Tensor) -> torch.Tensor:
         """
-        Compute direct illumination for Gaussians using explicit directional lighting.
+        Evaluate spherical harmonics at given normal directions.
 
-        Implements: intensity = sun_intensity * max(0, N·L) * shadow + ambient
+        Args:
+            sh_coeffs: SH coefficients [3, n_coeffs] for RGB channels
+            normals: Normal vectors [N, 3]
+
+        Returns:
+            Evaluated SH values [N, 3]
+        """
+        # Normalize normals
+        normals = normals / (torch.norm(normals, dim=-1, keepdim=True) + 1e-8)
+        x, y, z = normals[:, 0], normals[:, 1], normals[:, 2]
+
+        # SH basis functions (real spherical harmonics)
+        # Using same conventions as the rest of the codebase
+        N = normals.shape[0]
+        result = torch.zeros(N, 3, device=normals.device)
+
+        for ch in range(3):
+            coeffs = sh_coeffs[ch]  # [n_coeffs]
+
+            # L=0 (DC)
+            val = coeffs[0] * 0.282095  # Y_0^0
+
+            if self.sh_degree >= 1 and self.n_sh_coeffs >= 4:
+                # L=1
+                val = val + coeffs[1] * 0.488603 * y  # Y_1^{-1}
+                val = val + coeffs[2] * 0.488603 * z  # Y_1^0
+                val = val + coeffs[3] * 0.488603 * x  # Y_1^1
+
+            if self.sh_degree >= 2 and self.n_sh_coeffs >= 9:
+                # L=2
+                val = val + coeffs[4] * 1.092548 * x * y  # Y_2^{-2}
+                val = val + coeffs[5] * 1.092548 * y * z  # Y_2^{-1}
+                val = val + coeffs[6] * 0.315392 * (3 * z * z - 1)  # Y_2^0
+                val = val + coeffs[7] * 1.092548 * x * z  # Y_2^1
+                val = val + coeffs[8] * 0.546274 * (x * x - y * y)  # Y_2^2
+
+            result[:, ch] = val
+
+        return result
+
+    def forward(self, image_idx: int, normal_vectors: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute direct illumination for Gaussians using explicit directional lighting
+        plus residual SH environment.
+
+        Implements: intensity = sun_intensity * max(0, N·L) + ambient + SH_residual(N)
+
+        Note: Shadowing should be applied separately by the caller using geometry-based
+        shadow computation with the returned sun direction.
 
         Args:
             image_idx: Index of the image in the dataset.
             normal_vectors: Surface normals [N, 3] (should be normalized).
-            shadow_mask: Optional shadow visibility [N, 1] where 1=lit, 0=shadowed.
-                        If None, assumes all points are lit.
 
         Returns:
             Tuple of:
-            - intensity: HDR intensity values [N, 3]
-            - sun_direction: Sun direction vector [3]
-            - lighting_components: Dict with 'direct', 'ambient' for debugging
+            - intensity: HDR intensity values [N, 3] (unshadowed)
+            - sun_direction: Sun direction vector [3] for shadow computation
+            - lighting_components: Dict with 'direct', 'ambient', 'residual' for debugging
         """
         sun_direction = self.sun_directions[image_idx]  # [3]
         sun_int = torch.clamp(self.sun_intensity[image_idx], min=0.01)  # [3]
@@ -300,27 +357,27 @@ class SunModel(torch.nn.Module):
         # Clamp to [0, 1] - only front-facing surfaces receive direct light
         n_dot_l = torch.clamp(n_dot_l, min=0.0)  # [N, 1]
 
-        # Apply shadow mask if provided
-        if shadow_mask is not None:
-            # shadow_mask: 1 = lit, 0 = in shadow
-            # Apply soft shadow if softness > 0
-            softness = torch.clamp(self.shadow_softness[image_idx], min=0.0)
-            if softness > 0.01:
-                # Soft shadow transition
-                shadow_factor = torch.sigmoid((shadow_mask - 0.5) / (softness + 1e-6))
-            else:
-                shadow_factor = shadow_mask
-            n_dot_l = n_dot_l * shadow_factor  # [N, 1]
-
         # Direct sun illumination: sun_intensity * N·L
         direct_light = n_dot_l * sun_int.unsqueeze(0)  # [N, 3]
 
-        # Total illumination: direct + ambient
-        intensity = direct_light + ambient.unsqueeze(0)  # [N, 3]
+        # Ambient term
+        ambient_light = ambient.unsqueeze(0).expand(normal_vectors.shape[0], -1)  # [N, 3]
+
+        # Residual SH contribution
+        if self.use_residual_sh:
+            residual_light = self.evaluate_sh(self.residual_sh[image_idx], normals_norm)  # [N, 3]
+        else:
+            residual_light = torch.zeros_like(direct_light)
+
+        # Total illumination: direct + ambient + residual
+        # Clamp to prevent negative total intensity
+        intensity = direct_light + ambient_light + residual_light  # [N, 3]
+        intensity = torch.clamp(intensity, min=0.0)  # Ensure non-negative
 
         lighting_components = {
             'direct': direct_light,
-            'ambient': ambient.unsqueeze(0).expand_as(direct_light),
+            'ambient': ambient_light,
+            'residual': residual_light,
             'n_dot_l': n_dot_l,
         }
 
@@ -337,6 +394,13 @@ class SunModel(torch.nn.Module):
     def get_ambient(self, image_idx: int) -> torch.Tensor:
         """Get the ambient color for a specific image."""
         return torch.clamp(self.ambient_color[image_idx], min=0.01)
+
+    def get_residual_sh(self, image_idx: int) -> torch.Tensor:
+        """Get the residual SH coefficients for a specific image."""
+        if self.use_residual_sh:
+            return self.residual_sh[image_idx]
+        else:
+            return None
 
 
 def compute_sun_sh_simple(direction: torch.Tensor, intensity: float = 3.0,

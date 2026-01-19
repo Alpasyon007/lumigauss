@@ -103,17 +103,30 @@ The `sun_direction_vector` should be a unit vector pointing towards the sun in t
 
 ### How --use_sun Works
 
-The `--use_sun` flag enables explicit directional lighting that completely bypasses the SH (Spherical Harmonics) representation for environment lighting. This approach:
+The `--use_sun` flag enables a hybrid lighting model that combines:
 
-- Uses **explicit Lambert shading**: `L = albedo * (sun_intensity * max(0, N·L) * shadow + ambient)`
-- Keeps the sun as a true directional light source
-- Provides **sharper shadow boundaries** without SH band-limiting artifacts
-- Better for scenes requiring accurate shadow representation
+1. **Explicit directional sun light** for sharp shadows
+2. **Residual SH environment map** for sky gradients and indirect illumination
+
+The lighting equation is:
+```
+L = albedo * (sun_intensity * max(0, N·L) + ambient + SH_residual(N)) * shadow
+```
+
+Where `shadow` is computed externally using geometry-based shadow computation with the sun direction.
+
+This approach provides:
+- **Sharp shadow boundaries** from geometry-based shadow computation (not band-limited by SH)
+- **Flexible environment lighting** from the residual SH (sky gradients, indirect light)
+- **Physically grounded** sun direction from metadata
+- **Decoupled shadowing** allowing for custom shadow computation methods
 
 **Learnable parameters:**
 - `sun_intensity`: Per-image sun intensity [RGB]
 - `ambient_color`: Per-image ambient/sky color [RGB]
-- `shadow_softness`: Optional soft shadow falloff
+- `residual_sh`: Per-image residual SH coefficients [3 channels × 9 coefficients] for environment details
+
+**Note:** Shadows are applied externally by modulating the direct lighting component with a shadow mask. The shadow mask can be computed using ray tracing, depth-based methods, or any other geometry-aware technique.
 
 
 ### Notes on testing

@@ -157,7 +157,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if unshadowed_image_loss_lambda >0:
             if gaussians.use_sun:
                 # Use explicit directional lighting (no SH)
-                rgb_precomp_unshadowed, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, multiplier=None, shadowed=False)
+                # Shadows are not applied here - just unshadowed lighting
+                rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors)
             else:
                 rgb_precomp_unshadowed, _ = gaussians.compute_gaussian_rgb(sh_env+sh_random_noise, shadowed=False, normal_vectors=normal_vectors)
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_unshadowed)
@@ -174,8 +175,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # photometric loss for shadowed
         if shadowed_image_loss_lambda >0:
             if gaussians.use_sun:
-                # Use explicit directional lighting with shadow mask
-                rgb_precomp_shadowed, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, multiplier=multiplier, shadowed=True)
+                # Use explicit directional lighting
+                # Shadow will be applied externally via multiplier on the intensity
+                rgb_precomp_unshadowed_for_shadow, intensity_unshadowed, sun_dir, components = gaussians.compute_directional_rgb(emb_idx, normal_vectors)
+
+                # Apply shadow externally: modulate the direct lighting component by the shadow mask
+                # The multiplier represents visibility (1=lit, 0=shadowed)
+                if multiplier is not None:
+                    # Convert multiplier to proper shape
+                    if len(multiplier.shape) == 1:
+                        shadow_mask = multiplier.unsqueeze(-1).float()  # [N, 1]
+                    else:
+                        shadow_mask = multiplier.float()
+
+                    # Apply shadow to direct lighting only (ambient and residual remain unaffected)
+                    direct_light = components['direct']
+                    ambient_light = components['ambient']
+                    residual_light = components['residual']
+
+                    # Shadowed intensity = direct * shadow + ambient + residual
+                    intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                    intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                    intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)  # gamma correction
+
+                    albedo = gaussians.get_albedo
+                    rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+                else:
+                    rgb_precomp_shadowed = rgb_precomp_unshadowed_for_shadow
             else:
                 rgb_precomp_shadowed, _  = gaussians.compute_gaussian_rgb(sh_env+sh_random_noise, multiplier=multiplier)
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_shadowed)
@@ -210,8 +236,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             sh_env_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
 
-        # Sun model regularization (currently no regularization needed for directional model)
+        # Sun model regularization: encourage residual SH to stay small
         sun_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
+        if gaussians.use_sun and gaussians.sun_model.use_residual_sh:
+            residual = gaussians.sun_model.residual_sh[emb_idx]
+            # L2 regularization on residual SH coefficients
+            sun_reg_loss = 0.01 * (residual ** 2).mean()
 
         # 2DGS original regularization
         if lambda_normal>0 or lambda_dist>0:
