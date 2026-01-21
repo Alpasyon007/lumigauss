@@ -216,7 +216,9 @@ def load_sky_masks(sky_mask_path: str, image_names: list = None) -> dict:
                 # Load mask as grayscale
                 mask_img = Image.open(mask_path).convert('L')
                 mask_np = np.array(mask_img, dtype=np.float32) / 255.0  # Normalize to [0, 1]
-                # Black (0) = sky, White (1) = not sky -> already correct!
+                # Black (0) = sky, White (1) = not sky
+                # Use threshold to create binary mask (< 0.5 = sky = 0, >= 0.5 = not sky = 1)
+                mask_np = (mask_np >= 0.5).astype(np.float32)
                 # Convert to tensor
                 mask_tensor = torch.from_numpy(mask_np).cuda()
                 sky_masks[image_name] = mask_tensor

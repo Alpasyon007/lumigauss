@@ -97,7 +97,7 @@ def prepare_output_and_logger(args):
 
 
 @torch.no_grad()
-def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, appearance_lut=None, source_path=None):
+def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, appearance_lut=None, source_path=None, sky_masks=None):
     if tb_writer:
         tb_writer.add_scalar('Ll1_unshadowed', Ll1_unshadowed, iteration)
         tb_writer.add_scalar('Ll1_shadowed', Ll1_shadowed, iteration)
@@ -178,10 +178,12 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         albedo = scene.gaussians.get_albedo
                         rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
 
-                        # Render shadow map for visualization
+                        # Render shadow map for visualization with black background
                         # shadow_mask is [N, 1], render it as grayscale repeated to RGB
+                        # Use black background so shadowed (black) areas are visible against empty regions
                         shadow_rgb = shadow_mask.expand(-1, 3)  # [N, 3]
-                        render_pkg_shadow = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=shadow_rgb)
+                        black_bg = torch.zeros(3, device="cuda")
+                        render_pkg_shadow = renderFunc(viewpoint, scene.gaussians, renderArgs[0], black_bg, override_color=shadow_rgb)
                         shadow_map_vis = torch.clamp(render_pkg_shadow["render"], 0.0, 1.0)
 
                         # Render direct light only (with shadow applied) - shows sun contribution before ambient/residual
@@ -193,13 +195,52 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         direct_light_vis = torch.clamp(render_pkg_direct["render"], 0.0, 1.0)
 
                         # Render casts_shadow visualization (green=shadow casting, red=sky/non-casting)
+                        # Use black background for clarity
                         casts_shadow = scene.gaussians.get_casts_shadow  # [N]
                         # Create RGB: green for shadow-casting (1), red for non-shadow-casting (0)
                         casts_shadow_rgb = torch.zeros(casts_shadow.shape[0], 3, device=casts_shadow.device)
                         casts_shadow_rgb[:, 0] = 1.0 - casts_shadow  # Red channel = 1 for sky gaussians
                         casts_shadow_rgb[:, 1] = casts_shadow  # Green channel = 1 for shadow-casting
-                        render_pkg_casts_shadow = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=casts_shadow_rgb)
+                        render_pkg_casts_shadow = renderFunc(viewpoint, scene.gaussians, renderArgs[0], black_bg, override_color=casts_shadow_rgb)
                         casts_shadow_vis = torch.clamp(render_pkg_casts_shadow["render"], 0.0, 1.0)
+
+                        # Create sky mask comparison visualization
+                        sky_mask_vis = None
+                        sky_mask_comparison = None
+                        if sky_masks is not None and viewpoint.image_name in sky_masks:
+                            sky_mask = sky_masks[viewpoint.image_name]  # [H, W] where 0=sky, 1=not sky
+                            # Resize sky mask to match rendered image size if needed
+                            H_render, W_render = casts_shadow_vis.shape[1], casts_shadow_vis.shape[2]
+                            H_mask, W_mask = sky_mask.shape
+                            if H_mask != H_render or W_mask != W_render:
+                                import torch.nn.functional as F
+                                sky_mask_resized = F.interpolate(
+                                    sky_mask.unsqueeze(0).unsqueeze(0),
+                                    size=(H_render, W_render),
+                                    mode='nearest'
+                                ).squeeze()
+                            else:
+                                sky_mask_resized = sky_mask
+
+                            # Create RGB visualization of sky mask (green=not sky, red=sky)
+                            sky_mask_vis = torch.zeros(3, H_render, W_render, device=sky_mask.device)
+                            sky_mask_vis[0] = 1.0 - sky_mask_resized  # Red = sky (mask=0)
+                            sky_mask_vis[1] = sky_mask_resized  # Green = not sky (mask=1)
+
+                            # Create comparison: where rendered casts_shadow differs from sky mask
+                            # casts_shadow_vis: green channel high = shadow casting
+                            # sky_mask_vis: green channel high = not sky (should cast shadow)
+                            # If they match: green. If they differ: red or blue
+                            rendered_is_shadow_caster = casts_shadow_vis[1] > 0.5  # green channel
+                            mask_says_not_sky = sky_mask_resized > 0.5
+
+                            sky_mask_comparison = torch.zeros(3, H_render, W_render, device=sky_mask.device)
+                            # Green where both agree it should cast shadow (not sky)
+                            sky_mask_comparison[1] = (rendered_is_shadow_caster & mask_says_not_sky).float()
+                            # Red where rendered says casts shadow but mask says sky (false positive)
+                            sky_mask_comparison[0] = (rendered_is_shadow_caster & ~mask_says_not_sky).float()
+                            # Blue where rendered says no shadow but mask says not sky (sky gaussians over non-sky)
+                            sky_mask_comparison[2] = (~rendered_is_shadow_caster & mask_says_not_sky).float()
 
                         render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp_shadowed)
                         image_shadowed = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
@@ -352,6 +393,10 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                                 tb_writer.add_images(view_tag + "/09_direct_sun_only", direct_light_vis[None], global_step=iteration)
                             if casts_shadow_vis is not None:
                                 tb_writer.add_images(view_tag + "/10_casts_shadow_mask", casts_shadow_vis[None], global_step=iteration)
+                            if sky_mask_vis is not None:
+                                tb_writer.add_images(view_tag + "/11_sky_mask_gt", sky_mask_vis[None], global_step=iteration)
+                            if sky_mask_comparison is not None:
+                                tb_writer.add_images(view_tag + "/12_sky_mask_comparison", sky_mask_comparison[None], global_step=iteration)
 
                             # 3D visualization of sun direction and camera
                             try:

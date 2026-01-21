@@ -316,6 +316,9 @@ class GaussianModel:
         sky_votes = torch.zeros(N, device="cuda", dtype=torch.float32)
         visible_count = torch.zeros(N, device="cuda", dtype=torch.float32)
 
+        num_cams_with_masks = 0
+        total_sky_pixels_sampled = 0
+
         for cam in cameras:
             if cam.image_name not in sky_masks:
                 continue
@@ -324,6 +327,7 @@ class GaussianModel:
             if sky_mask is None:
                 continue
 
+            num_cams_with_masks += 1
             H, W = sky_mask.shape
 
             # Project gaussian centers to camera image coordinates
@@ -343,8 +347,9 @@ class GaussianModel:
 
             # NDC to pixel coordinates
             # NDC is in [-1, 1], convert to [0, W-1] and [0, H-1]
+            # Note: Y is flipped in image coordinates (0 at top, H-1 at bottom)
             px = ((ndc[:, 0] + 1) * 0.5 * (W - 1)).long()
-            py = ((ndc[:, 1] + 1) * 0.5 * (H - 1)).long()
+            py = ((1 - ndc[:, 1]) * 0.5 * (H - 1)).long()  # Flip Y for image coordinates
 
             # Check if in image bounds
             in_bounds = (px >= 0) & (px < W) & (py >= 0) & (py < H)
@@ -356,12 +361,17 @@ class GaussianModel:
             visible_count += visible.float()
 
             # Check sky mask for visible gaussians
-            # sky_mask: 0=sky (black), 1=not sky
+            # sky_mask: 0=sky (black), 1=not sky (after thresholding, these are floats)
             valid_px = px.clamp(0, W - 1)
             valid_py = py.clamp(0, H - 1)
 
-            # Sample sky mask at projected positions
-            is_sky = (sky_mask[valid_py, valid_px] == 0)  # 0 = sky region
+            # Sample sky mask at projected positions - use < 0.5 for sky detection
+            sampled_mask_values = sky_mask[valid_py, valid_px]
+            is_sky = (sampled_mask_values < 0.5)  # < 0.5 = sky region (was black in original mask)
+
+            # Count sky pixels for this camera
+            sky_in_this_cam = (visible & is_sky).sum().item()
+            total_sky_pixels_sampled += sky_in_this_cam
 
             # Add sky votes for visible gaussians that are in sky region
             sky_votes += (visible & is_sky).float()
@@ -378,7 +388,9 @@ class GaussianModel:
         self._casts_shadow = torch.where(is_sky_gaussian, torch.zeros_like(self._casts_shadow), torch.ones_like(self._casts_shadow))
 
         num_sky = is_sky_gaussian.sum().item()
-        print(f"[Sky Classification] {num_sky}/{N} gaussians marked as sky (non-shadow-casting)")
+        num_with_votes = (visible_count > 0).sum().item()
+        max_sky_fraction = sky_fraction.max().item() if sky_fraction.numel() > 0 else 0
+        print(f"[Sky Classification] {num_sky}/{N} marked sky | {num_with_votes} visible | max_frac={max_sky_fraction:.3f} | cams_w_masks={num_cams_with_masks} | total_sky_samples={total_sky_pixels_sampled}")
 
 
     def compute_env_sh(self, emb_idx):

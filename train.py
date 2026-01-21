@@ -296,7 +296,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             psnr_metric = training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background),
-                                          appearance_lut=appearance_lut, source_path=dataset.source_path)
+                                          appearance_lut=appearance_lut, source_path=dataset.source_path, sky_masks=sky_masks)
 
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -316,12 +316,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold)
 
-                    # Update sky gaussian classification after densification
-                    if sky_masks and dataset.use_sun:
-                        gaussians.update_sky_gaussians(scene.getTrainCameras(), sky_masks, sky_vote_threshold=0.5)
-
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # Update sky gaussian classification - runs after densification, offset by half interval
+            # This ensures new gaussians from densification get classified in the next update
+            sky_update_interval = opt.densification_interval
+            sky_update_offset = opt.densification_interval // 2
+            if sky_masks and dataset.use_sun and iteration < opt.densify_until_iter:
+                if iteration > opt.densify_from_iter and (iteration - sky_update_offset) % sky_update_interval == 0:
+                    gaussians.update_sky_gaussians(scene.getTrainCameras(), sky_masks, sky_vote_threshold=0.5)
 
 
             # update lrs
