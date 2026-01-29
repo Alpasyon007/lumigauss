@@ -44,7 +44,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # We need to know the number of images upfront for the SunModel
         # This will be set properly after Scene is created
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
-                                   use_sun=dataset.use_sun, n_images=1700)  # Temporary, will be reset
+                                   use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh)  # Temporary, will be reset
     else:
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
@@ -71,7 +71,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image_names = [cam.image_name for cam in scene.getTrainCameras()]
         sky_masks = load_sky_masks(dataset.sky_mask_path, image_names)
         if sky_masks:
-            print(f"Sky mask classification will run during densification")
+            print(f"Loaded {len(sky_masks)} sky masks for sky mask loss training")
 
     gaussians.training_setup(opt)
 
@@ -153,13 +153,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # photometric loss for unshadowed
         if unshadowed_image_loss_lambda >0:
             if gaussians.use_sun:
-                # Use explicit directional lighting (no SH)
-                # Get sun direction from camera
+                # Use explicit directional lighting with sun color prior
+                # Get sun direction and elevation from camera
                 sun_dir = viewpoint_cam.sun_direction
+                sun_elev = viewpoint_cam.sun_elevation
                 if sun_dir is None:
                     raise ValueError(f"Sun direction missing for camera {viewpoint_cam.image_name}")
                 # Shadows are not applied here - just unshadowed lighting
-                rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir)
+                rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
             else:
                 rgb_precomp_unshadowed, _ = gaussians.compute_gaussian_rgb(sh_env+sh_random_noise, shadowed=False, normal_vectors=normal_vectors)
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_unshadowed)
@@ -176,12 +177,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # photometric loss for shadowed
         if shadowed_image_loss_lambda >0:
             if gaussians.use_sun:
-                # Get sun direction from camera
+                # Get sun direction and elevation from camera
                 sun_dir = viewpoint_cam.sun_direction
+                sun_elev = viewpoint_cam.sun_elevation
                 if sun_dir is None:
                     raise ValueError(f"Sun direction missing for camera {viewpoint_cam.image_name}")
-                # Use explicit directional lighting
-                rgb_precomp_unshadowed_for_shadow, intensity_unshadowed, sun_dir, components = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir)
+                # Use explicit directional lighting with sun color prior
+                rgb_precomp_unshadowed_for_shadow, intensity_unshadowed, sun_dir, components = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
 
                 # Compute shadow mask using selected method
                 shadow_mask, _, _ = compute_shadows_for_gaussians(
@@ -243,12 +245,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             sh_env_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
 
-        # Sun model regularization: encourage residual SH to stay small
+        # Sun model regularization: encourage global sky SH to stay bounded
         sun_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
         if gaussians.use_sun and gaussians.sun_model.use_residual_sh:
-            residual = gaussians.sun_model.residual_sh[emb_idx]
-            # L2 regularization on residual SH coefficients
-            sun_reg_loss = 0.01 * (residual ** 2).mean()
+            sky_sh = gaussians.sun_model.sky_sh  # Global sky SH [3, n_coeffs]
+            # L2 regularization on global sky SH coefficients (lighter than per-image)
+            sun_reg_loss = 0.001 * (sky_sh ** 2).mean()
+            # Also regularize sun_color_correction to stay near 1.0
+            color_corr = gaussians.sun_model.sun_color_correction[emb_idx]
+            sun_reg_loss = sun_reg_loss + 0.01 * ((color_corr - 1.0) ** 2).mean()
+
+        # Sky mask loss: train _casts_shadow to match sky mask via rendering
+        sky_mask_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
+        if sky_masks and gaussians.use_sun and viewpoint_cam.image_name in sky_masks:
+            sky_mask = sky_masks[viewpoint_cam.image_name]
+            sky_mask_loss_raw, _ = gaussians.compute_sky_mask_loss(
+                viewpoint_cam, sky_mask, render, pipe, background
+            )
+            sky_mask_loss = 0.1 * sky_mask_loss_raw  # Weight for sky mask loss
 
         # 2DGS original regularization
         if lambda_normal>0 or lambda_dist>0:
@@ -262,7 +276,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             normal_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
             dist_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
 
-        total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss
+        total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss + sky_mask_loss
 
         # Only backward if we have a loss with gradients
         # For use_sun mode during warmup->shadowed transition, SH losses are skipped and image losses may be 0
@@ -319,21 +333,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-            # Update sky gaussian classification - runs after densification, offset by half interval
-            # This ensures new gaussians from densification get classified in the next update
-            sky_update_interval = opt.densification_interval
-            sky_update_offset = opt.densification_interval // 2
-            if sky_masks and dataset.use_sun and iteration < opt.densify_until_iter:
-                if iteration > opt.densify_from_iter and (iteration - sky_update_offset) % sky_update_interval == 0:
-                    gaussians.update_sky_gaussians(scene.getTrainCameras(), sky_masks, sky_vote_threshold=0.5)
-
+            # Sky mask loss is now applied during training loop (see sky_mask_loss computation above)
+            # No need for periodic update_sky_gaussians calls
 
             # update lrs
             if iteration>opt.warmup and iteration<=opt.start_shadowed:
                 for param_group in gaussians.optimizer_env.param_groups:
                     # For sun model, keep a small learning rate during SH_gauss tuning
                     # This helps maintain good sun priors while tuning Gaussian SH
-                    if gaussians.use_sun and param_group["name"] in ["sun_intensity", "sky_zenith", "sky_horizon", "residual_sh"]:
+                    if gaussians.use_sun and param_group["name"] in ["sun_intensity", "sun_color_correction", "ambient_color", "sky_sh"]:
                         param_group['lr'] = opt.env_lr * 0.1  # Reduced but not zero
                     else:
                         param_group['lr'] = 0.0
@@ -352,11 +360,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     # Sun model learning rates
                     if param_group["name"] == "sun_intensity":
                         param_group['lr'] = opt.env_lr * 2.0
-                    if param_group["name"] == "sky_zenith":
+                    if param_group["name"] == "sun_color_correction":
+                        param_group['lr'] = opt.env_lr * 0.5
+                    if param_group["name"] == "ambient_color":
                         param_group['lr'] = opt.env_lr * 2.0
-                    if param_group["name"] == "sky_horizon":
-                        param_group['lr'] = opt.env_lr * 2.0
-                    if param_group["name"] == "residual_sh":
+                    if param_group["name"] == "sky_sh":
                         param_group['lr'] = opt.env_lr
 
                 for param_group in gaussians.optimizer.param_groups:

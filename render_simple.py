@@ -77,15 +77,16 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
             appearance_idx = appearance_lut[view.image_name]
 
             if gaussians.use_sun:
-                # Get sun direction from camera
+                # Get sun direction and elevation from camera
                 sun_dir = view.sun_direction
+                sun_elev = view.sun_elevation
                 if sun_dir is None:
                     print(f"Warning: No sun direction for {view.image_name}, skipping")
                     continue
 
-                # Directional sun lighting mode - no diffuse map, use explicit lighting
+                # Directional sun lighting mode with sun color prior
                 # unshadowed version
-                rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir)
+                rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
                 render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                 rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                 combined_rendering = torch.cat((view.original_image, rendering), 2)
@@ -173,9 +174,9 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                 app_image = torch.clamp(app_image, min=0.0, max = 1.0)
 
                 if gaussians.use_sun:
-                    # Directional sun lighting mode
+                    # Directional sun lighting mode with sun color prior
                     # unshadowed version
-                    rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir)
+                    rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
                     render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                     rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
@@ -238,7 +239,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         if dataset.use_sun:
             # Temporary n_images - will be updated after Scene creation
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
-                                       use_sun=dataset.use_sun, n_images=1700)
+                                       use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh)
         else:
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 

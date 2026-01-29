@@ -192,36 +192,106 @@ def create_sun_sh_with_color(direction: torch.Tensor,
     return sh_rgb
 
 
+def compute_sun_color_from_elevation(elevation_deg: float, device: str = "cuda") -> torch.Tensor:
+    """
+    Compute physically-based sun color from elevation angle using atmospheric scattering.
+
+    Based on the Nishita sky model - sunlight color changes with elevation due to
+    Rayleigh and Mie scattering through the atmosphere. Lower sun = more atmosphere
+    traversed = redder light.
+
+    This is a simplified polynomial approximation fitted to the Nishita model.
+
+    Args:
+        elevation_deg: Sun elevation angle in degrees (0 = horizon, 90 = zenith)
+        device: Device for output tensor
+
+    Returns:
+        Sun color multiplier [3] for RGB channels (normalized, multiply with intensity)
+    """
+    # Clamp elevation to valid range
+    elevation = max(0.0, min(90.0, elevation_deg))
+
+    # Convert to radians for calculations
+    elev_rad = elevation * np.pi / 180.0
+
+    # Approximate optical depth based on elevation
+    # At horizon (0°), light travels through ~38x more atmosphere than at zenith
+    # Air mass approximation: AM ≈ 1/sin(elevation) for elevation > 0
+    if elevation < 5.0:
+        # Very low sun - extreme reddening
+        air_mass = 10.0 + (5.0 - elevation) * 2.0  # Cap at reasonable value
+    else:
+        air_mass = 1.0 / np.sin(elev_rad)
+
+    # Rayleigh scattering coefficients (wavelength dependent: ~1/λ^4)
+    # Blue scatters more than red, so blue is attenuated more at high air mass
+    # Approximate for RGB: R=650nm, G=550nm, B=450nm
+    beta_r = 0.0596  # Rayleigh scattering coefficient at sea level
+
+    # Wavelength-dependent extinction (normalized to red channel)
+    lambda_r, lambda_g, lambda_b = 650.0, 550.0, 450.0
+    ext_r = (lambda_r / 650.0) ** (-4)  # = 1.0
+    ext_g = (lambda_g / 650.0) ** (-4)  # ≈ 1.95
+    ext_b = (lambda_b / 650.0) ** (-4)  # ≈ 4.36
+
+    # Transmittance through atmosphere: T = exp(-beta * air_mass * ext)
+    # Scale factor to get reasonable color shifts
+    scale = 0.15
+
+    t_r = np.exp(-beta_r * air_mass * ext_r * scale)
+    t_g = np.exp(-beta_r * air_mass * ext_g * scale)
+    t_b = np.exp(-beta_r * air_mass * ext_b * scale)
+
+    # Normalize so that at zenith (90°) we get approximately white light
+    # At zenith, air_mass ≈ 1, so normalize by zenith values
+    t_r_zenith = np.exp(-beta_r * 1.0 * ext_r * scale)
+    t_g_zenith = np.exp(-beta_r * 1.0 * ext_g * scale)
+    t_b_zenith = np.exp(-beta_r * 1.0 * ext_b * scale)
+
+    sun_color = torch.tensor([
+        t_r / t_r_zenith,
+        t_g / t_g_zenith,
+        t_b / t_b_zenith
+    ], dtype=torch.float32, device=device)
+
+    # Clamp to reasonable range
+    sun_color = torch.clamp(sun_color, min=0.1, max=1.5)
+
+    return sun_color
+
+
 class SunModel(torch.nn.Module):
     """
-    Explicit directional sun model with residual SH environment map.
+    Explicit directional sun model with sun color prior and global sky SH.
 
     This model combines:
-    1. Explicit directional sun light (Lambert shading)
-    2. Residual SH environment map for sky gradients and indirect lighting
+    1. Explicit directional sun light with physically-based color prior
+    2. Global (shared) first-order SH for sky lighting
 
     The lighting equation is:
-        L = sun_intensity * max(0, N·L) + ambient + SH_residual(N)
+        L = sun_color(elevation) * sun_intensity * max(0, N·L) + ambient + SH_sky(N)
 
     Note: Shadowing is handled separately using geometry-based shadow computation.
 
+    Key features:
+    - Sun color prior: Sun color is derived from elevation angle using atmospheric scattering
+    - Global sky SH: Single shared SH environment for all images (enables relighting)
+    - Per-image parameters: sun_intensity (scalar multiplier), ambient_color
+
     The sun direction is obtained from Camera objects at forward time.
-    The following parameters are learnable (per-image):
-    - sun_intensity: Per-image sun intensity [3] for RGB channels
-    - ambient_color: Per-image ambient/sky color [3] for RGB channels
-    - residual_sh: Per-image residual SH coefficients [3, 9] for environment details
     """
 
     def __init__(self, n_images: int, device: str = "cuda",
-                 use_residual_sh: bool = True, sh_degree: int = 2):
+                 use_residual_sh: bool = True, sh_degree: int = 1):
         """
-        Initialize the directional sun model.
+        Initialize the directional sun model with sun color prior.
 
         Args:
             n_images: Number of images in the dataset.
             device: Device to store tensors on.
-            use_residual_sh: Whether to use residual SH for environment details.
-            sh_degree: Degree of spherical harmonics (default 2 = 9 coefficients).
+            use_residual_sh: Whether to use global sky SH (kept for API compatibility).
+            sh_degree: Degree of spherical harmonics (default 1 = 4 coefficients for global sky).
         """
         super().__init__()
 
@@ -229,12 +299,19 @@ class SunModel(torch.nn.Module):
         self.device = device
         self.use_residual_sh = use_residual_sh
         self.sh_degree = sh_degree
-        self.n_sh_coeffs = (sh_degree + 1) ** 2  # 9 for degree 2
+        self.n_sh_coeffs = (sh_degree + 1) ** 2  # 4 for degree 1
 
-        # Learnable sun intensity per image (initialized for typical outdoor sun)
-        # Shape: [n_images, 3] for RGB
-        self.sun_intensity = nn.Parameter(
-            torch.ones(self.n_images, 3, device=device) * 3.0
+        # Learnable sun intensity multiplier per image (scalar, color from elevation prior)
+        # Shape: [n_images, 1]
+        self.sun_intensity_multiplier = nn.Parameter(
+            torch.ones(self.n_images, 1, device=device) * 3.0
+        )
+
+        # Learnable color correction for sun (small adjustment to physical prior)
+        # Initialized to [1, 1, 1] = no correction, learned as multiplier
+        # Shape: [n_images, 3]
+        self.sun_color_correction = nn.Parameter(
+            torch.ones(self.n_images, 3, device=device)
         )
 
         # Learnable ambient color per image (sky/indirect illumination)
@@ -243,13 +320,25 @@ class SunModel(torch.nn.Module):
             torch.ones(self.n_images, 3, device=device) * 0.3
         )
 
-        # Residual SH coefficients for environment details
-        # Shape: [n_images, 3, n_sh_coeffs] - initialized to zero (no residual initially)
+        # GLOBAL sky SH coefficients (shared across all images)
+        # This enables relighting with novel environments
+        # Shape: [3, n_sh_coeffs] - initialized with slight sky gradient (blue at top)
         if use_residual_sh:
-            self.residual_sh = nn.Parameter(
-                torch.zeros(self.n_images, 3, self.n_sh_coeffs, device=device)
-            )
-            print(f"SunModel: Using residual SH with {self.n_sh_coeffs} coefficients per channel")
+            # Initialize with slight upward bias for sky
+            init_sh = torch.zeros(3, self.n_sh_coeffs, device=device)
+            # DC term - base sky color
+            init_sh[0, 0] = 0.2  # R
+            init_sh[1, 0] = 0.25  # G
+            init_sh[2, 0] = 0.4  # B (more blue)
+            if self.n_sh_coeffs >= 4:
+                # L1 z-component - gradient from ground to sky
+                init_sh[2, 2] = 0.1  # Blue increases upward
+
+            self.sky_sh = nn.Parameter(init_sh)
+            print(f"SunModel: Using GLOBAL sky SH with {self.n_sh_coeffs} coefficients (degree {sh_degree})")
+
+        # Keep legacy attribute for compatibility
+        self.sun_intensity = self.sun_intensity_multiplier  # Alias
 
     def evaluate_sh(self, sh_coeffs: torch.Tensor, normals: torch.Tensor) -> torch.Tensor:
         """
@@ -267,7 +356,6 @@ class SunModel(torch.nn.Module):
         x, y, z = normals[:, 0], normals[:, 1], normals[:, 2]
 
         # SH basis functions (real spherical harmonics)
-        # Using same conventions as the rest of the codebase
         N = normals.shape[0]
         result = torch.zeros(N, 3, device=normals.device)
 
@@ -296,26 +384,24 @@ class SunModel(torch.nn.Module):
         return result
 
     def forward(self, image_idx: int, normal_vectors: torch.Tensor,
-                sun_direction: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                sun_direction: torch.Tensor = None,
+                sun_elevation: float = None) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
-        Compute direct illumination for Gaussians using explicit directional lighting
-        plus residual SH environment.
+        Compute direct illumination using sun color prior and global sky SH.
 
-        Implements: intensity = sun_intensity * max(0, N·L) + ambient + SH_residual(N)
-
-        Note: Shadowing should be applied separately by the caller using geometry-based
-        shadow computation with the returned sun direction.
+        Implements: intensity = sun_color(elev) * intensity * max(0, N·L) + ambient + SH_sky(N)
 
         Args:
             image_idx: Index of the image in the dataset.
             normal_vectors: Surface normals [N, 3] (should be normalized).
             sun_direction: Sun direction vector [3] from camera. Required.
+            sun_elevation: Sun elevation angle in degrees. If None, uses default (45°).
 
         Returns:
             Tuple of:
             - intensity: HDR intensity values [N, 3] (unshadowed)
             - sun_direction: Sun direction vector [3] for shadow computation
-            - lighting_components: Dict with 'direct', 'ambient', 'residual' for debugging
+            - lighting_components: Dict with 'direct', 'ambient', 'sky_sh', 'sun_color' for debugging
         """
         if sun_direction is None:
             raise ValueError("sun_direction must be provided from camera")
@@ -326,7 +412,18 @@ class SunModel(torch.nn.Module):
         elif sun_direction.device != self.device:
             sun_direction = sun_direction.to(self.device)
 
-        sun_int = torch.clamp(self.sun_intensity[image_idx], min=0.01)  # [3]
+        # Get sun color from elevation prior
+        if sun_elevation is None:
+            sun_elevation = 45.0  # Default to mid-day sun
+        sun_color_prior = compute_sun_color_from_elevation(sun_elevation, self.device)
+
+        # Apply learnable color correction (small adjustment to physical model)
+        color_correction = torch.clamp(self.sun_color_correction[image_idx], min=0.5, max=2.0)
+        sun_color = sun_color_prior * color_correction  # [3]
+
+        # Get intensity multiplier and ambient
+        intensity_mult = torch.clamp(self.sun_intensity_multiplier[image_idx], min=0.01)  # [1]
+        sun_int = sun_color * intensity_mult  # [3]
         ambient = torch.clamp(self.ambient_color[image_idx], min=0.01)  # [3]
 
         # Normalize sun direction and normals
@@ -335,50 +432,62 @@ class SunModel(torch.nn.Module):
 
         # Lambert's cosine law: N·L
         n_dot_l = torch.sum(normals_norm * sun_dir_norm.unsqueeze(0), dim=-1, keepdim=True)  # [N, 1]
-
-        # Clamp to [0, 1] - only front-facing surfaces receive direct light
         n_dot_l = torch.clamp(n_dot_l, min=0.0)  # [N, 1]
 
-        # Direct sun illumination: sun_intensity * N·L
+        # Direct sun illumination: sun_color * intensity * N·L
         direct_light = n_dot_l * sun_int.unsqueeze(0)  # [N, 3]
 
         # Ambient term
         ambient_light = ambient.unsqueeze(0).expand(normal_vectors.shape[0], -1)  # [N, 3]
 
-        # Residual SH contribution
+        # Global sky SH contribution (same for all images)
         if self.use_residual_sh:
-            residual_light = self.evaluate_sh(self.residual_sh[image_idx], normals_norm)  # [N, 3]
+            sky_light = self.evaluate_sh(self.sky_sh, normals_norm)  # [N, 3]
+            sky_light = torch.clamp(sky_light, min=0.0)  # Sky light should be non-negative
         else:
-            residual_light = torch.zeros_like(direct_light)
+            sky_light = torch.zeros_like(direct_light)
 
-        # Total illumination: direct + ambient + residual
-        # Clamp to prevent negative total intensity
-        intensity = direct_light + ambient_light + residual_light  # [N, 3]
+        # Total illumination
+        intensity = direct_light + ambient_light + sky_light  # [N, 3]
         intensity = torch.clamp(intensity, min=0.0)  # Ensure non-negative
 
         lighting_components = {
             'direct': direct_light,
             'ambient': ambient_light,
-            'residual': residual_light,
+            'residual': sky_light,  # Keep 'residual' key for compatibility
+            'sky_sh': sky_light,
             'n_dot_l': n_dot_l,
+            'sun_color': sun_int,
+            'sun_color_prior': sun_color_prior,
         }
 
         return intensity, sun_dir_norm, lighting_components
 
-    def get_sun_intensity(self, image_idx: int) -> torch.Tensor:
-        """Get the sun intensity for a specific image."""
-        return torch.clamp(self.sun_intensity[image_idx], min=0.01)
+    def get_sun_intensity(self, image_idx: int, sun_elevation: float = None) -> torch.Tensor:
+        """Get the sun intensity (with color prior) for a specific image."""
+        if sun_elevation is None:
+            sun_elevation = 45.0
+        sun_color_prior = compute_sun_color_from_elevation(sun_elevation, self.device)
+        color_correction = torch.clamp(self.sun_color_correction[image_idx], min=0.5, max=2.0)
+        intensity_mult = torch.clamp(self.sun_intensity_multiplier[image_idx], min=0.01)
+        return sun_color_prior * color_correction * intensity_mult
 
     def get_ambient(self, image_idx: int) -> torch.Tensor:
         """Get the ambient color for a specific image."""
         return torch.clamp(self.ambient_color[image_idx], min=0.01)
 
-    def get_residual_sh(self, image_idx: int) -> torch.Tensor:
-        """Get the residual SH coefficients for a specific image."""
+    def get_residual_sh(self, image_idx: int = None) -> torch.Tensor:
+        """Get the global sky SH coefficients (same for all images)."""
         if self.use_residual_sh:
-            return self.residual_sh[image_idx]
+            return self.sky_sh
         else:
             return None
+
+    def get_sky_sh(self) -> torch.Tensor:
+        """Get the global sky SH coefficients."""
+        if self.use_residual_sh:
+            return self.sky_sh
+        return None
 
 
 def compute_sun_sh_simple(direction: torch.Tensor, intensity: float = 3.0,

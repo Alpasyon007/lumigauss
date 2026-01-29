@@ -18,7 +18,7 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", mask = None,
-                 sun_direction = None
+                 sun_direction = None, sun_elevation = None
                  ):
         super(Camera, self).__init__()
 
@@ -30,10 +30,14 @@ class Camera(nn.Module):
         self.FoVy = FoVy
         self.image_name = image_name
 
-        # Sun direction for this camera/image (can be None if not using sun model)
+        # Sun direction and elevation for this camera/image (can be None if not using sun model)
         self.sun_direction = None
         if sun_direction is not None:
             self.sun_direction = torch.tensor(sun_direction, dtype=torch.float32)
+
+        self.sun_elevation = None  # Elevation in degrees
+        if sun_elevation is not None:
+            self.sun_elevation = float(sun_elevation)
 
         try:
             self.data_device = torch.device(data_device)

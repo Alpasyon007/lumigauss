@@ -148,8 +148,9 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             # For test, use first training image's lighting
                             emb_idx = list(appearance_lut.values())[0] if appearance_lut else 0
 
-                        # Get unshadowed lighting + components
-                        rgb_precomp_unshadowed, intensity, sun_dir, components = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, viewpoint.sun_direction)
+                        # Get unshadowed lighting + components (with sun color prior)
+                        sun_elev = viewpoint.sun_elevation
+                        rgb_precomp_unshadowed, intensity, sun_dir, components = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, viewpoint.sun_direction, sun_elevation=sun_elev)
 
                         # render unshadowed with directional lighting
                         render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp_unshadowed)
@@ -188,19 +189,24 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
 
                         # Render direct light only (with shadow applied) - shows sun contribution before ambient/residual
                         # This will be black in shadowed areas
-                        direct_shadowed = direct_light * shadow_mask  # [N, 3]
+                        # For sky gaussians (casts_shadow < 0.5), use full sun intensity instead of N·L shading
+                        casts_shadow_flag = scene.gaussians.get_casts_shadow.unsqueeze(-1)  # [N, 1]
+                        is_sky = casts_shadow_flag < 0.5
+                        # Sky gets full intensity, non-sky gets N·L based direct light
+                        sun_intensity = scene.gaussians.sun_model.get_sun_intensity(emb_idx).unsqueeze(0)  # [1, 3]
+                        direct_for_vis = torch.where(is_sky, sun_intensity.expand(direct_light.shape[0], -1), direct_light)
+                        direct_shadowed = direct_for_vis * shadow_mask  # [N, 3]
                         direct_shadowed_gamma = torch.clamp_min(direct_shadowed, 0.00001) ** (1 / 2.2)
                         direct_shadowed_rgb = torch.clamp(direct_shadowed_gamma * albedo, 0.0)
                         render_pkg_direct = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=direct_shadowed_rgb)
                         direct_light_vis = torch.clamp(render_pkg_direct["render"], 0.0, 1.0)
 
-                        # Render casts_shadow visualization (green=shadow casting, red=sky/non-casting)
+                        # Render casts_shadow visualization as grayscale mask
+                        # Black = sky (non-shadow-casting, value 0), White = non-sky (shadow-casting, value 1)
                         # Use black background for clarity
                         casts_shadow = scene.gaussians.get_casts_shadow  # [N]
-                        # Create RGB: green for shadow-casting (1), red for non-shadow-casting (0)
-                        casts_shadow_rgb = torch.zeros(casts_shadow.shape[0], 3, device=casts_shadow.device)
-                        casts_shadow_rgb[:, 0] = 1.0 - casts_shadow  # Red channel = 1 for sky gaussians
-                        casts_shadow_rgb[:, 1] = casts_shadow  # Green channel = 1 for shadow-casting
+                        # Create grayscale RGB: white for shadow-casting (1), black for non-shadow-casting (0)
+                        casts_shadow_rgb = casts_shadow.unsqueeze(-1).expand(-1, 3)  # [N, 3]
                         render_pkg_casts_shadow = renderFunc(viewpoint, scene.gaussians, renderArgs[0], black_bg, override_color=casts_shadow_rgb)
                         casts_shadow_vis = torch.clamp(render_pkg_casts_shadow["render"], 0.0, 1.0)
 
@@ -222,16 +228,15 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             else:
                                 sky_mask_resized = sky_mask
 
-                            # Create RGB visualization of sky mask (green=not sky, red=sky)
-                            sky_mask_vis = torch.zeros(3, H_render, W_render, device=sky_mask.device)
-                            sky_mask_vis[0] = 1.0 - sky_mask_resized  # Red = sky (mask=0)
-                            sky_mask_vis[1] = sky_mask_resized  # Green = not sky (mask=1)
+                            # Create RGB visualization of sky mask as grayscale (white=not sky, black=sky)
+                            # This matches the casts_shadow_vis format
+                            sky_mask_vis = sky_mask_resized.unsqueeze(0).expand(3, -1, -1)  # [3, H, W]
 
                             # Create comparison: where rendered casts_shadow differs from sky mask
-                            # casts_shadow_vis: green channel high = shadow casting
-                            # sky_mask_vis: green channel high = not sky (should cast shadow)
+                            # casts_shadow_vis is grayscale: high value = shadow casting (not sky)
+                            # sky_mask: 1 = not sky (should cast shadow), 0 = sky
                             # If they match: green. If they differ: red or blue
-                            rendered_is_shadow_caster = casts_shadow_vis[1] > 0.5  # green channel
+                            rendered_is_shadow_caster = casts_shadow_vis[0] > 0.5  # any channel works, it's grayscale
                             mask_says_not_sky = sky_mask_resized > 0.5
 
                             sky_mask_comparison = torch.zeros(3, H_render, W_render, device=sky_mask.device)
@@ -245,12 +250,17 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp_shadowed)
                         image_shadowed = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
 
-                        # Visualize residual SH environment map
+                        # Visualize global sky SH environment map
                         if scene.gaussians.sun_model.use_residual_sh:
-                            # residual_sh shape: [n_images, 3, n_sh_coeffs] -> need [n_sh_coeffs, 3] for shReconstructDiffuseMap
-                            residual_sh_coeffs = scene.gaussians.sun_model.residual_sh[emb_idx]  # [3, 9]
-                            residual_sh_for_vis = residual_sh_coeffs.T.cpu().detach().numpy()  # [9, 3]
-                            residual_env_map = np.clip(shReconstructDiffuseMap(residual_sh_for_vis, width=300), 0, None)
+                            # sky_sh shape: [3, n_sh_coeffs] -> need [n_sh_coeffs, 3] for shReconstructDiffuseMap
+                            sky_sh_coeffs = scene.gaussians.sun_model.sky_sh  # [3, 4] for degree 1
+                            sky_sh_for_vis = sky_sh_coeffs.T.cpu().detach().numpy()  # [4, 3]
+                            # Pad to 9 coeffs if needed for visualization (shReconstructDiffuseMap expects degree 2)
+                            if sky_sh_for_vis.shape[0] < 9:
+                                sky_sh_padded = np.zeros((9, 3))
+                                sky_sh_padded[:sky_sh_for_vis.shape[0]] = sky_sh_for_vis
+                                sky_sh_for_vis = sky_sh_padded
+                            residual_env_map = np.clip(shReconstructDiffuseMap(sky_sh_for_vis, width=300), 0, None)
                             # Apply gamma correction and convert to tensor
                             residual_env_map = torch.clamp(torch.tensor(residual_env_map ** (1 / 2.2)).permute(2, 0, 1), 0.0, 1.0)
 

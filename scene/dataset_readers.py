@@ -37,6 +37,7 @@ class CameraInfo(NamedTuple):
     height: int
     mask: np.array = None
     sun_direction: np.array = None  # Sun direction vector [3] for this image
+    sun_elevation: float = None  # Sun elevation angle in degrees
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -130,6 +131,48 @@ def flip_sun_direction(direction: np.ndarray) -> np.ndarray:
 	arr = np.array(direction, dtype=np.float32)
 	arr[0] = -arr[0]  # Flip x direction
 	return arr
+
+
+def get_sun_elevation_for_image(sun_data: dict, image_name: str) -> Optional[float]:
+	"""
+	Get the sun elevation angle for a specific image.
+
+	Args:
+		sun_data: Dictionary with sun position data for all images
+		image_name: Name of the image to get sun elevation for
+
+	Returns:
+		Sun elevation angle in degrees, or None if not found
+	"""
+	# Try exact match first
+	if image_name in sun_data:
+		sun_pos = sun_data[image_name].get("sun_position", {})
+		elevation = sun_pos.get("elevation_deg")
+		if elevation is not None:
+			return float(elevation)
+
+	# Try with different extensions
+	base_name = image_name.rsplit('.', 1)[0] if '.' in image_name else image_name
+	extensions = [".JPG", ".jpg", ".png", ".PNG", ".jpeg", ".JPEG"]
+
+	for ext in extensions:
+		key = base_name + ext
+		if key in sun_data:
+			sun_pos = sun_data[key].get("sun_position", {})
+			elevation = sun_pos.get("elevation_deg")
+			if elevation is not None:
+				return float(elevation)
+
+	# Try to find a match by removing extension from keys
+	for key in sun_data:
+		key_base = key.rsplit('.', 1)[0] if '.' in key else key
+		if key_base == base_name:
+			sun_pos = sun_data[key].get("sun_position", {})
+			elevation = sun_pos.get("elevation_deg")
+			if elevation is not None:
+				return float(elevation)
+
+	return None
 
 
 def get_sun_direction_for_image(sun_data: dict, image_name: str) -> Optional[np.ndarray]:
@@ -299,14 +342,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir, sun_dat
         else:
             mask = Image.fromarray(np.uint8(np.ones_like(image)*255)).convert('L')
 
-        # Get sun direction for this image if available
+        # Get sun direction and elevation for this image if available
         sun_direction = None
+        sun_elevation = None
         if sun_data is not None:
             sun_direction = get_sun_direction_for_image(sun_data, image_name)
+            sun_elevation = get_sun_elevation_for_image(sun_data, image_name)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height,
-                              mask=mask, sun_direction=sun_direction)
+                              mask=mask, sun_direction=sun_direction, sun_elevation=sun_elevation)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos

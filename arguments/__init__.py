@@ -59,10 +59,11 @@ class ModelParams(ParamGroup):
         self.mlp_W = 64
         self.mlp_D = 3
         self.N_a = 24
-        # Sun position parameters - explicit directional lighting without SH environment
+        # Sun position parameters - explicit directional lighting with sun color prior
         self.use_sun = False  # Enable physical sun model with explicit directional lighting
         self.sun_json_path = ""  # Path to JSON file with sun positions per image
         self.sky_mask_path = ""  # Path to folder with sky masks (black=sky, white=not sky)
+        self.use_residual_sh = True  # Use global sky SH for environment (enables relighting)
         # Shadow computation method: 'none', 'shadow_map', 'ray_march', 'voxel'
         self.shadow_method = "shadow_map"
         self.shadow_map_resolution = 512  # Resolution for shadow mapping

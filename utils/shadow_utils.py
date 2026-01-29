@@ -440,6 +440,12 @@ def compute_shadows_ray_march(
     opacities = gaussians.get_opacity.squeeze()  # [N]
     scales = gaussians.get_scaling  # [N, 3]
 
+    # Filter out non-shadow-casting gaussians (sky gaussians)
+    # by zeroing their opacity for shadow computation
+    casts_shadow = gaussians.get_casts_shadow  # [N]
+    if casts_shadow.shape[0] == opacities.shape[0]:
+        opacities = opacities * casts_shadow
+
     N = positions.shape[0]
 
     # Normalize sun direction
@@ -586,6 +592,12 @@ def compute_shadows_voxel(
     opacities = gaussians.get_opacity.squeeze()  # [N]
     scales = gaussians.get_scaling  # [N, 3]
 
+    # Filter out non-shadow-casting gaussians (sky gaussians)
+    # by zeroing their opacity for shadow computation
+    casts_shadow = gaussians.get_casts_shadow  # [N]
+    if casts_shadow.shape[0] == opacities.shape[0]:
+        opacities = opacities * casts_shadow
+
     N = positions.shape[0]
     res = voxel_resolution
 
@@ -705,12 +717,14 @@ def compute_shadows_for_gaussians(
         - shadow_depth_map: [1, H, W] depth map (only for shadow_map method)
         - sun_camera: SunShadowCamera (only for shadow_map method)
     """
+    shadow_depth_map = None
+    sun_camera = None
+
     if method == "none":
         shadow_mask = compute_shadows_none(gaussians, sun_direction, device)
-        return shadow_mask, None, None
 
     elif method == "shadow_map":
-        return compute_shadows_shadow_map(
+        shadow_mask, shadow_depth_map, sun_camera = compute_shadows_shadow_map(
             gaussians, sun_direction, pipe,
             shadow_map_resolution, shadow_bias, device
         )
@@ -719,17 +733,23 @@ def compute_shadows_for_gaussians(
         shadow_mask = compute_shadows_ray_march(
             gaussians, sun_direction, ray_march_steps, device
         )
-        return shadow_mask, None, None
 
     elif method == "voxel":
         shadow_mask = compute_shadows_voxel(
             gaussians, sun_direction, voxel_resolution, device
         )
-        return shadow_mask, None, None
 
     else:
         raise ValueError(f"Unknown shadow method: {method}. "
                         f"Choose from: 'none', 'shadow_map', 'ray_march', 'voxel'")
+
+    # Sky gaussians (casts_shadow=0) should always be fully lit (not in shadow)
+    # They represent the sky which doesn't receive shadows
+    casts_shadow = gaussians.get_casts_shadow  # [N]
+    is_sky_gaussian = casts_shadow < 0.5
+    shadow_mask = torch.where(is_sky_gaussian, torch.ones_like(shadow_mask), shadow_mask)
+
+    return shadow_mask, shadow_depth_map, sun_camera
 
 
 def visualize_sun_and_camera(
