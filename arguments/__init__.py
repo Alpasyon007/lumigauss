@@ -61,6 +61,7 @@ class ModelParams(ParamGroup):
         self.N_a = 24
         # Sun position parameters - explicit directional lighting with sun color prior
         self.use_sun = False  # Enable physical sun model with explicit directional lighting
+        self.full_pbr = False  # Enable full PBR shading path (guarded, use with --use_sun)
         self.sun_json_path = ""  # Path to JSON file with sun positions per image
         self.sky_mask_path = ""  # Path to folder with sky masks (black=sky, white=not sky)
         self.use_residual_sh = True  # Use global sky SH for environment (enables relighting)
@@ -82,6 +83,7 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.depth_ratio = 0.0
+        self.use_gaussians = False
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
 
@@ -112,6 +114,30 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
 
+        # Adaptive grid-based densification (populates empty high-loss regions)
+        self.use_adaptive_dens = False
+        # More aggressive defaults to better fill empty/under-represented regions.
+        self.adaptive_dens_grid_res = 48             # Higher: finer/smaller cells (more localized placement, noisier); Lower: coarser/larger cells (smoother, less precise)
+        self.adaptive_dens_interval = 250            # Higher: trigger less often (slower growth); Lower: trigger more often (faster growth, more compute/memory)
+        self.adaptive_dens_from_iter = 500           # Higher: starts later (safer/stabler early training); Lower: starts earlier (fills gaps sooner)
+        self.adaptive_dens_until_iter = 30000        # Higher: keep adaptive densification active longer; Lower: stop earlier
+        self.adaptive_dens_loss_thresh = 0.01         # Higher (e.g. 0.8): only very top-loss cells selected (more selective); Lower (e.g. 0.2): many cells selected (more aggressive spread)
+        self.adaptive_dens_max_gaussians = 4096      # Higher: more new gaussians per trigger (stronger effect, higher VRAM/time); Lower: fewer additions
+        self.adaptive_dens_count_thresh = 12         # Higher: more cells treated as sparse (more filling); Lower: only near-empty cells treated as sparse
+        # When depth is 0 (often indicates holes / empty regions), optionally sample along the camera ray
+        # within the scene AABB so loss can still be attributed to 3D space.
+        self.adaptive_dens_fill_empty = True
+        self.adaptive_dens_zero_depth_max_pixels = 16384  # Higher: use more zero-depth pixels for hole filling (stronger but slower); Lower: faster but less coverage
+        self.adaptive_dens_zero_depth_samples = 2         # Higher: more samples along each zero-depth ray (better volume coverage, more compute); Lower: cheaper
+        self.adaptive_dens_surface_samples = 2            # Higher: more samples around valid-depth surfaces (thicker coverage); Lower: thinner/surface-only coverage
+        self.adaptive_dens_surface_jitter = 20           # Higher: broader depth neighborhood around surface (more exploratory); Lower: tighter around rendered surface
+        self.adaptive_dens_ema_decay = 0.8                # Higher: slower/stabler adaptation to new loss (more memory); Lower: faster reaction to recent errors
+        self.adaptive_dens_use_highfreq = True            # Enable high-frequency (edge/detail) checks to prioritize structurally important regions
+        self.adaptive_dens_hf_boost = 0.75                # Additional score multiplier for high-frequency pixels
+        self.adaptive_dens_hf_quantile = 0.6              # Quantile threshold for high-frequency pixel detection
+        self.adaptive_dens_hole_score_quantile = 0.5      # For depth==0 pixels, keep only higher-scoring half by default
+        self.adaptive_dens_vis_interval = 100             # TensorBoard logging interval for adaptive densification maps
+
         self.env_lr = 0.02
         self.mlp_lr = 0.002
         self.mlp_lr_final_ratio = 10.0
@@ -124,6 +150,7 @@ class OptimizationParams(ParamGroup):
         self.consistency_loss_lambda_init = 1.0
         self.consistency_loss_lambda_final_ratio = 1.0
         self.shadow_loss_lambda=10.0
+        self.sky_mask_loss_weight = 0.5
 
         super().__init__(parser, "Optimization Parameters")
 

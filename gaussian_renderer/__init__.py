@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -11,15 +11,44 @@
 
 import torch
 import math
-from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.point_utils import depth_to_normal
 from utils.sh_utils import eval_sh_point
 
+try:
+    from diff_surfel_rasterization import GaussianRasterizationSettings as SurfelGaussianRasterizationSettings
+    from diff_surfel_rasterization import GaussianRasterizer as SurfelGaussianRasterizer
+except ImportError:
+    SurfelGaussianRasterizationSettings = None
+    SurfelGaussianRasterizer = None
+
+try:
+    from diff_gaussian_rasterization import GaussianRasterizationSettings as DenseGaussianRasterizationSettings
+    from diff_gaussian_rasterization import GaussianRasterizer as DenseGaussianRasterizer
+except ImportError:
+    DenseGaussianRasterizationSettings = None
+    DenseGaussianRasterizer = None
+
+
+def _get_rasterizer_backend(use_gaussians: bool):
+    if use_gaussians:
+        if DenseGaussianRasterizationSettings is None or DenseGaussianRasterizer is None:
+            raise ImportError(
+                "--use_gaussians was enabled but diff_gaussian_rasterization is not available. "
+                "Build/install submodules/diff-gaussian-rasterization first."
+            )
+        return DenseGaussianRasterizationSettings, DenseGaussianRasterizer
+
+    if SurfelGaussianRasterizationSettings is None or SurfelGaussianRasterizer is None:
+        raise ImportError(
+            "diff_surfel_rasterization is not available. Build/install submodules/diff-surfel-rasterization first."
+        )
+    return SurfelGaussianRasterizationSettings, SurfelGaussianRasterizer
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, gaussian_mask=None):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
     """
     if not torch.is_tensor(gaussian_mask):
@@ -27,10 +56,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         opacity_limit_min, opacity_limit_max = -torch.inf, torch.inf
     else:
         opacity_limit_min, opacity_limit_max = -torch.inf, torch.inf
-    
+
     if override_color is None:
         raise("PLEASE OVERRIDE COLOR BECAUSE WE CHANGED LOGIC")
- 
+
+    use_gaussians = bool(getattr(pipe, "use_gaussians", False))
+    GaussianRasterizationSettings, GaussianRasterizer = _get_rasterizer_backend(use_gaussians)
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     screenspace_points=screenspace_points[gaussian_mask]
@@ -75,7 +107,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         scales = pc.get_scaling[gaussian_mask]
         rotations = pc.get_rotation[gaussian_mask]
-    
+
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     pipe.convert_SHs_python = False
@@ -98,17 +130,29 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     except:
         pass
 
-    rendered_image, radii, allmap = rasterizer(
-        means3D = means3D,
-        means2D = means2D,
-        shs = shs,
-        colors_precomp = colors_precomp,
-        opacities = opacity,
-        scales = scales,
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp
-    )
-    
+    if use_gaussians:
+        rendered_image, radii = rasterizer(
+            means3D = means3D,
+            means2D = means2D,
+            shs = shs,
+            colors_precomp = colors_precomp,
+            opacities = opacity,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp
+        )
+    else:
+        rendered_image, radii, allmap = rasterizer(
+            means3D = means3D,
+            means2D = means2D,
+            shs = shs,
+            colors_precomp = colors_precomp,
+            opacities = opacity,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp
+        )
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     rets =  {"render": rendered_image,
@@ -118,37 +162,49 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     }
 
 
-    # additional regularizations
-    render_alpha = torch.nan_to_num(allmap[1:2], 0, 0)
+    if use_gaussians:
+        H, W = rendered_image.shape[1], rendered_image.shape[2]
+        device = rendered_image.device
+        dtype = rendered_image.dtype
 
-    # get normal map
-    render_normal = torch.nan_to_num(allmap[2:5],0,0)
-    view_normal = -torch.nan_to_num(allmap[2:5],0,0)#.clone()
-    render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)
-    
-    # get median depth map
-    render_depth_median = allmap[5:6]
-    render_depth_median = torch.nan_to_num(render_depth_median, 0, 0)
+        render_alpha = torch.ones((1, H, W), device=device, dtype=dtype)
+        render_normal = torch.zeros((3, H, W), device=device, dtype=dtype)
+        view_normal = torch.zeros((3, H, W), device=device, dtype=dtype)
+        render_dist = torch.zeros((1, H, W), device=device, dtype=dtype)
+        surf_depth = torch.zeros((1, H, W), device=device, dtype=dtype)
+        surf_normal = torch.zeros((3, H, W), device=device, dtype=dtype)
+    else:
+        # additional regularizations
+        render_alpha = torch.nan_to_num(allmap[1:2], 0, 0)
 
-    # get expected depth map
-    render_depth_expected = allmap[0:1]
-    render_depth_expected = torch.nan_to_num(render_depth_expected, 0, 0)
-    render_depth_expected = (render_depth_expected / render_alpha.clamp_min(1e-6))
-    
-    # get depth distortion map
-    render_dist = torch.nan_to_num(allmap[6:7],0,0)
+        # get normal map
+        render_normal = torch.nan_to_num(allmap[2:5],0,0)
+        view_normal = -torch.nan_to_num(allmap[2:5],0,0)#.clone()
+        render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)
 
-    # psedo surface attributes
-    # surf depth is either median or expected by setting depth_ratio to 1 or 0
-    # for bounded scene, use median depth, i.e., depth_ratio = 1; 
-    # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
-    surf_depth = render_depth_expected * (1-pipe.depth_ratio) + (pipe.depth_ratio) * render_depth_median
-    
-    # assume the depth points form the 'surface' and generate psudo surface normal for regularizations.
-    surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
-    surf_normal = surf_normal.permute(2,0,1)
-    # remember to multiply with accum_alpha since render_normal is unnormalized.
-    surf_normal = surf_normal * (render_alpha).detach()
+        # get median depth map
+        render_depth_median = allmap[5:6]
+        render_depth_median = torch.nan_to_num(render_depth_median, 0, 0)
+
+        # get expected depth map
+        render_depth_expected = allmap[0:1]
+        render_depth_expected = torch.nan_to_num(render_depth_expected, 0, 0)
+        render_depth_expected = (render_depth_expected / render_alpha.clamp_min(1e-6))
+
+        # get depth distortion map
+        render_dist = torch.nan_to_num(allmap[6:7],0,0)
+
+        # psedo surface attributes
+        # surf depth is either median or expected by setting depth_ratio to 1 or 0
+        # for bounded scene, use median depth, i.e., depth_ratio = 1;
+        # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
+        surf_depth = render_depth_expected * (1-pipe.depth_ratio) + (pipe.depth_ratio) * render_depth_median
+
+        # assume the depth points form the 'surface' and generate psudo surface normal for regularizations.
+        surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
+        surf_normal = surf_normal.permute(2,0,1)
+        # remember to multiply with accum_alpha since render_normal is unnormalized.
+        surf_normal = surf_normal * (render_alpha).detach()
 
 
     rets.update({

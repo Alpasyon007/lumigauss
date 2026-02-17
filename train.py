@@ -27,8 +27,13 @@ import json
 import os
 from utils.normal_utils import compute_normal_world_space
 from utils.loss_utils import compute_sh_gauss_losses, compute_sh_env_loss
-from utils.train_utils import prepare_output_and_logger, training_report, update_lambdas
+from utils.train_utils import (
+    prepare_output_and_logger, training_report, update_lambdas,
+    get_training_phase, create_loss_components, LossComponents, TrainingPhase,
+    generate_final_metrics_report, export_metrics_to_csv
+)
 from utils.shadow_utils import compute_shadows_for_gaussians
+from utils.adaptive_dens_utils import AdaptiveDensGrid
 
 
 
@@ -36,7 +41,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     assert opt.warmup <= opt.start_shadowed
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer, metrics_logger = prepare_output_and_logger(dataset)
 
     # Create GaussianModel - sun data is loaded automatically in Scene via dataset_readers
     # and stored in cameras. n_images is needed for use_sun mode.
@@ -44,7 +49,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # We need to know the number of images upfront for the SunModel
         # This will be set properly after Scene is created
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
-                                   use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh)  # Temporary, will be reset
+                                   use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh,
+                                   full_pbr=dataset.full_pbr)  # Temporary, will be reset
     else:
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
@@ -105,6 +111,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     viewpoint_stack = None
 
+    # ---- Adaptive grid-based densification setup ----
+    adaptive_grid = None
+    if opt.use_adaptive_dens:
+        adaptive_grid = AdaptiveDensGrid(
+            gaussians, scene.cameras_extent,
+            grid_resolution=opt.adaptive_dens_grid_res,
+            fill_empty=getattr(opt, "adaptive_dens_fill_empty", True),
+            zero_depth_max_pixels=getattr(opt, "adaptive_dens_zero_depth_max_pixels", 4096),
+            zero_depth_samples=getattr(opt, "adaptive_dens_zero_depth_samples", 1),
+            surface_samples=getattr(opt, "adaptive_dens_surface_samples", 1),
+            surface_jitter=getattr(opt, "adaptive_dens_surface_jitter", 0.0),
+            ema_decay=getattr(opt, "adaptive_dens_ema_decay", 0.8),
+            use_highfreq=getattr(opt, "adaptive_dens_use_highfreq", True),
+            highfreq_boost=getattr(opt, "adaptive_dens_hf_boost", 0.75),
+            highfreq_quantile=getattr(opt, "adaptive_dens_hf_quantile", 0.6),
+            hole_score_quantile=getattr(opt, "adaptive_dens_hole_score_quantile", 0.5),
+        )
+        print(f"[Adaptive Densification] Enabled  –  grid {opt.adaptive_dens_grid_res}³, "
+              f"interval={opt.adaptive_dens_interval}, "
+              f"iters [{opt.adaptive_dens_from_iter}, {opt.adaptive_dens_until_iter}]")
+
     print("\n[Saving Gaussians before trainig")
     scene.save(0)
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -140,7 +167,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_vectors, multiplier = compute_normal_world_space(quaternions, scales, viewpoint_cam.world_view_transform, gaussians.get_xyz)
 
         # Update loss lambdas depending on shadowed/unshadowed mode
-        lambdas = update_lambdas(iteration, opt)
+        lambdas = update_lambdas(iteration, opt, use_sun=gaussians.use_sun)
         shadowed_image_loss_lambda = lambdas["shadowed_image_loss_lambda"]
         unshadowed_image_loss_lambda = lambdas["unshadowed_image_loss_lambda"]
         consistency_loss_lambda = lambdas["consistency_loss_lambda"]
@@ -150,7 +177,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         lambda_normal = lambdas["lambda_normal"]
         lambda_dist = lambdas["lambda_dist"]
 
+        if getattr(pipe, "use_gaussians", False):
+            lambda_normal = 0.0
+            lambda_dist = 0.0
+
         # photometric loss for unshadowed
+        # NOTE: For use_sun mode, the unshadowed image should NOT be the primary loss target
+        # during warmup, because GT images have real shadows. If we fit unshadowed to GT,
+        # the model bakes shadow patterns into albedo. Instead, unshadowed serves as a
+        # small regularizer to encourage clean, shadow-free albedo.
         if unshadowed_image_loss_lambda >0:
             if gaussians.use_sun:
                 # Use explicit directional lighting with sun color prior
@@ -160,7 +195,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if sun_dir is None:
                     raise ValueError(f"Sun direction missing for camera {viewpoint_cam.image_name}")
                 # Shadows are not applied here - just unshadowed lighting
-                rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
+                if gaussians.full_pbr:
+                    rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_pbr(
+                        emb_idx, normal_vectors, sun_dir, viewpoint_cam.camera_center, sun_elevation=sun_elev
+                    )
+                else:
+                    rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
             else:
                 rgb_precomp_unshadowed, _ = gaussians.compute_gaussian_rgb(sh_env+sh_random_noise, shadowed=False, normal_vectors=normal_vectors)
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_unshadowed)
@@ -182,15 +222,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 sun_elev = viewpoint_cam.sun_elevation
                 if sun_dir is None:
                     raise ValueError(f"Sun direction missing for camera {viewpoint_cam.image_name}")
-                # Use explicit directional lighting with sun color prior
-                rgb_precomp_unshadowed_for_shadow, intensity_unshadowed, sun_dir, components = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
-
                 # Compute shadow mask using selected method
+                shadow_method = dataset.shadow_method
+                if getattr(pipe, "use_gaussians", False) and shadow_method == "shadow_map":
+                    shadow_method = "ray_march"
                 shadow_mask, _, _ = compute_shadows_for_gaussians(
                     gaussians,
                     sun_dir,
                     pipe,
-                    method=dataset.shadow_method,
+                    method=shadow_method,
                     shadow_map_resolution=dataset.shadow_map_resolution,
                     shadow_bias=dataset.shadow_bias,
                     ray_march_steps=dataset.ray_march_steps,
@@ -198,19 +238,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     device="cuda"
                 )
                 shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
+                if gaussians.full_pbr:
+                    rgb_precomp_shadowed, _, sun_dir, _ = gaussians.compute_directional_pbr(
+                        emb_idx, normal_vectors, sun_dir, viewpoint_cam.camera_center,
+                        sun_elevation=sun_elev, shadow_mask=shadow_mask
+                    )
+                else:
+                    # Use explicit directional lighting with sun color prior
+                    _, _, sun_dir, components = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
 
-                # Apply shadow to direct lighting only (ambient and residual remain unaffected)
-                direct_light = components['direct']
-                ambient_light = components['ambient']
-                residual_light = components['residual']
+                    # Apply shadow to direct lighting only (ambient and residual remain unaffected)
+                    direct_light = components['direct']
+                    ambient_light = components['ambient']
+                    residual_light = components['residual']
 
-                # Shadowed intensity = direct * shadow + ambient + residual
-                intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
-                intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
-                intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)  # gamma correction
+                    # Shadowed intensity = direct * shadow + ambient + residual
+                    intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                    intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                    intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)  # gamma correction
 
-                albedo = gaussians.get_albedo
-                rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+                    albedo = gaussians.get_albedo
+                    rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
             else:
                 rgb_precomp_shadowed, _  = gaussians.compute_gaussian_rgb(sh_env+sh_random_noise, multiplier=multiplier)
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_shadowed)
@@ -245,15 +293,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             sh_env_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
 
-        # Sun model regularization: encourage global sky SH to stay bounded
+        # Sun model regularization: encourage direct light to dominate over ambient/sky
         sun_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
-        if gaussians.use_sun and gaussians.sun_model.use_residual_sh:
-            sky_sh = gaussians.sun_model.sky_sh  # Global sky SH [3, n_coeffs]
-            # L2 regularization on global sky SH coefficients (lighter than per-image)
-            sun_reg_loss = 0.001 * (sky_sh ** 2).mean()
-            # Also regularize sun_color_correction to stay near 1.0
+        if gaussians.use_sun:
+            # Get current lighting parameters
+            sun_int = gaussians.sun_model.get_sun_intensity(emb_idx)  # [3]
+            ambient = gaussians.sun_model.get_ambient(emb_idx)  # [3]
+
+            # 1. Regularize ambient to stay lower than sun intensity
+            # Ambient should be ~10-30% of sun intensity for realistic outdoor scenes
+            ambient_ratio = ambient.mean() / (sun_int.mean() + 1e-6)
+            if ambient_ratio > 0.3:
+                # Penalize if ambient is more than 30% of sun
+                sun_reg_loss = sun_reg_loss + 0.1 * (ambient_ratio - 0.3) ** 2
+
+            # 2. Regularize sun_color_correction to stay near 1.0
             color_corr = gaussians.sun_model.sun_color_correction[emb_idx]
             sun_reg_loss = sun_reg_loss + 0.01 * ((color_corr - 1.0) ** 2).mean()
+
+            # 3. Regularize global sky SH to stay bounded
+            if gaussians.sun_model.use_residual_sh:
+                sky_sh = gaussians.sun_model.sky_sh  # Global sky SH [3, n_coeffs]
+                # L2 regularization - sky should be subtle
+                sun_reg_loss = sun_reg_loss + 0.01 * (sky_sh ** 2).mean()
+                # Sky SH DC term should be lower than ambient
+                sky_dc = sky_sh[:, 0].abs().mean() * 0.282095  # DC contribution
+                if sky_dc > ambient.mean() * 0.5:
+                    sun_reg_loss = sun_reg_loss + 0.05 * (sky_dc - ambient.mean() * 0.5) ** 2
 
         # Sky mask loss: train _casts_shadow to match sky mask via rendering
         sky_mask_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
@@ -262,7 +328,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             sky_mask_loss_raw, _ = gaussians.compute_sky_mask_loss(
                 viewpoint_cam, sky_mask, render, pipe, background
             )
-            sky_mask_loss = 0.1 * sky_mask_loss_raw  # Weight for sky mask loss
+            sky_mask_loss = opt.sky_mask_loss_weight * sky_mask_loss_raw
 
         # 2DGS original regularization
         if lambda_normal>0 or lambda_dist>0:
@@ -279,11 +345,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss + sky_mask_loss
 
         # Only backward if we have a loss with gradients
-        # For use_sun mode during warmup->shadowed transition, SH losses are skipped and image losses may be 0
-        if total_loss.requires_grad:
+        if torch.is_tensor(total_loss) and total_loss.requires_grad:
             total_loss.backward()
         else:
-            # Skip backward if no gradients (happens during certain training phases with use_sun)
+            # Skip backward if no gradients (happens during certain training phases)
             pass
 
         iter_end.record()
@@ -292,17 +357,53 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
 
             if iteration % 10 == 0:
+                # Create structured loss components
+                loss_components = create_loss_components(
+                    unshadowed_image_loss=unshadowed_image_loss,
+                    shadowed_image_loss=shadowed_image_loss,
+                    l1_unshadowed=Ll1_unshadowed,
+                    l1_shadowed=Ll1_shadowed,
+                    normal_loss=normal_loss,
+                    dist_loss=dist_loss,
+                    sh_gauss_loss=sh_gauss_loss,
+                    sh_env_loss=sh_env_loss,
+                    consistency_loss=consistency_loss,
+                    shadow_loss=shadow_loss,
+                    sun_reg_loss=sun_reg_loss,
+                    sky_mask_loss=sky_mask_loss,
+                    total_loss=total_loss
+                )
+
+                # Get training phase info
+                phase = get_training_phase(iteration, opt)
+
+                # Log to metrics logger with structured data
+                if metrics_logger is not None:
+                    metrics_logger.log_training_losses(iteration, loss_components, phase, lambdas)
+
+                # Console output - more compact and informative
+                phase_name = phase.get_phase_name()
+                def _val(x):
+                    return x.item() if torch.is_tensor(x) else float(x)
                 loss_dict = {
-                    "UnshadowedImLoss": f"{unshadowed_image_loss:.{5}f}",
-                    "ShadowedImLoss": f"{shadowed_image_loss:.{5}f}",
-                    "DistortLoss": f"{dist_loss:.{5}f}",
-                    "NormalLoss": f"{normal_loss:.{5}f}",
-                    "SHgaussLoss": f"{sh_gauss_loss:.{5}f}",
-                    "SHenvLoss": f"{sh_env_loss:.{5}f}",
-                    "ConsistencyLoss": f"{consistency_loss:.{5}f}",
-                    "ShadowLoss": f"{shadow_loss:.{5}f}",
+                    "Phase": phase_name,
+                    "Total": f"{_val(total_loss):.5f}",
+                    "Unshadowed": f"{_val(unshadowed_image_loss):.5f}",
+                    "Shadowed": f"{_val(shadowed_image_loss):.5f}",
+                    "Normal": f"{_val(normal_loss):.5f}",
+                    "Dist": f"{_val(dist_loss):.5f}",
+                    "SHgauss": f"{_val(sh_gauss_loss):.5f}",
+                    "SHenv": f"{_val(sh_env_loss):.5f}",
+                    "Consist": f"{_val(consistency_loss):.5f}",
+                    "Shadow": f"{_val(shadow_loss):.5f}",
                     "Points": f"{len(gaussians.get_xyz)}"
                 }
+                # Add sun-specific losses if in use_sun mode
+                if gaussians.use_sun:
+                    loss_dict["SunReg"] = f"{_val(sun_reg_loss):.5f}"
+                    if sky_masks:
+                        loss_dict["SkyMask"] = f"{_val(sky_mask_loss):.5f}"
+
                 print(loss_dict)
 
                 progress_bar.update(10)
@@ -310,7 +411,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             psnr_metric = training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background),
-                                          appearance_lut=appearance_lut, source_path=dataset.source_path, sky_masks=sky_masks)
+                                          appearance_lut=appearance_lut, source_path=dataset.source_path, sky_masks=sky_masks,
+                                          metrics_logger=metrics_logger)
 
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -320,11 +422,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Densification
             if iteration < opt.densify_until_iter and (iteration<opt.warmup or iteration>opt.start_shadowed):
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                if iteration > opt.start_shadowed:
-                    gradient_stats = viewspace_point_tensor_unshadowed.grad + viewspace_point_tensor_shadowed.grad
-                else:
+                # Accumulate gradient stats from whichever renders were active
+                gradient_stats = None
+                if unshadowed_image_loss_lambda > 0:
                     gradient_stats = viewspace_point_tensor_unshadowed.grad
-                gaussians.add_densification_stats(gradient_stats, visibility_filter)
+                if shadowed_image_loss_lambda > 0:
+                    if gradient_stats is not None:
+                        gradient_stats = gradient_stats + viewspace_point_tensor_shadowed.grad
+                    else:
+                        gradient_stats = viewspace_point_tensor_shadowed.grad
+                if gradient_stats is not None:
+                    gaussians.add_densification_stats(gradient_stats, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -333,21 +441,108 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
+            # ---- Adaptive grid-based densification ----
+            if (adaptive_grid is not None
+                    and iteration >= opt.adaptive_dens_from_iter
+                    and iteration <= opt.adaptive_dens_until_iter):
+                # Accumulate per-pixel loss into the 3D voxel grid every iteration
+                # Pick whichever rendered image + loss is active
+                active_image = None
+                if shadowed_image_loss_lambda > 0:
+                    active_image = image_shadowed
+                elif unshadowed_image_loss_lambda > 0:
+                    active_image = image_unshadowed
+                if active_image is not None:
+                    per_pixel_loss = torch.abs(active_image - gt_image).mean(dim=0)  # [H, W]
+                    surf_depth = render_pkg.get("surf_depth", None)
+                    if surf_depth is not None:
+                        dens_mask = mask
+                        # Ignore sky for adaptive densification (sky is naturally high-error and dynamic).
+                        if sky_masks and viewpoint_cam.image_name in sky_masks:
+                            import torch.nn.functional as F
+                            sky_non_sky_mask = sky_masks[viewpoint_cam.image_name]  # [H, W], 1=non-sky
+
+                            # Resize sky mask to current view resolution if needed.
+                            target_h, target_w = per_pixel_loss.shape
+                            if sky_non_sky_mask.shape[0] != target_h or sky_non_sky_mask.shape[1] != target_w:
+                                sky_non_sky_mask = F.interpolate(
+                                    sky_non_sky_mask.unsqueeze(0).unsqueeze(0),
+                                    size=(target_h, target_w),
+                                    mode='nearest'
+                                ).squeeze(0).squeeze(0)
+
+                            if torch.is_tensor(dens_mask):
+                                if dens_mask.dim() == 3:
+                                    dens_mask = dens_mask * sky_non_sky_mask.unsqueeze(0)
+                                else:
+                                    dens_mask = dens_mask * sky_non_sky_mask
+                            else:
+                                dens_mask = sky_non_sky_mask
+
+                        dens_debug = adaptive_grid.accumulate(
+                            per_pixel_loss, surf_depth.squeeze(0),
+                            viewpoint_cam, mask=dens_mask, reference_image=gt_image
+                        )
+
+                        if tb_writer and dens_debug is not None:
+                            vis_interval = max(int(getattr(opt, "adaptive_dens_vis_interval", 100)), 1)
+                            if iteration % vis_interval == 0:
+                                err_map = dens_debug["error_map"]
+                                score_map = dens_debug["score_map"]
+                                hf_map = dens_debug["highfreq_map"]
+                                selected_mask = dens_debug["selected_mask"].float()
+
+                                err_map = err_map / (err_map.max().clamp_min(1e-6))
+                                score_map = score_map / (score_map.max().clamp_min(1e-6))
+                                hf_map = hf_map / (hf_map.max().clamp_min(1e-6))
+
+                                selected_rgb = selected_mask.unsqueeze(0).expand(3, -1, -1)
+                                overlay = torch.clamp(gt_image, 0.0, 1.0).clone()
+                                overlay[0] = torch.clamp(overlay[0] + 0.8 * selected_mask, 0.0, 1.0)
+                                overlay[1] = torch.clamp(overlay[1] * (1.0 - 0.6 * selected_mask), 0.0, 1.0)
+                                overlay[2] = torch.clamp(overlay[2] * (1.0 - 0.6 * selected_mask), 0.0, 1.0)
+
+                                tag = f"adaptive_dens/{viewpoint_cam.image_name}"
+                                tb_writer.add_images(tag + "/01_error_map", err_map.unsqueeze(0).unsqueeze(0), global_step=iteration)
+                                tb_writer.add_images(tag + "/02_highfreq_map", hf_map.unsqueeze(0).unsqueeze(0), global_step=iteration)
+                                tb_writer.add_images(tag + "/03_score_map", score_map.unsqueeze(0).unsqueeze(0), global_step=iteration)
+                                tb_writer.add_images(tag + "/04_selected_pixels", selected_rgb.unsqueeze(0), global_step=iteration)
+                                tb_writer.add_images(tag + "/05_densify_overlay", overlay.unsqueeze(0), global_step=iteration)
+
+                # Trigger adaptive densification at the configured interval
+                if (iteration > opt.adaptive_dens_from_iter
+                        and iteration % opt.adaptive_dens_interval == 0):
+                    adaptive_grid.trigger_densification(
+                        gaussians,
+                        loss_thresh_quantile=opt.adaptive_dens_loss_thresh,
+                        count_thresh=opt.adaptive_dens_count_thresh,
+                        max_new_gaussians=opt.adaptive_dens_max_gaussians,
+                    )
+
             # Sky mask loss is now applied during training loop (see sky_mask_loss computation above)
             # No need for periodic update_sky_gaussians calls
 
             # update lrs
             if iteration>opt.warmup and iteration<=opt.start_shadowed:
-                for param_group in gaussians.optimizer_env.param_groups:
-                    # For sun model, keep a small learning rate during SH_gauss tuning
-                    # This helps maintain good sun priors while tuning Gaussian SH
-                    if gaussians.use_sun and param_group["name"] in ["sun_intensity", "sun_color_correction", "ambient_color", "sky_sh"]:
-                        param_group['lr'] = opt.env_lr * 0.1  # Reduced but not zero
-                    else:
+                if gaussians.use_sun:
+                    # For use_sun mode: keep sun model learning rates active during this phase
+                    # since we're still training with shadowed rendering
+                    for param_group in gaussians.optimizer_env.param_groups:
+                        if param_group["name"] == "sun_intensity":
+                            param_group['lr'] = opt.env_lr * 1.0  # Keep learning
+                        elif param_group["name"] == "sun_color_correction":
+                            param_group['lr'] = opt.env_lr * 0.3
+                        elif param_group["name"] == "ambient_color":
+                            param_group['lr'] = opt.env_lr * 1.0
+                        elif param_group["name"] == "sky_sh":
+                            param_group['lr'] = opt.env_lr * 0.5
+                    # Don't freeze rotation for sun mode - normals matter for N·L
+                else:
+                    for param_group in gaussians.optimizer_env.param_groups:
                         param_group['lr'] = 0.0
-                for param_group in gaussians.optimizer.param_groups:
-                    if "rotation" in param_group["name"]:
-                        param_group['lr'] = 0.0
+                    for param_group in gaussians.optimizer.param_groups:
+                        if "rotation" in param_group["name"]:
+                            param_group['lr'] = 0.0
 
             if iteration>opt.start_shadowed:
                 for param_group in gaussians.optimizer_env.param_groups:
@@ -394,6 +589,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     torch.save(gaussians.env_params.state_dict(), scene.model_path + "/chkpnt_env" + str(iteration) + ".pth")
                     torch.save(gaussians.optimizer_env.state_dict(), scene.model_path + "/chkpnt_optimizer_env" + str(iteration) + ".pth")
+
+    # Generate final metrics report
+    if metrics_logger is not None:
+        generate_final_metrics_report(metrics_logger)
+        export_metrics_to_csv(metrics_logger)
 
 
 

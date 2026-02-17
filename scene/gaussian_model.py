@@ -11,6 +11,7 @@
 
 import torch
 import numpy as np
+import math
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
@@ -54,7 +55,8 @@ class GaussianModel:
 
 
     def __init__(self, sh_degree : int, with_mlp: bool = False, mlp_W=128, mlp_D=4, N_a = 32,
-                 use_sun: bool = False, n_images: int = None, use_residual_sh: bool = True):
+                 use_sun: bool = False, n_images: int = None, use_residual_sh: bool = True,
+                 full_pbr: bool = False):
 
         # We only implement deg 2 for SH_gauss and SH_env.
         # More on environment map degree: https://cseweb.ucsd.edu/~ravir/papers/envmap/envmap.pdf
@@ -68,6 +70,8 @@ class GaussianModel:
         self._features_dc_negative = torch.empty(0)
         self._features_rest_negative = torch.empty(0)
         self._albedo = torch.empty(0)
+        self._roughness = torch.empty(0)
+        self._metallic = torch.empty(0)
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -85,6 +89,9 @@ class GaussianModel:
 
         # Sun model parameters (explicit directional lighting, no SH for environment)
         self.use_sun = use_sun
+        self.full_pbr = bool(full_pbr and use_sun)
+        if full_pbr and not use_sun:
+            print("Warning: --full_pbr requires --use_sun. Disabling full_pbr.")
         self.n_images = n_images
         self.use_residual_sh = use_residual_sh  # Whether to use residual SH for environment details
         self.sun_model = None
@@ -158,6 +165,8 @@ class GaussianModel:
             self._features_dc_negative,
             self._features_rest_negative,
             self._albedo,
+            self._roughness,
+            self._metallic,
             self._scaling,
             self._rotation,
             self._opacity,
@@ -169,21 +178,50 @@ class GaussianModel:
         )
 
     def restore(self, model_args, training_args):
-        (self.active_sh_degree,
-        self._xyz,
-        self._features_dc_positive,
-        self._features_rest_positive,
-        self._features_dc_negative,
-        self._features_rest_negative,
-        self._albedo,
-        self._scaling,
-        self._rotation,
-        self._opacity,
-        self.max_radii2D,
-        xyz_gradient_accum,
-        denom,
-        opt_dict,
-        self.spatial_lr_scale) = model_args
+        if len(model_args) >= 17:
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc_positive,
+            self._features_rest_positive,
+            self._features_dc_negative,
+            self._features_rest_negative,
+            self._albedo,
+            self._roughness,
+            self._metallic,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
+        else:
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc_positive,
+            self._features_rest_positive,
+            self._features_dc_negative,
+            self._features_rest_negative,
+            self._albedo,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
+            self._roughness = nn.Parameter(
+                torch.full((self._xyz.shape[0], 1), 0.6, device="cuda", dtype=torch.float32).requires_grad_(self.full_pbr)
+            )
+            self._metallic = nn.Parameter(
+                torch.zeros((self._xyz.shape[0], 1), device="cuda", dtype=torch.float32).requires_grad_(self.full_pbr)
+            )
+
+        # Ensure PBR material params are trainable only when full_pbr is enabled.
+        self._roughness = nn.Parameter(self._roughness.detach().requires_grad_(self.full_pbr))
+        self._metallic = nn.Parameter(self._metallic.detach().requires_grad_(self.full_pbr))
         # Reinitialize _casts_shadow as learnable parameter with correct size (default: all shadow-casting)
         # Will be optimized via sky mask loss during training
         self._casts_shadow = nn.Parameter(torch.ones(self._xyz.shape[0], device="cuda", dtype=torch.float32).requires_grad_(True))
@@ -225,6 +263,18 @@ class GaussianModel:
     @property
     def get_albedo(self):
         return torch.clamp(SH2RGB(self._albedo), 0.0)
+
+    @property
+    def get_base_color(self):
+        return self.get_albedo
+
+    @property
+    def get_roughness(self):
+        return torch.clamp(self._roughness, 0.04, 1.0)
+
+    @property
+    def get_metallic(self):
+        return torch.clamp(self._metallic, 0.0, 1.0)
 
     @property
     def get_opacity(self):
@@ -300,6 +350,91 @@ class GaussianModel:
 
         # Final RGB = albedo * intensity
         rgb = torch.clamp(intensity * albedo, 0.0)
+
+        return rgb, intensity, sun_dir, components
+
+    def compute_directional_pbr(self, emb_idx, normal_vectors, sun_direction, camera_center,
+                                sun_elevation=None, shadow_mask=None):
+        """
+        Full PBR shading with Cook-Torrance microfacet BRDF (guarded by full_pbr).
+
+        Args:
+            emb_idx: Image embedding index.
+            normal_vectors: Surface normals [N, 3].
+            sun_direction: Sun direction [3].
+            camera_center: Camera position [3].
+            sun_elevation: Sun elevation angle in degrees.
+            shadow_mask: Optional per-gaussian shadow mask [N, 1] where 1=lit, 0=shadow.
+
+        Returns:
+            rgb, intensity, sun_dir, components
+        """
+        assert self.full_pbr and self.use_sun and self.sun_model is not None, \
+            "compute_directional_pbr requires full_pbr=True and use_sun=True"
+
+        base_color = self.get_base_color
+        roughness = self.get_roughness
+        metallic = self.get_metallic
+
+        intensity_hdr_lambert, sun_dir, components = self.sun_model(
+            emb_idx, normal_vectors, sun_direction=sun_direction, sun_elevation=sun_elevation
+        )
+
+        sun_int = torch.clamp(components['sun_color'], min=1e-6).unsqueeze(0)
+        ambient_light = components['ambient']
+        residual_light = components['residual']
+
+        normals_norm = normal_vectors / (torch.norm(normal_vectors, dim=-1, keepdim=True) + 1e-8)
+
+        if not isinstance(camera_center, torch.Tensor):
+            camera_center = torch.tensor(camera_center, dtype=torch.float32, device=self._xyz.device)
+        camera_center = camera_center.to(self._xyz.device)
+
+        view_dirs = camera_center.unsqueeze(0) - self.get_xyz
+        view_dirs = view_dirs / (torch.norm(view_dirs, dim=-1, keepdim=True) + 1e-8)
+
+        light_dirs = sun_dir.unsqueeze(0).expand_as(view_dirs)
+        half_vec = view_dirs + light_dirs
+        half_vec = half_vec / (torch.norm(half_vec, dim=-1, keepdim=True) + 1e-8)
+
+        n_dot_l = torch.clamp((normals_norm * light_dirs).sum(dim=-1, keepdim=True), min=0.0)
+        n_dot_v = torch.clamp((normals_norm * view_dirs).sum(dim=-1, keepdim=True), min=1e-4)
+        n_dot_h = torch.clamp((normals_norm * half_vec).sum(dim=-1, keepdim=True), min=1e-4)
+        v_dot_h = torch.clamp((view_dirs * half_vec).sum(dim=-1, keepdim=True), min=0.0)
+
+        alpha = torch.clamp(roughness ** 2, min=1e-3)
+        alpha2 = alpha ** 2
+        denom = (n_dot_h ** 2) * (alpha2 - 1.0) + 1.0
+        D = alpha2 / (math.pi * denom ** 2 + 1e-6)
+
+        k = ((roughness + 1.0) ** 2) / 8.0
+        G_v = n_dot_v / (n_dot_v * (1.0 - k) + k + 1e-6)
+        G_l = n_dot_l / (n_dot_l * (1.0 - k) + k + 1e-6)
+        G = G_v * G_l
+
+        F0 = 0.04 * (1.0 - metallic) + base_color * metallic
+        F = F0 + (1.0 - F0) * ((1.0 - v_dot_h) ** 5)
+
+        specular = (D * G) * F / torch.clamp(4.0 * n_dot_v * n_dot_l, min=1e-4)
+        k_d = (1.0 - F) * (1.0 - metallic)
+        diffuse = k_d * base_color / math.pi
+
+        direct_brdf = diffuse + specular
+        direct = direct_brdf * sun_int * n_dot_l
+
+        if shadow_mask is not None:
+            direct = direct * shadow_mask
+
+        indirect = base_color * (ambient_light + residual_light) * (1.0 - metallic)
+        indirect_spec = F0 * (ambient_light + residual_light) * 0.25
+
+        intensity_hdr = torch.clamp(direct + indirect + indirect_spec, min=0.0)
+        intensity = torch.clamp_min(intensity_hdr, 1e-5) ** (1 / 2.2)
+        rgb = torch.clamp(intensity, 0.0)
+
+        components['direct_pbr'] = direct
+        components['indirect_pbr'] = indirect + indirect_spec
+        components['lambert_intensity'] = intensity_hdr_lambert
 
         return rgb, intensity, sun_dir, components
 
@@ -405,6 +540,8 @@ class GaussianModel:
         self._features_dc_negative = nn.Parameter(features_negative[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest_negative = nn.Parameter(features_negative[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._albedo = nn.Parameter(albedo.requires_grad_(True))
+        self._roughness = nn.Parameter(torch.full((fused_point_cloud.shape[0], 1), 0.6, device="cuda", dtype=torch.float32).requires_grad_(self.full_pbr))
+        self._metallic = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 1), device="cuda", dtype=torch.float32).requires_grad_(self.full_pbr))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
@@ -428,6 +565,8 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': [self._albedo], 'lr': training_args.albedo_lr, "name": "albedo"},
+            {'params': [self._roughness], 'lr': (training_args.albedo_lr * 0.5) if self.full_pbr else 0.0, "name": "roughness"},
+            {'params': [self._metallic], 'lr': (training_args.albedo_lr * 0.5) if self.full_pbr else 0.0, "name": "metallic"},
             {'params': [self._casts_shadow], 'lr': training_args.opacity_lr, "name": "casts_shadow"}
         ]
 
@@ -481,6 +620,8 @@ class GaussianModel:
             l.append('f_rest_negative_{}'.format(i))
         for i in range(self._albedo.shape[1]):
             l.append('albedo_{}'.format(i))
+        l.append('roughness_0')
+        l.append('metallic_0')
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -498,6 +639,8 @@ class GaussianModel:
         f_dc_negative = self._features_dc_negative.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest_negative = self._features_rest_negative.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         albedo = self._albedo.detach().cpu().numpy()
+        roughness = self._roughness.detach().cpu().numpy()
+        metallic = self._metallic.detach().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
@@ -505,7 +648,7 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc_positive, f_rest_positive, f_dc_negative, f_rest_negative, albedo, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc_positive, f_rest_positive, f_dc_negative, f_rest_negative, albedo, roughness, metallic, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -558,6 +701,20 @@ class GaussianModel:
         for idx, attr_name in enumerate(albedo_names):
             albedo[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
+        roughness_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("roughness_")]
+        roughness = np.zeros((xyz.shape[0], 1)) + 0.6
+        if len(roughness_names) > 0:
+            roughness_names = sorted(roughness_names, key=lambda x: int(x.split('_')[-1]))
+            for idx, attr_name in enumerate(roughness_names[:1]):
+                roughness[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+        metallic_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("metallic_")]
+        metallic = np.zeros((xyz.shape[0], 1))
+        if len(metallic_names) > 0:
+            metallic_names = sorted(metallic_names, key=lambda x: int(x.split('_')[-1]))
+            for idx, attr_name in enumerate(metallic_names[:1]):
+                metallic[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
         scales = np.zeros((xyz.shape[0], len(scale_names)))
@@ -576,9 +733,14 @@ class GaussianModel:
         self._features_dc_negative = nn.Parameter(torch.tensor(features_dc_negative, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest_negative = nn.Parameter(torch.tensor(features_extra_negative, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._albedo = nn.Parameter(torch.tensor(albedo, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._roughness = nn.Parameter(torch.tensor(roughness, dtype=torch.float, device="cuda").requires_grad_(self.full_pbr))
+        self._metallic = nn.Parameter(torch.tensor(metallic, dtype=torch.float, device="cuda").requires_grad_(self.full_pbr))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+
+        # Initialize _casts_shadow if not present (default: all gaussians cast shadows)
+        self._casts_shadow = nn.Parameter(torch.ones((xyz.shape[0],), dtype=torch.float, device="cuda").requires_grad_(False))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -626,6 +788,10 @@ class GaussianModel:
         self._features_rest_negative = optimizable_tensors["f_rest_negative"]
         self._opacity = optimizable_tensors["opacity"]
         self._albedo = optimizable_tensors["albedo"]
+        if "roughness" in optimizable_tensors:
+            self._roughness = optimizable_tensors["roughness"]
+        if "metallic" in optimizable_tensors:
+            self._metallic = optimizable_tensors["metallic"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._casts_shadow = optimizable_tensors["casts_shadow"]
@@ -659,10 +825,17 @@ class GaussianModel:
 
     def densification_postfix(self, new_xyz, new_features_dc_positive, new_features_rest_positive,
                               new_features_dc_negative, new_features_rest_negative,
-                              new_albedo, new_opacities, new_scaling, new_rotation, new_casts_shadow=None):
+                              new_albedo, new_opacities, new_scaling, new_rotation, new_casts_shadow=None,
+                              new_roughness=None, new_metallic=None):
         # Default new gaussians to shadow-casting (1.0)
         if new_casts_shadow is None:
             new_casts_shadow = torch.ones(new_xyz.shape[0], device="cuda", dtype=torch.float32)
+        if new_roughness is None:
+            new_roughness = torch.full((new_xyz.shape[0], 1), 0.6, device="cuda", dtype=torch.float32)
+        if new_metallic is None:
+            new_metallic = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        new_roughness = new_roughness.requires_grad_(self.full_pbr)
+        new_metallic = new_metallic.requires_grad_(self.full_pbr)
 
         d = {"xyz": new_xyz,
         "f_dc_positive": new_features_dc_positive,
@@ -670,6 +843,8 @@ class GaussianModel:
         "f_dc_negative": new_features_dc_negative,
         "f_rest_negative": new_features_rest_negative,
         "albedo": new_albedo,
+        "roughness": new_roughness,
+        "metallic": new_metallic,
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation,
@@ -682,6 +857,10 @@ class GaussianModel:
         self._features_dc_negative = optimizable_tensors["f_dc_negative"]
         self._features_rest_negative = optimizable_tensors["f_rest_negative"]
         self._albedo = optimizable_tensors["albedo"]
+        if "roughness" in optimizable_tensors:
+            self._roughness = optimizable_tensors["roughness"]
+        if "metallic" in optimizable_tensors:
+            self._metallic = optimizable_tensors["metallic"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -690,6 +869,145 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def adaptive_densify_from_loss_grid(self, loss_grid, grid_counts, grid_min, grid_max,
+                                          loss_thresh_quantile=0.7, count_thresh=2,
+                                          max_new_gaussians=512):
+        """
+        Spawn new Gaussians in voxel cells that have high accumulated loss but
+        few existing Gaussians, filling in empty / under-represented regions.
+
+        Args:
+            loss_grid:  [Gx, Gy, Gz] tensor – accumulated per-cell photometric loss
+            grid_counts: [Gx, Gy, Gz] tensor – number of Gaussians currently in each cell
+            grid_min:   [3] tensor – world-space min corner of the grid (AABB)
+            grid_max:   [3] tensor – world-space max corner of the grid (AABB)
+            loss_thresh_quantile: float – only cells whose loss is above this quantile
+                                  are considered (e.g. 0.7 = top 30%)
+            count_thresh: int   – cells with fewer than this many Gaussians are "sparse"
+            max_new_gaussians: int – upper cap on the number of Gaussians added in one call
+        """
+        device = self.get_xyz.device
+        G = loss_grid.shape  # (Gx, Gy, Gz)
+        cell_size = (grid_max - grid_min) / torch.tensor(G, device=device, dtype=torch.float32)
+
+        # ---- Identify candidate cells: observed, sparse, and high-loss ----
+        observed_mask = loss_grid > 0
+        if observed_mask.sum() == 0:
+            return  # nothing observed yet
+
+        sparsity_deficit = (float(count_thresh) - grid_counts).clamp_min(0.0)
+        sparse_mask = sparsity_deficit > 0
+        candidate_mask = observed_mask & sparse_mask
+        if candidate_mask.sum() == 0:
+            return
+
+        sparse_losses = loss_grid[candidate_mask]
+        loss_threshold = torch.quantile(sparse_losses, loss_thresh_quantile)
+        candidate_mask = candidate_mask & (loss_grid >= loss_threshold)
+
+        # Fallback: if quantile is too strict, keep all observed sparse cells.
+        if candidate_mask.sum() == 0:
+            candidate_mask = observed_mask & sparse_mask
+
+        candidate_indices = candidate_mask.nonzero(as_tuple=False)  # [K, 3]
+
+        if candidate_indices.shape[0] == 0:
+            return  # no candidates
+
+        # ---- Determine how many Gaussians to place per cell ----
+        n_cells = candidate_indices.shape[0]
+        # Weight by loss so worse cells get more Gaussians.
+        # Allocate *exactly* max_new_gaussians samples while ensuring broad coverage.
+        cell_losses = loss_grid[candidate_mask].clamp_min(0)
+        cell_sparse = sparsity_deficit[candidate_mask]
+        if cell_losses.sum() <= 0:
+            return
+
+        # Score combines loss and sparsity pressure so truly empty cells are preferred.
+        cell_scores = cell_losses * (1.0 + 2.0 * cell_sparse / (float(count_thresh) + 1e-6))
+        weights = cell_scores / cell_scores.sum().clamp_min(1e-12)
+
+        budget = int(max_new_gaussians)
+        budget = max(budget, 0)
+        if budget == 0:
+            return
+
+        # Guarantee at least 1 gaussian in the top cells (up to budget)
+        top_k = min(n_cells, budget)
+        order = torch.argsort(cell_scores, descending=True)
+        per_cell_budget = torch.zeros(n_cells, device=device, dtype=torch.long)
+        per_cell_budget[order[:top_k]] = 1
+        remaining = budget - top_k
+
+        if remaining > 0:
+            sampled = torch.multinomial(weights, remaining, replacement=True)
+            per_cell_budget += torch.bincount(sampled, minlength=n_cells)
+
+        # ---- Sample positions uniformly inside each candidate cell ----
+        new_xyz_list = []
+        for i in range(n_cells):
+            idx = candidate_indices[i]  # (ix, iy, iz)
+            n_pts = per_cell_budget[i].item()
+            # Cell world-space bounds
+            cell_lo = grid_min + idx.float() * cell_size
+            cell_hi = cell_lo + cell_size
+            pts = torch.rand(n_pts, 3, device=device) * (cell_hi - cell_lo) + cell_lo
+            new_xyz_list.append(pts)
+
+        new_xyz = torch.cat(new_xyz_list, dim=0)
+        n_new = new_xyz.shape[0]
+
+        if n_new == 0:
+            return
+
+        # ---- Initialise attributes for the new Gaussians ----
+        # Use scene-wide median / mean as sensible defaults so new Gaussians
+        # blend in and can be optimised quickly.
+
+        # Scale: keep newborn Gaussians small enough to fit target cells.
+        median_scale_lin = self.get_scaling.median(dim=0).values  # [2], linear space
+        cell_scale_lin = cell_size[:2].clamp_min(1e-6) * 0.5
+        target_scale_lin = torch.minimum(median_scale_lin, cell_scale_lin)
+        new_scaling = self.scaling_inverse_activation(target_scale_lin).unsqueeze(0).expand(n_new, -1).clone()
+
+        # Rotation: random quaternions
+        new_rotation = torch.randn(n_new, 4, device=device)
+        new_rotation = torch.nn.functional.normalize(new_rotation, dim=-1)
+
+        # Opacity: start above prune threshold so they survive long enough to learn.
+        new_opacity = self.inverse_opacity_activation(
+            0.12 * torch.ones(n_new, 1, device=device)
+        )
+
+        # SH features: initialise near zero (neutral grey)
+        sh_dim = (self.max_sh_degree + 1) ** 2
+        new_features_dc_pos = torch.zeros(n_new, 1, 3, device=device) + 0.02
+        new_features_rest_pos = torch.zeros(n_new, sh_dim - 1, 3, device=device) + 0.01
+        new_features_dc_neg = torch.zeros(n_new, 1, 3, device=device) + 0.02
+        new_features_rest_neg = torch.zeros(n_new, sh_dim - 1, 3, device=device) + 0.01
+
+        # Albedo: initialise to mean albedo
+        mean_albedo = self._albedo.mean(dim=0, keepdim=True)
+        new_albedo = mean_albedo.expand(n_new, -1).clone()
+        mean_roughness = self._roughness.mean(dim=0, keepdim=True)
+        mean_metallic = self._metallic.mean(dim=0, keepdim=True)
+        new_roughness = mean_roughness.expand(n_new, -1).clone()
+        new_metallic = mean_metallic.expand(n_new, -1).clone()
+
+        # Shadow casting: default on
+        new_casts_shadow = torch.ones(n_new, device=device)
+
+        self.densification_postfix(
+            new_xyz, new_features_dc_pos, new_features_rest_pos,
+            new_features_dc_neg, new_features_rest_neg,
+            new_albedo, new_opacity, new_scaling, new_rotation,
+            new_casts_shadow, new_roughness=new_roughness, new_metallic=new_metallic
+        )
+
+        print(f"[Adaptive Densification] Added {n_new} Gaussians across "
+              f"{n_cells} sparse high-loss cells "
+              f"(total now: {self.get_xyz.shape[0]})")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -713,10 +1031,12 @@ class GaussianModel:
         new_features_dc_negative = self._features_dc_negative[selected_pts_mask].repeat(N,1,1)
         new_features_rest_negative = self._features_rest_negative[selected_pts_mask].repeat(N,1,1)
         new_albedo = self._albedo[selected_pts_mask].repeat(N,1)
+        new_roughness = self._roughness[selected_pts_mask].repeat(N,1)
+        new_metallic = self._metallic[selected_pts_mask].repeat(N,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_casts_shadow = self._casts_shadow[selected_pts_mask].repeat(N)  # Inherit shadow-casting from parent
 
-        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacity, new_scaling, new_rotation, new_casts_shadow)
+        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacity, new_scaling, new_rotation, new_casts_shadow, new_roughness=new_roughness, new_metallic=new_metallic)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -733,12 +1053,14 @@ class GaussianModel:
         new_features_dc_negative = self._features_dc_negative[selected_pts_mask]
         new_features_rest_negative = self._features_rest_negative[selected_pts_mask]
         new_albedo = self._albedo[selected_pts_mask]
+        new_roughness = self._roughness[selected_pts_mask]
+        new_metallic = self._metallic[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_casts_shadow = self._casts_shadow[selected_pts_mask]  # Inherit shadow-casting from parent
 
-        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacities, new_scaling, new_rotation, new_casts_shadow)
+        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacities, new_scaling, new_rotation, new_casts_shadow, new_roughness=new_roughness, new_metallic=new_metallic)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
 

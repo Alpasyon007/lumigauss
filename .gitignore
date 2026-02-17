@@ -12,3 +12,4 @@ eval
 *.npz
 **/tmp
 *tar
+/lk2

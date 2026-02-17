@@ -328,6 +328,13 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir, sun_dat
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path)
+
+        # Skip specific lk2 PNG images without EXIF data (C1-C6 series) - only for lk2 dataset
+        import re
+        if 'lk2' in path.lower() and re.match(r'^C[1-6]_DSC_\d+.*\.png$', image_name, re.IGNORECASE):
+            print(f"\nSkipping {image_name} - lk2 PNG without EXIF data")
+            continue
+
         image = Image.open(image_path)
 
         precomputed_mask=True

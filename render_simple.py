@@ -37,6 +37,8 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
     shadow_bias = getattr(args, 'shadow_bias', 0.1) if args else 0.1
     ray_march_steps = getattr(args, 'ray_march_steps', 64) if args else 64
     voxel_resolution = getattr(args, 'voxel_resolution', 128) if args else 128
+    use_gaussians = bool(getattr(pipeline, 'use_gaussians', False))
+    effective_shadow_method = 'ray_march' if use_gaussians and shadow_method == 'shadow_map' else shadow_method
 
     if only_from_appearence_list:
         assert appearance_list is not None, 'only_from_appearences_list requires appearance_list'
@@ -86,7 +88,12 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
 
                 # Directional sun lighting mode with sun color prior
                 # unshadowed version
-                rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
+                if gaussians.full_pbr:
+                    rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_pbr(
+                        appearance_idx, normal_vectors, sun_dir, view.camera_center, sun_elevation=sun_elev
+                    )
+                else:
+                    rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
                 render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                 rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                 combined_rendering = torch.cat((view.original_image, rendering), 2)
@@ -97,7 +104,7 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                     gaussians,
                     sun_dir,
                     pipeline,
-                    method=shadow_method,
+                    method=effective_shadow_method,
                     shadow_map_resolution=shadow_map_resolution,
                     shadow_bias=shadow_bias,
                     ray_march_steps=ray_march_steps,
@@ -106,17 +113,24 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                 )
                 shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 
-                # Apply shadow to direct lighting only
-                direct_light = components['direct']
-                ambient_light = components['ambient']
-                residual_light = components['residual']
+                if gaussians.full_pbr:
+                    rgb_precomp_shadowed, _, _, components_shadowed = gaussians.compute_directional_pbr(
+                        appearance_idx, normal_vectors, sun_dir, view.camera_center,
+                        sun_elevation=sun_elev, shadow_mask=shadow_mask
+                    )
+                    direct_light = components_shadowed['direct_pbr'] if 'direct_pbr' in components_shadowed else components_shadowed['direct']
+                else:
+                    # Apply shadow to direct lighting only
+                    direct_light = components['direct']
+                    ambient_light = components['ambient']
+                    residual_light = components['residual']
 
-                intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
-                intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
-                intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
+                    intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                    intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                    intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
 
-                albedo = gaussians.get_albedo
-                rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+                    albedo = gaussians.get_albedo
+                    rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
 
                 render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
                 rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
@@ -176,7 +190,12 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                 if gaussians.use_sun:
                     # Directional sun lighting mode with sun color prior
                     # unshadowed version
-                    rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
+                    if gaussians.full_pbr:
+                        rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_pbr(
+                            appearance_idx, normal_vectors, sun_dir, view.camera_center, sun_elevation=sun_elev
+                        )
+                    else:
+                        rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
                     render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                     rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
@@ -187,7 +206,7 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                         gaussians,
                         sun_dir,
                         pipeline,
-                        method=shadow_method,
+                        method=effective_shadow_method,
                         shadow_map_resolution=shadow_map_resolution,
                         shadow_bias=shadow_bias,
                         ray_march_steps=ray_march_steps,
@@ -196,16 +215,22 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                     )
                     shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 
-                    direct_light = components['direct']
-                    ambient_light = components['ambient']
-                    residual_light = components['residual']
+                    if gaussians.full_pbr:
+                        rgb_precomp_shadowed, _, _, _ = gaussians.compute_directional_pbr(
+                            appearance_idx, normal_vectors, sun_dir, view.camera_center,
+                            sun_elevation=sun_elev, shadow_mask=shadow_mask
+                        )
+                    else:
+                        direct_light = components['direct']
+                        ambient_light = components['ambient']
+                        residual_light = components['residual']
 
-                    intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
-                    intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
-                    intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
+                        intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                        intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                        intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
 
-                    albedo = gaussians.get_albedo
-                    rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+                        albedo = gaussians.get_albedo
+                        rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
 
                     render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
                     rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
@@ -239,7 +264,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         if dataset.use_sun:
             # Temporary n_images - will be updated after Scene creation
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
-                                       use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh)
+                                       use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh,
+                                       full_pbr=dataset.full_pbr)
         else:
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 

@@ -89,7 +89,8 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
         if dataset.use_sun:
             # Temporary n_images - will be updated after Scene creation
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
-                                       use_sun=True, n_images=1700, use_residual_sh=dataset.use_residual_sh)
+                                       use_sun=True, n_images=1700, use_residual_sh=dataset.use_residual_sh,
+                                       full_pbr=dataset.full_pbr)
         else:
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 

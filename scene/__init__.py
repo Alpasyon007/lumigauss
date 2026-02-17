@@ -102,6 +102,10 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
             if self.gaussians.use_sun:
+                # Setup sun_model with correct n_images before loading checkpoint
+                n_images = len(scene_info.train_cameras)
+                self.gaussians.n_images = n_images
+                self.gaussians.setup_sun_model()
                 self.gaussians.sun_model.load_state_dict(torch.load(self.model_path + "/chkpnt_sun" + str(self.loaded_iter) + ".pth", weights_only=True))
             elif self.gaussians.with_mlp:
                 self.gaussians.mlp.load_state_dict(torch.load(self.model_path + "/chkpnt_mlp" + str(self.loaded_iter) + ".pth", weights_only=True))

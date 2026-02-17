@@ -719,15 +719,21 @@ def compute_shadows_for_gaussians(
     """
     shadow_depth_map = None
     sun_camera = None
+    use_gaussians = bool(getattr(pipe, "use_gaussians", False))
 
     if method == "none":
         shadow_mask = compute_shadows_none(gaussians, sun_direction, device)
 
     elif method == "shadow_map":
-        shadow_mask, shadow_depth_map, sun_camera = compute_shadows_shadow_map(
-            gaussians, sun_direction, pipe,
-            shadow_map_resolution, shadow_bias, device
-        )
+        if use_gaussians:
+            shadow_mask = compute_shadows_ray_march(
+                gaussians, sun_direction, ray_march_steps, device
+            )
+        else:
+            shadow_mask, shadow_depth_map, sun_camera = compute_shadows_shadow_map(
+                gaussians, sun_direction, pipe,
+                shadow_map_resolution, shadow_bias, device
+            )
 
     elif method == "ray_march":
         shadow_mask = compute_shadows_ray_march(

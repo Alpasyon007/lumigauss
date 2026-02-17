@@ -44,7 +44,7 @@ COPY ./requirements.txt ./requirements.txt
 RUN python -m pip install -r requirements.txt
 
 COPY ./submodules ./submodules
-RUN python -m pip install submodules/diff-surfel-rasterization submodules/simple-knn
+RUN python -m pip install submodules/diff-surfel-rasterization submodules/diff-gaussian-rasterization submodules/simple-knn
 
 # Copy all necessary files
 COPY . /workspace

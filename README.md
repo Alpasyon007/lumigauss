@@ -58,6 +58,29 @@ filename;split
 ### Usage
 Refer to `run_all.sh` for scripts to train, render, and test. We provide two implementations: one using MLP and another with direct SH_env optimization. Initial tests showed significantly worse results with direct optimization, so the parameters were not further tuned. If you choose to use this version, additional fine-tuning may be required.
 
+### 3D Gaussian Rasterization (`--use_gaussians`)
+
+The pipeline supports an opt-in rasterization backend switch:
+
+- Default (no flag): uses `diff-surfel-rasterization` (current 2DGS/surfel behavior)
+- With `--use_gaussians`: uses `diff-gaussian-rasterization` backend
+
+This switch is guarded by the pipeline flag and does not affect default behavior.
+
+**Training example:**
+```bash
+python train.py -s data/your_scene -m output/your_model --use_sun --use_gaussians
+```
+
+**Rendering example:**
+```bash
+python render_simple.py -m output/your_model --use_sun --use_gaussians
+```
+
+**Shadow method compatibility:**
+- `shadow_map` depends on surfel-specific auxiliary outputs.
+- When `--use_gaussians` is enabled and `shadow_map` is requested, the code uses `ray_march`-compatible behavior for shadow computation paths.
+
 ### Physical Sun Position Model (--use_sun)
 
 An improved lighting model that uses physical sun positions from image metadata instead of learned environment maps. This approach:

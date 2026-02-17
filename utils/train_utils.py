@@ -1,10 +1,17 @@
 
 import os
+import json
+import time
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Any
+from collections import defaultdict
+
 import numpy as np
 import torch
 from gaussian_renderer import render
 import uuid
-from utils.image_utils import psnr
+from utils.image_utils import psnr, mse
+from utils.loss_utils import ssim
 from argparse import ArgumentParser, Namespace
 import os
 from utils.sh_vis_utils import shReconstructDiffuseMap
@@ -18,9 +25,566 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def update_lambdas(iteration, opt):
+# Try to import LPIPS for perceptual metrics
+try:
+    from lpipsPyTorch import lpips as compute_lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+
+
+# =============================================================================
+# Metrics Data Classes
+# =============================================================================
+
+@dataclass
+class ImageMetrics:
+    """Metrics for a single image comparison."""
+    psnr: float = 0.0
+    ssim: float = 0.0
+    lpips: float = 0.0
+    l1: float = 0.0
+    l2: float = 0.0
+    mse: float = 0.0
+
+    def to_dict(self) -> Dict[str, float]:
+        return asdict(self)
+
+
+@dataclass
+class LossComponents:
+    """Individual loss components during training."""
+    unshadowed_image: float = 0.0
+    shadowed_image: float = 0.0
+    l1_unshadowed: float = 0.0
+    l1_shadowed: float = 0.0
+    ssim_unshadowed: float = 0.0
+    ssim_shadowed: float = 0.0
+    normal: float = 0.0
+    dist: float = 0.0
+    sh_gauss: float = 0.0
+    sh_env: float = 0.0
+    consistency: float = 0.0
+    shadow: float = 0.0
+    sun_reg: float = 0.0
+    sky_mask: float = 0.0
+    total: float = 0.0
+
+    def to_dict(self) -> Dict[str, float]:
+        return asdict(self)
+
+
+@dataclass
+class TrainingPhase:
+    """Training phase information."""
+    name: str = "unknown"
+    iteration: int = 0
+    warmup_end: int = 0
+    sh_tuning_end: int = 0
+
+    @property
+    def is_warmup(self) -> bool:
+        return self.iteration < self.warmup_end
+
+    @property
+    def is_sh_tuning(self) -> bool:
+        return self.warmup_end <= self.iteration <= self.sh_tuning_end
+
+    @property
+    def is_shadowed(self) -> bool:
+        return self.iteration > self.sh_tuning_end
+
+    def get_phase_name(self) -> str:
+        if self.is_warmup:
+            return "warmup"
+        elif self.is_sh_tuning:
+            return "sh_tuning"
+        else:
+            return "shadowed"
+
+
+@dataclass
+class EvaluationResult:
+    """Complete evaluation result for a viewpoint."""
+    viewpoint_name: str
+    config_name: str  # 'train' or 'test'
+    iteration: int
+
+    # Metrics for different render types
+    albedo_metrics: ImageMetrics = field(default_factory=ImageMetrics)
+    shadowed_metrics: ImageMetrics = field(default_factory=ImageMetrics)
+    unshadowed_metrics: ImageMetrics = field(default_factory=ImageMetrics)
+
+    # Additional info
+    num_gaussians: int = 0
+    render_time_ms: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "viewpoint_name": self.viewpoint_name,
+            "config_name": self.config_name,
+            "iteration": self.iteration,
+            "albedo_metrics": self.albedo_metrics.to_dict(),
+            "shadowed_metrics": self.shadowed_metrics.to_dict(),
+            "unshadowed_metrics": self.unshadowed_metrics.to_dict(),
+            "num_gaussians": self.num_gaussians,
+            "render_time_ms": self.render_time_ms
+        }
+
+
+@dataclass
+class EvaluationSummary:
+    """Summary statistics across multiple viewpoints."""
+    config_name: str
+    iteration: int
+    num_viewpoints: int = 0
+
+    # Aggregated metrics (mean)
+    mean_psnr_albedo: float = 0.0
+    mean_psnr_shadowed: float = 0.0
+    mean_psnr_unshadowed: float = 0.0
+    mean_ssim_albedo: float = 0.0
+    mean_ssim_shadowed: float = 0.0
+    mean_ssim_unshadowed: float = 0.0
+    mean_lpips_albedo: float = 0.0
+    mean_lpips_shadowed: float = 0.0
+    mean_lpips_unshadowed: float = 0.0
+    mean_l1_albedo: float = 0.0
+    mean_l1_shadowed: float = 0.0
+    mean_l1_unshadowed: float = 0.0
+
+    # Standard deviations
+    std_psnr_albedo: float = 0.0
+    std_psnr_shadowed: float = 0.0
+    std_psnr_unshadowed: float = 0.0
+
+    # Best/worst
+    best_psnr_viewpoint: str = ""
+    worst_psnr_viewpoint: str = ""
+    best_psnr: float = 0.0
+    worst_psnr: float = float('inf')
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# =============================================================================
+# Metrics Calculator
+# =============================================================================
+
+class MetricsCalculator:
+    """Utility class for computing image quality metrics."""
+
+    def __init__(self, device: str = "cuda"):
+        self.device = device
+        self._lpips_net = None
+
+    @property
+    def lpips_net(self):
+        """Lazy load LPIPS network."""
+        if self._lpips_net is None and LPIPS_AVAILABLE:
+            from lpipsPyTorch.modules.lpips import LPIPS
+            self._lpips_net = LPIPS('alex', '0.1').to(self.device)
+            self._lpips_net.eval()
+        return self._lpips_net
+
+    def compute_all_metrics(self, pred: torch.Tensor, gt: torch.Tensor,
+                           mask: Optional[torch.Tensor] = None) -> ImageMetrics:
+        """Compute all image metrics between prediction and ground truth."""
+        metrics = ImageMetrics()
+
+        # Ensure proper shape [C, H, W] or [1, C, H, W]
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(0)
+        if gt.dim() == 3:
+            gt = gt.unsqueeze(0)
+
+        # PSNR
+        metrics.psnr = psnr(pred, gt, mask).mean().item()
+
+        # MSE
+        metrics.mse = mse(pred, gt, mask).mean().item()
+
+        # SSIM
+        metrics.ssim = ssim(pred.squeeze(0), gt.squeeze(0), mask=mask).item()
+
+        # L1
+        if mask is not None:
+            metrics.l1 = (torch.abs(pred - gt) * mask).sum().item() / (mask.sum().item() * pred.shape[1] + 1e-6)
+        else:
+            metrics.l1 = torch.abs(pred - gt).mean().item()
+
+        # L2
+        if mask is not None:
+            metrics.l2 = ((pred - gt) ** 2 * mask).sum().item() / (mask.sum().item() * pred.shape[1] + 1e-6)
+        else:
+            metrics.l2 = ((pred - gt) ** 2).mean().item()
+
+        # LPIPS (perceptual)
+        if LPIPS_AVAILABLE and self.lpips_net is not None:
+            try:
+                # LPIPS expects [N, C, H, W] in range [-1, 1]
+                pred_lpips = pred * 2 - 1
+                gt_lpips = gt * 2 - 1
+                with torch.no_grad():
+                    metrics.lpips = self.lpips_net(pred_lpips, gt_lpips).mean().item()
+            except Exception as e:
+                metrics.lpips = 0.0
+
+        return metrics
+
+    def compute_quick_metrics(self, pred: torch.Tensor, gt: torch.Tensor,
+                              mask: Optional[torch.Tensor] = None) -> ImageMetrics:
+        """Compute only PSNR and L1 (faster for training logging)."""
+        metrics = ImageMetrics()
+
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(0)
+        if gt.dim() == 3:
+            gt = gt.unsqueeze(0)
+
+        metrics.psnr = psnr(pred, gt, mask).mean().item()
+
+        if mask is not None:
+            metrics.l1 = (torch.abs(pred - gt) * mask).sum().item() / (mask.sum().item() * pred.shape[1] + 1e-6)
+        else:
+            metrics.l1 = torch.abs(pred - gt).mean().item()
+
+        return metrics
+
+
+# =============================================================================
+# Metrics Logger
+# =============================================================================
+
+class MetricsLogger:
+    """Centralized logging for training and evaluation metrics."""
+
+    def __init__(self, tb_writer: Optional[SummaryWriter], model_path: str):
+        self.tb_writer = tb_writer
+        self.model_path = model_path
+        self.metrics_calculator = MetricsCalculator()
+
+        # Storage for aggregating metrics
+        self.training_losses: List[LossComponents] = []
+        self.evaluation_results: Dict[int, List[EvaluationResult]] = defaultdict(list)
+        self.evaluation_summaries: Dict[int, Dict[str, EvaluationSummary]] = {}
+
+        # Timing
+        self.iteration_times: List[float] = []
+
+        # Create metrics output directory
+        self.metrics_dir = os.path.join(model_path, "metrics")
+        os.makedirs(self.metrics_dir, exist_ok=True)
+
+    def log_training_losses(self, iteration: int, losses: LossComponents,
+                           phase: TrainingPhase, lambdas: Dict[str, float]):
+        """Log training losses to TensorBoard with proper organization."""
+        if self.tb_writer is None:
+            return
+
+        phase_name = phase.get_phase_name()
+
+        # Group 1: Total and Combined Losses
+        self.tb_writer.add_scalar('Loss/total', losses.total, iteration)
+        self.tb_writer.add_scalar('Loss/image_combined',
+                                  losses.unshadowed_image + losses.shadowed_image, iteration)
+
+        # Group 2: Image Reconstruction Losses
+        self.tb_writer.add_scalar('Loss_Image/unshadowed', losses.unshadowed_image, iteration)
+        self.tb_writer.add_scalar('Loss_Image/shadowed', losses.shadowed_image, iteration)
+        self.tb_writer.add_scalar('Loss_Image/l1_unshadowed', losses.l1_unshadowed, iteration)
+        self.tb_writer.add_scalar('Loss_Image/l1_shadowed', losses.l1_shadowed, iteration)
+
+        # Group 3: Regularization Losses
+        self.tb_writer.add_scalar('Loss_Regularization/normal', losses.normal, iteration)
+        self.tb_writer.add_scalar('Loss_Regularization/dist', losses.dist, iteration)
+        self.tb_writer.add_scalar('Loss_Regularization/sun_reg', losses.sun_reg, iteration)
+        self.tb_writer.add_scalar('Loss_Regularization/sky_mask', losses.sky_mask, iteration)
+
+        # Group 4: SH/Lighting Losses
+        self.tb_writer.add_scalar('Loss_Lighting/sh_gauss', losses.sh_gauss, iteration)
+        self.tb_writer.add_scalar('Loss_Lighting/sh_env', losses.sh_env, iteration)
+        self.tb_writer.add_scalar('Loss_Lighting/consistency', losses.consistency, iteration)
+        self.tb_writer.add_scalar('Loss_Lighting/shadow', losses.shadow, iteration)
+
+        # Group 5: Lambda Values (loss weights)
+        for name, value in lambdas.items():
+            self.tb_writer.add_scalar(f'Lambda/{name}', value, iteration)
+
+        # Group 6: Training Phase
+        phase_idx = {"warmup": 0, "sh_tuning": 1, "shadowed": 2}.get(phase_name, -1)
+        self.tb_writer.add_scalar('Training/phase', phase_idx, iteration)
+
+    def log_iteration_time(self, iteration: int, elapsed_ms: float):
+        """Log iteration timing."""
+        self.iteration_times.append(elapsed_ms)
+        if self.tb_writer:
+            self.tb_writer.add_scalar('Performance/iter_time_ms', elapsed_ms, iteration)
+            # Running average
+            if len(self.iteration_times) >= 100:
+                avg_time = sum(self.iteration_times[-100:]) / 100
+                self.tb_writer.add_scalar('Performance/iter_time_avg100', avg_time, iteration)
+
+    def log_gaussian_stats(self, iteration: int, gaussians):
+        """Log Gaussian model statistics."""
+        if self.tb_writer is None:
+            return
+
+        num_points = gaussians.get_xyz.shape[0]
+        self.tb_writer.add_scalar('Gaussians/total_count', num_points, iteration)
+
+        # Scale statistics
+        scales = gaussians.get_scaling
+        self.tb_writer.add_scalar('Gaussians/scale_mean', scales.mean().item(), iteration)
+        self.tb_writer.add_scalar('Gaussians/scale_max', scales.max().item(), iteration)
+        self.tb_writer.add_scalar('Gaussians/scale_min', scales.min().item(), iteration)
+
+        # Opacity statistics
+        opacity = gaussians.get_opacity
+        self.tb_writer.add_scalar('Gaussians/opacity_mean', opacity.mean().item(), iteration)
+        self.tb_writer.add_histogram('Gaussians/opacity_hist', opacity, iteration)
+
+        # PBR material statistics (available regardless of training mode)
+        if hasattr(gaussians, 'get_roughness') and hasattr(gaussians, 'get_metallic'):
+            roughness = gaussians.get_roughness
+            metallic = gaussians.get_metallic
+            self.tb_writer.add_scalar('Gaussians/roughness_mean', roughness.mean().item(), iteration)
+            self.tb_writer.add_scalar('Gaussians/roughness_min', roughness.min().item(), iteration)
+            self.tb_writer.add_scalar('Gaussians/roughness_max', roughness.max().item(), iteration)
+            self.tb_writer.add_histogram('Gaussians/roughness_hist', roughness, iteration)
+            self.tb_writer.add_scalar('Gaussians/metallic_mean', metallic.mean().item(), iteration)
+            self.tb_writer.add_scalar('Gaussians/metallic_min', metallic.min().item(), iteration)
+            self.tb_writer.add_scalar('Gaussians/metallic_max', metallic.max().item(), iteration)
+            self.tb_writer.add_histogram('Gaussians/metallic_hist', metallic, iteration)
+
+        # For sun mode: casts_shadow statistics
+        if gaussians.use_sun:
+            casts_shadow = gaussians.get_casts_shadow
+            sky_ratio = (casts_shadow < 0.5).float().mean().item()
+            self.tb_writer.add_scalar('Gaussians/sky_ratio', sky_ratio, iteration)
+            self.tb_writer.add_histogram('Gaussians/casts_shadow_hist', casts_shadow, iteration)
+
+    def log_sun_model_params(self, iteration: int, sun_model, emb_idx: int = 0):
+        """Log sun model parameters for use_sun mode."""
+        if self.tb_writer is None or sun_model is None:
+            return
+
+        # Sun intensity
+        sun_intensity = sun_model.get_sun_intensity(emb_idx)
+        self.tb_writer.add_scalar('SunModel/intensity_r', sun_intensity[0].item(), iteration)
+        self.tb_writer.add_scalar('SunModel/intensity_g', sun_intensity[1].item(), iteration)
+        self.tb_writer.add_scalar('SunModel/intensity_b', sun_intensity[2].item(), iteration)
+        self.tb_writer.add_scalar('SunModel/intensity_mean', sun_intensity.mean().item(), iteration)
+
+        # Ambient color
+        ambient = sun_model.get_ambient(emb_idx)
+        self.tb_writer.add_scalar('SunModel/ambient_r', ambient[0].item(), iteration)
+        self.tb_writer.add_scalar('SunModel/ambient_g', ambient[1].item(), iteration)
+        self.tb_writer.add_scalar('SunModel/ambient_b', ambient[2].item(), iteration)
+
+        # Color correction
+        if hasattr(sun_model, 'sun_color_correction'):
+            color_corr = sun_model.sun_color_correction[emb_idx]
+            self.tb_writer.add_scalar('SunModel/color_correction_r', color_corr[0].item(), iteration)
+            self.tb_writer.add_scalar('SunModel/color_correction_g', color_corr[1].item(), iteration)
+            self.tb_writer.add_scalar('SunModel/color_correction_b', color_corr[2].item(), iteration)
+
+    def log_evaluation_result(self, result: EvaluationResult):
+        """Log a single evaluation result."""
+        self.evaluation_results[result.iteration].append(result)
+
+        if self.tb_writer is None:
+            return
+
+        prefix = f"Eval_{result.config_name}"
+
+        # Per-viewpoint metrics (use sanitized name for tag)
+        view_tag = result.viewpoint_name.replace('.', '_').replace('/', '_')
+
+        # Albedo metrics
+        self.tb_writer.add_scalar(f'{prefix}/psnr_albedo/{view_tag}',
+                                  result.albedo_metrics.psnr, result.iteration)
+        self.tb_writer.add_scalar(f'{prefix}/ssim_albedo/{view_tag}',
+                                  result.albedo_metrics.ssim, result.iteration)
+        self.tb_writer.add_scalar(f'{prefix}/l1_albedo/{view_tag}',
+                                  result.albedo_metrics.l1, result.iteration)
+
+        # Shadowed metrics
+        self.tb_writer.add_scalar(f'{prefix}/psnr_shadowed/{view_tag}',
+                                  result.shadowed_metrics.psnr, result.iteration)
+        self.tb_writer.add_scalar(f'{prefix}/ssim_shadowed/{view_tag}',
+                                  result.shadowed_metrics.ssim, result.iteration)
+
+        # Unshadowed metrics
+        self.tb_writer.add_scalar(f'{prefix}/psnr_unshadowed/{view_tag}',
+                                  result.unshadowed_metrics.psnr, result.iteration)
+
+    def compute_and_log_summary(self, iteration: int, config_name: str) -> EvaluationSummary:
+        """Compute and log summary statistics for an evaluation config."""
+        results = [r for r in self.evaluation_results[iteration] if r.config_name == config_name]
+
+        if not results:
+            return EvaluationSummary(config_name=config_name, iteration=iteration)
+
+        summary = EvaluationSummary(
+            config_name=config_name,
+            iteration=iteration,
+            num_viewpoints=len(results)
+        )
+
+        # Collect metrics
+        psnr_albedo = [r.albedo_metrics.psnr for r in results]
+        psnr_shadowed = [r.shadowed_metrics.psnr for r in results]
+        psnr_unshadowed = [r.unshadowed_metrics.psnr for r in results]
+        ssim_albedo = [r.albedo_metrics.ssim for r in results]
+        ssim_shadowed = [r.shadowed_metrics.ssim for r in results]
+        ssim_unshadowed = [r.unshadowed_metrics.ssim for r in results]
+        lpips_albedo = [r.albedo_metrics.lpips for r in results]
+        lpips_shadowed = [r.shadowed_metrics.lpips for r in results]
+        lpips_unshadowed = [r.unshadowed_metrics.lpips for r in results]
+        l1_albedo = [r.albedo_metrics.l1 for r in results]
+        l1_shadowed = [r.shadowed_metrics.l1 for r in results]
+        l1_unshadowed = [r.unshadowed_metrics.l1 for r in results]
+
+        # Compute means
+        summary.mean_psnr_albedo = np.mean(psnr_albedo)
+        summary.mean_psnr_shadowed = np.mean(psnr_shadowed)
+        summary.mean_psnr_unshadowed = np.mean(psnr_unshadowed)
+        summary.mean_ssim_albedo = np.mean(ssim_albedo)
+        summary.mean_ssim_shadowed = np.mean(ssim_shadowed)
+        summary.mean_ssim_unshadowed = np.mean(ssim_unshadowed)
+        summary.mean_lpips_albedo = np.mean(lpips_albedo)
+        summary.mean_lpips_shadowed = np.mean(lpips_shadowed)
+        summary.mean_lpips_unshadowed = np.mean(lpips_unshadowed)
+        summary.mean_l1_albedo = np.mean(l1_albedo)
+        summary.mean_l1_shadowed = np.mean(l1_shadowed)
+        summary.mean_l1_unshadowed = np.mean(l1_unshadowed)
+
+        # Compute std
+        summary.std_psnr_albedo = np.std(psnr_albedo)
+        summary.std_psnr_shadowed = np.std(psnr_shadowed)
+        summary.std_psnr_unshadowed = np.std(psnr_unshadowed)
+
+        # Best/worst
+        best_idx = np.argmax(psnr_albedo)
+        worst_idx = np.argmin(psnr_albedo)
+        summary.best_psnr_viewpoint = results[best_idx].viewpoint_name
+        summary.worst_psnr_viewpoint = results[worst_idx].viewpoint_name
+        summary.best_psnr = psnr_albedo[best_idx]
+        summary.worst_psnr = psnr_albedo[worst_idx]
+
+        # Store summary
+        if iteration not in self.evaluation_summaries:
+            self.evaluation_summaries[iteration] = {}
+        self.evaluation_summaries[iteration][config_name] = summary
+
+        # Log to TensorBoard
+        if self.tb_writer:
+            prefix = f"Eval_{config_name}_Summary"
+
+            # PSNR
+            self.tb_writer.add_scalar(f'{prefix}/psnr_albedo_mean', summary.mean_psnr_albedo, iteration)
+            self.tb_writer.add_scalar(f'{prefix}/psnr_shadowed_mean', summary.mean_psnr_shadowed, iteration)
+            self.tb_writer.add_scalar(f'{prefix}/psnr_unshadowed_mean', summary.mean_psnr_unshadowed, iteration)
+            self.tb_writer.add_scalar(f'{prefix}/psnr_albedo_std', summary.std_psnr_albedo, iteration)
+
+            # SSIM
+            self.tb_writer.add_scalar(f'{prefix}/ssim_albedo_mean', summary.mean_ssim_albedo, iteration)
+            self.tb_writer.add_scalar(f'{prefix}/ssim_shadowed_mean', summary.mean_ssim_shadowed, iteration)
+            self.tb_writer.add_scalar(f'{prefix}/ssim_unshadowed_mean', summary.mean_ssim_unshadowed, iteration)
+
+            # LPIPS
+            self.tb_writer.add_scalar(f'{prefix}/lpips_albedo_mean', summary.mean_lpips_albedo, iteration)
+            self.tb_writer.add_scalar(f'{prefix}/lpips_shadowed_mean', summary.mean_lpips_shadowed, iteration)
+
+            # L1
+            self.tb_writer.add_scalar(f'{prefix}/l1_albedo_mean', summary.mean_l1_albedo, iteration)
+            self.tb_writer.add_scalar(f'{prefix}/l1_shadowed_mean', summary.mean_l1_shadowed, iteration)
+
+        return summary
+
+    def save_evaluation_json(self, iteration: int):
+        """Save evaluation results to JSON file."""
+        results = self.evaluation_results.get(iteration, [])
+        summaries = self.evaluation_summaries.get(iteration, {})
+
+        output = {
+            "iteration": iteration,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "results": [r.to_dict() for r in results],
+            "summaries": {k: v.to_dict() for k, v in summaries.items()}
+        }
+
+        filepath = os.path.join(self.metrics_dir, f"evaluation_{iteration:06d}.json")
+        with open(filepath, 'w') as f:
+            json.dump(output, f, indent=2)
+
+    def print_evaluation_summary(self, iteration: int, config_name: str):
+        """Print formatted evaluation summary."""
+        summary = self.evaluation_summaries.get(iteration, {}).get(config_name)
+        if summary is None:
+            return
+
+        print(f"\n{'='*60}")
+        print(f"[ITER {iteration}] Evaluation Summary - {config_name.upper()}")
+        print(f"{'='*60}")
+        print(f"  Viewpoints evaluated: {summary.num_viewpoints}")
+        print(f"  PSNR (albedo):    {summary.mean_psnr_albedo:.2f} ± {summary.std_psnr_albedo:.2f} dB")
+        print(f"  PSNR (shadowed):  {summary.mean_psnr_shadowed:.2f} ± {summary.std_psnr_shadowed:.2f} dB")
+        print(f"  PSNR (unshadowed):{summary.mean_psnr_unshadowed:.2f} ± {summary.std_psnr_unshadowed:.2f} dB")
+        print(f"  SSIM (albedo):    {summary.mean_ssim_albedo:.4f}")
+        print(f"  SSIM (shadowed):  {summary.mean_ssim_shadowed:.4f}")
+        if LPIPS_AVAILABLE:
+            print(f"  LPIPS (albedo):   {summary.mean_lpips_albedo:.4f}")
+        print(f"  L1 (albedo):      {summary.mean_l1_albedo:.5f}")
+        print(f"  Best viewpoint:   {summary.best_psnr_viewpoint} ({summary.best_psnr:.2f} dB)")
+        print(f"  Worst viewpoint:  {summary.worst_psnr_viewpoint} ({summary.worst_psnr:.2f} dB)")
+        print(f"{'='*60}\n")
+
+
+def create_loss_components(
+    unshadowed_image_loss: torch.Tensor,
+    shadowed_image_loss: torch.Tensor,
+    l1_unshadowed: torch.Tensor,
+    l1_shadowed: torch.Tensor,
+    normal_loss: torch.Tensor,
+    dist_loss: torch.Tensor,
+    sh_gauss_loss: torch.Tensor,
+    sh_env_loss: torch.Tensor,
+    consistency_loss: torch.Tensor,
+    shadow_loss: torch.Tensor,
+    sun_reg_loss: torch.Tensor = None,
+    sky_mask_loss: torch.Tensor = None,
+    total_loss: torch.Tensor = None
+) -> LossComponents:
+    """Helper to create LossComponents from tensor values."""
+    return LossComponents(
+        unshadowed_image=unshadowed_image_loss.item() if torch.is_tensor(unshadowed_image_loss) else unshadowed_image_loss,
+        shadowed_image=shadowed_image_loss.item() if torch.is_tensor(shadowed_image_loss) else shadowed_image_loss,
+        l1_unshadowed=l1_unshadowed.item() if torch.is_tensor(l1_unshadowed) else l1_unshadowed,
+        l1_shadowed=l1_shadowed.item() if torch.is_tensor(l1_shadowed) else l1_shadowed,
+        normal=normal_loss.item() if torch.is_tensor(normal_loss) else normal_loss,
+        dist=dist_loss.item() if torch.is_tensor(dist_loss) else dist_loss,
+        sh_gauss=sh_gauss_loss.item() if torch.is_tensor(sh_gauss_loss) else sh_gauss_loss,
+        sh_env=sh_env_loss.item() if torch.is_tensor(sh_env_loss) else sh_env_loss,
+        consistency=consistency_loss.item() if torch.is_tensor(consistency_loss) else consistency_loss,
+        shadow=shadow_loss.item() if torch.is_tensor(shadow_loss) else shadow_loss,
+        sun_reg=sun_reg_loss.item() if sun_reg_loss is not None and torch.is_tensor(sun_reg_loss) else (sun_reg_loss or 0.0),
+        sky_mask=sky_mask_loss.item() if sky_mask_loss is not None and torch.is_tensor(sky_mask_loss) else (sky_mask_loss or 0.0),
+        total=total_loss.item() if total_loss is not None and torch.is_tensor(total_loss) else (total_loss or 0.0)
+    )
+
+def update_lambdas(iteration, opt, use_sun=False) -> Dict[str, float]:
     """
     Returns the loss lambda values based on the current iteration and shadowed/unshadowed mode.
+
+    For use_sun mode, the training schedule is fundamentally different:
+    - Shadowed rendering is used from the START (warmup included)
+    - This prevents shadows from being baked into albedo
+    - The unshadowed loss is only a small regularizer, never the primary loss
+    - The SH_gauss tuning phase is skipped (not applicable for explicit sun model)
+
     Returns:
         dict: A dictionary containing adjusted lambda values.
     """
@@ -28,36 +592,84 @@ def update_lambdas(iteration, opt):
     lambda_normal = opt.lambda_normal if iteration > opt.start_regularization else 0.0
     lambda_dist = opt.lambda_dist if iteration > opt.start_regularization else 0.0
 
-    if iteration < opt.warmup:
-        shadowed_image_loss_lambda = 0.0
-        unshadowed_image_loss_lambda = 1.0
-        consistency_loss_lambda = 0.0
-        sh_gauss_lambda = 0.0
-        shadow_loss_lambda = 0.0
-        env_loss_lambda = opt.env_loss_lambda
+    if use_sun:
+        # ===== USE_SUN MODE =====
+        # Key insight: We MUST use shadowed rendering from the start.
+        # If we train unshadowed against GT (which has real shadows), the model
+        # will bake shadow patterns into albedo since there's no shadow mask to
+        # explain the dark regions.
+        #
+        # Training phases for use_sun:
+        # 1. Early warmup (0 → warmup): Shadowed + unshadowed, build geometry
+        # 2. Post-warmup (warmup → start_shadowed): Shadowed only, refine lighting
+        # 3. Full training (start_shadowed+): Shadowed + small unshadowed regularizer
 
-    # For small number of iterations, tune only SH_gauss
-    elif opt.warmup <= iteration <= opt.start_shadowed:
-        shadowed_image_loss_lambda = 0.0
-        unshadowed_image_loss_lambda = 0.0
-        consistency_loss_lambda = opt.consistency_loss_lambda_init
-        sh_gauss_lambda = opt.gauss_loss_lambda
-        shadow_loss_lambda = 0.0
-        env_loss_lambda = 0.0
+        if iteration < opt.warmup:
+            # Early phase: primarily shadowed, with unshadowed as regularizer
+            # Shadowed fits GT (which has shadows), unshadowed encourages clean albedo
+            shadowed_image_loss_lambda = 1.0
+            unshadowed_image_loss_lambda = 0.01  # Small regularizer to prevent albedo collapse
+            consistency_loss_lambda = 0.0
+            sh_gauss_lambda = 0.0
+            shadow_loss_lambda = 0.0
+            env_loss_lambda = 0.0
 
-        #Turn off 2DGS regularization while tuning SH_gauss
-        lambda_normal = 0.0
-        lambda_dist = 0.0
+        elif opt.warmup <= iteration <= opt.start_shadowed:
+            # Refinement: shadowed only, let shadow mask and lighting settle
+            # SH_gauss tuning is not applicable for sun model
+            shadowed_image_loss_lambda = 1.0
+            unshadowed_image_loss_lambda = 0.0
+            consistency_loss_lambda = 0.0
+            sh_gauss_lambda = 0.0
+            shadow_loss_lambda = 0.0
+            env_loss_lambda = 0.0
 
-    elif iteration > opt.start_shadowed:
-        shadowed_image_loss_lambda = 1.0
-        unshadowed_image_loss_lambda = 0.001
-        consistency_loss_lambda = opt.consistency_loss_lambda_init / opt.consistency_loss_lambda_final_ratio
-        sh_gauss_lambda = opt.gauss_loss_lambda
-        shadow_loss_lambda = opt.shadow_loss_lambda
-        env_loss_lambda = opt.env_loss_lambda
+            # Keep 2DGS regularization on for sun mode (normals matter for N·L)
+            # lambda_normal and lambda_dist stay as set above
+
+        elif iteration > opt.start_shadowed:
+            # Full training: shadowed primary only (disable unshadowed GT supervision)
+            shadowed_image_loss_lambda = 1.0
+            unshadowed_image_loss_lambda = 0.0 #Old was 0.01
+            consistency_loss_lambda = 0.0
+            sh_gauss_lambda = 0.0
+            shadow_loss_lambda = 0.0
+            env_loss_lambda = 0.0
+        else:
+            raise ValueError("Iteration doesn't fit into any defined conditions - verify logic.")
+
     else:
-        raise ValueError("Iteration doesn't fit into any defined conditions - verify logic.")
+        # ===== ORIGINAL SH MODE =====
+        if iteration < opt.warmup:
+            shadowed_image_loss_lambda = 0.0
+            unshadowed_image_loss_lambda = 1.0
+            consistency_loss_lambda = 0.0
+            sh_gauss_lambda = 0.0
+            shadow_loss_lambda = 0.0
+            env_loss_lambda = opt.env_loss_lambda
+
+        # For small number of iterations, tune only SH_gauss
+        elif opt.warmup <= iteration <= opt.start_shadowed:
+            shadowed_image_loss_lambda = 0.0
+            unshadowed_image_loss_lambda = 0.0
+            consistency_loss_lambda = opt.consistency_loss_lambda_init
+            sh_gauss_lambda = opt.gauss_loss_lambda
+            shadow_loss_lambda = 0.0
+            env_loss_lambda = 0.0
+
+            #Turn off 2DGS regularization while tuning SH_gauss
+            lambda_normal = 0.0
+            lambda_dist = 0.0
+
+        elif iteration > opt.start_shadowed:
+            shadowed_image_loss_lambda = 1.0
+            unshadowed_image_loss_lambda = 0.001
+            consistency_loss_lambda = opt.consistency_loss_lambda_init / opt.consistency_loss_lambda_final_ratio
+            sh_gauss_lambda = opt.gauss_loss_lambda
+            shadow_loss_lambda = opt.shadow_loss_lambda
+            env_loss_lambda = opt.env_loss_lambda
+        else:
+            raise ValueError("Iteration doesn't fit into any defined conditions - verify logic.")
 
 
 
@@ -73,7 +685,23 @@ def update_lambdas(iteration, opt):
     }
 
 
-def prepare_output_and_logger(args):
+def get_training_phase(iteration: int, opt) -> TrainingPhase:
+    """Get the current training phase information."""
+    return TrainingPhase(
+        name="training",
+        iteration=iteration,
+        warmup_end=opt.warmup,
+        sh_tuning_end=opt.start_shadowed
+    )
+
+
+def prepare_output_and_logger(args) -> tuple:
+    """
+    Prepare output directory and logging infrastructure.
+
+    Returns:
+        tuple: (tb_writer, metrics_logger)
+    """
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -93,39 +721,83 @@ def prepare_output_and_logger(args):
         tb_writer = SummaryWriter(args.model_path, flush_secs=5)
     else:
         print("Tensorboard not available: not logging progress")
-    return tb_writer
+
+    # Create metrics logger
+    metrics_logger = MetricsLogger(tb_writer, args.model_path)
+
+    return tb_writer, metrics_logger
 
 
 @torch.no_grad()
-def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, appearance_lut=None, source_path=None, sky_masks=None):
-    if tb_writer:
-        tb_writer.add_scalar('Ll1_unshadowed', Ll1_unshadowed, iteration)
-        tb_writer.add_scalar('Ll1_shadowed', Ll1_shadowed, iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
-        tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss, elapsed,
+                    testing_iterations, scene: Scene, renderFunc, renderArgs,
+                    appearance_lut=None, source_path=None, sky_masks=None,
+                    metrics_logger: Optional[MetricsLogger] = None):
+    """
+    Generate training report with detailed metrics logging.
+
+    Args:
+        tb_writer: TensorBoard writer
+        iteration: Current training iteration
+        Ll1_unshadowed: L1 loss for unshadowed render
+        Ll1_shadowed: L1 loss for shadowed render
+        l1_loss: L1 loss function
+        elapsed: Elapsed time for iteration (ms)
+        testing_iterations: List of iterations to run evaluation
+        scene: Scene object
+        renderFunc: Render function
+        renderArgs: Arguments for render function
+        appearance_lut: Appearance lookup table
+        source_path: Source data path
+        sky_masks: Sky masks dictionary
+        metrics_logger: MetricsLogger instance for detailed logging
+
+    Returns:
+        float: PSNR value from evaluation (or large number if not evaluating)
+    """
+    # Use metrics_logger if available, otherwise fall back to basic logging
+    if metrics_logger is not None:
+        metrics_logger.log_iteration_time(iteration, elapsed)
+        metrics_logger.log_gaussian_stats(iteration, scene.gaussians)
+
+        # Log sun model parameters if in use_sun mode
+        if scene.gaussians.use_sun and appearance_lut:
+            first_emb_idx = list(appearance_lut.values())[0]
+            metrics_logger.log_sun_model_params(iteration, scene.gaussians.sun_model, first_emb_idx)
+    elif tb_writer:
+        # Fallback to basic logging
+        tb_writer.add_scalar('Loss_Image/l1_unshadowed', Ll1_unshadowed, iteration)
+        tb_writer.add_scalar('Loss_Image/l1_shadowed', Ll1_shadowed, iteration)
+        tb_writer.add_scalar('Performance/iter_time_ms', elapsed, iteration)
+        tb_writer.add_scalar('Gaussians/total_count', scene.gaussians.get_xyz.shape[0], iteration)
 
     psnr_test = 10000000
+
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         test_cameras = scene.getTestCameras()
-        validation_configs = ({'name': 'test', 'cameras' : test_cameras[:5] if len(test_cameras) > 5 else test_cameras},
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        validation_configs = (
+            {'name': 'test', 'cameras': test_cameras[:5] if len(test_cameras) > 5 else test_cameras},
+            {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]}
+        )
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
 
+                for idx, viewpoint in enumerate(config['cameras']):
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
 
-                    #render albedo
+                    # Render albedo
                     rgb_precomp = scene.gaussians.get_albedo
+                    render_start = time.time()
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
+                    render_time_ms = (time.time() - render_start) * 1000
                     image_albedo = torch.clamp(render_pkg["render"], 0.0, 1.0)
 
-                    #get normals in world space
+                    # Get normals in world space
                     quaternions = scene.gaussians.get_rotation
                     scales = scene.gaussians.get_scaling
                     normal_vectors, multiplier = compute_normal_world_space(
@@ -150,50 +822,60 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
 
                         # Get unshadowed lighting + components (with sun color prior)
                         sun_elev = viewpoint.sun_elevation
-                        rgb_precomp_unshadowed, intensity, sun_dir, components = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, viewpoint.sun_direction, sun_elevation=sun_elev)
+                        if scene.gaussians.full_pbr:
+                            rgb_precomp_unshadowed, intensity, sun_dir, components = scene.gaussians.compute_directional_pbr(
+                                emb_idx, normal_vectors, viewpoint.sun_direction, viewpoint.camera_center, sun_elevation=sun_elev
+                            )
+                        else:
+                            rgb_precomp_unshadowed, intensity, sun_dir, components = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, viewpoint.sun_direction, sun_elevation=sun_elev)
 
                         # render unshadowed with directional lighting
                         render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp_unshadowed)
                         image_unshadowed = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
 
-                        # Compute shadow mask using selected method (shadow_map for TensorBoard visualization)
+                        # Compute shadow mask for TensorBoard visualization
+                        viz_shadow_method = "shadow_map"
+                        if getattr(renderArgs[0], "use_gaussians", False):
+                            viz_shadow_method = "ray_march"
                         shadow_mask, shadow_depth_map, sun_camera = compute_shadows_for_gaussians(
                             scene.gaussians,
                             sun_dir,
                             renderArgs[0],  # pipe
-                            method="shadow_map",  # Always use shadow_map for viz to get depth map
+                            method=viz_shadow_method,
                             shadow_map_resolution=512,
                             shadow_bias=0.1,
                             device="cuda"
                         )
                         shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
-
-                        direct_light = components['direct']
-                        ambient_light = components['ambient']
-                        residual_light = components['residual']
-
-                        intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
-                        intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
-                        intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
-
                         albedo = scene.gaussians.get_albedo
-                        rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
+
+                        if scene.gaussians.full_pbr:
+                            rgb_precomp_shadowed, intensity_shadowed, _, components_shadowed = scene.gaussians.compute_directional_pbr(
+                                emb_idx, normal_vectors, viewpoint.sun_direction, viewpoint.camera_center,
+                                sun_elevation=sun_elev, shadow_mask=shadow_mask
+                            )
+                            direct_light = components_shadowed['direct_pbr'] if 'direct_pbr' in components_shadowed else components_shadowed['direct']
+                        else:
+                            direct_light = components['direct']
+                            ambient_light = components['ambient']
+                            residual_light = components['residual']
+
+                            intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                            intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
+                            intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
+
+                            rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
 
                         # Render shadow map for visualization with black background
-                        # shadow_mask is [N, 1], render it as grayscale repeated to RGB
-                        # Use black background so shadowed (black) areas are visible against empty regions
                         shadow_rgb = shadow_mask.expand(-1, 3)  # [N, 3]
                         black_bg = torch.zeros(3, device="cuda")
                         render_pkg_shadow = renderFunc(viewpoint, scene.gaussians, renderArgs[0], black_bg, override_color=shadow_rgb)
                         shadow_map_vis = torch.clamp(render_pkg_shadow["render"], 0.0, 1.0)
 
-                        # Render direct light only (with shadow applied) - shows sun contribution before ambient/residual
-                        # This will be black in shadowed areas
-                        # For sky gaussians (casts_shadow < 0.5), use full sun intensity instead of N·L shading
+                        # Render direct light only (with shadow applied)
                         casts_shadow_flag = scene.gaussians.get_casts_shadow.unsqueeze(-1)  # [N, 1]
                         is_sky = casts_shadow_flag < 0.5
-                        # Sky gets full intensity, non-sky gets N·L based direct light
-                        sun_intensity = scene.gaussians.sun_model.get_sun_intensity(emb_idx).unsqueeze(0)  # [1, 3]
+                        sun_intensity = scene.gaussians.sun_model.get_sun_intensity(emb_idx, sun_elevation=sun_elev).unsqueeze(0)  # [1, 3]
                         direct_for_vis = torch.where(is_sky, sun_intensity.expand(direct_light.shape[0], -1), direct_light)
                         direct_shadowed = direct_for_vis * shadow_mask  # [N, 3]
                         direct_shadowed_gamma = torch.clamp_min(direct_shadowed, 0.00001) ** (1 / 2.2)
@@ -447,18 +1129,218 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             rend_dist = render_pkg["rend_dist"]
                             rend_dist = colormap(rend_dist.cpu().numpy()[0])
                             tb_writer.add_images(view_tag + "/16_rend_dist", rend_dist[None], global_step=iteration)
+
+                            # Material map renders (similar pipeline to normal map render)
+                            if hasattr(scene.gaussians, 'get_roughness') and hasattr(scene.gaussians, 'get_metallic'):
+                                roughness_precomp = scene.gaussians.get_roughness.expand(-1, 3)
+                                render_pkg_roughness = render(viewpoint, scene.gaussians, *renderArgs, override_color=roughness_precomp)
+                                roughness_map = torch.clamp(render_pkg_roughness["render"], 0.0, 1.0)
+                                tb_writer.add_images(view_tag + "/17_roughness_map", roughness_map[None], global_step=iteration)
+
+                                metallic_precomp = scene.gaussians.get_metallic.expand(-1, 3)
+                                render_pkg_metallic = render(viewpoint, scene.gaussians, *renderArgs, override_color=metallic_precomp)
+                                metallic_map = torch.clamp(render_pkg_metallic["render"], 0.0, 1.0)
+                                tb_writer.add_images(view_tag + "/18_metallic_map", metallic_map[None], global_step=iteration)
                         except:
                             pass
 
-                    l1_test += l1_loss(image_albedo, gt_image).mean().double()
-                    psnr_test += psnr(image_albedo, gt_image).mean().double()
+                    # Compute detailed metrics using MetricsLogger if available
+                    if metrics_logger is not None:
+                        # Compute comprehensive metrics for albedo
+                        albedo_metrics = metrics_logger.metrics_calculator.compute_all_metrics(
+                            image_albedo, gt_image
+                        )
 
+                        # Compute metrics for shadowed and unshadowed renders
+                        shadowed_metrics = ImageMetrics()
+                        unshadowed_metrics = ImageMetrics()
+
+                        if image_shadowed is not None:
+                            shadowed_metrics = metrics_logger.metrics_calculator.compute_all_metrics(
+                                image_shadowed, gt_image
+                            )
+
+                        if image_unshadowed is not None:
+                            unshadowed_metrics = metrics_logger.metrics_calculator.compute_all_metrics(
+                                image_unshadowed, gt_image
+                            )
+
+                        # Create and log evaluation result
+                        eval_result = EvaluationResult(
+                            viewpoint_name=viewpoint.image_name,
+                            config_name=config['name'],
+                            iteration=iteration,
+                            albedo_metrics=albedo_metrics,
+                            shadowed_metrics=shadowed_metrics,
+                            unshadowed_metrics=unshadowed_metrics,
+                            num_gaussians=scene.gaussians.get_xyz.shape[0],
+                            render_time_ms=render_time_ms
+                        )
+                        metrics_logger.log_evaluation_result(eval_result)
+
+                        # Accumulate for backward compatibility
+                        l1_test += albedo_metrics.l1
+                        psnr_test += albedo_metrics.psnr
+                    else:
+                        # Fallback to basic metrics computation
+                        l1_test += l1_loss(image_albedo, gt_image).mean().double()
+                        psnr_test += psnr(image_albedo, gt_image).mean().double()
+
+                # Compute averages
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+
+                # Log summary using MetricsLogger if available
+                if metrics_logger is not None:
+                    summary = metrics_logger.compute_and_log_summary(iteration, config['name'])
+                    metrics_logger.print_evaluation_summary(iteration, config['name'])
+                else:
+                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                    if tb_writer:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+
+        # Save evaluation results to JSON
+        if metrics_logger is not None:
+            metrics_logger.save_evaluation_json(iteration)
 
         torch.cuda.empty_cache()
     return psnr_test
+
+
+# =============================================================================
+# Utility Functions for Final Metrics Export
+# =============================================================================
+
+def generate_final_metrics_report(metrics_logger: MetricsLogger, output_path: str = None):
+    """
+    Generate a comprehensive final metrics report.
+
+    Args:
+        metrics_logger: The MetricsLogger instance with accumulated data
+        output_path: Optional path to save the report (defaults to metrics_dir)
+    """
+    if output_path is None:
+        output_path = os.path.join(metrics_logger.metrics_dir, "final_report.json")
+
+    # Collect all summaries
+    all_summaries = {}
+    for iteration, configs in metrics_logger.evaluation_summaries.items():
+        all_summaries[iteration] = {config: summary.to_dict() for config, summary in configs.items()}
+
+    # Find best iteration by PSNR
+    best_iter_train = None
+    best_psnr_train = 0
+    best_iter_test = None
+    best_psnr_test = 0
+
+    for iteration, configs in metrics_logger.evaluation_summaries.items():
+        if 'train' in configs and configs['train'].mean_psnr_albedo > best_psnr_train:
+            best_psnr_train = configs['train'].mean_psnr_albedo
+            best_iter_train = iteration
+        if 'test' in configs and configs['test'].mean_psnr_albedo > best_psnr_test:
+            best_psnr_test = configs['test'].mean_psnr_albedo
+            best_iter_test = iteration
+
+    report = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "total_evaluations": len(metrics_logger.evaluation_summaries),
+        "best_train_iteration": best_iter_train,
+        "best_train_psnr": best_psnr_train,
+        "best_test_iteration": best_iter_test,
+        "best_test_psnr": best_psnr_test,
+        "iteration_summaries": all_summaries,
+        "performance": {
+            "mean_iter_time_ms": np.mean(metrics_logger.iteration_times) if metrics_logger.iteration_times else 0,
+            "total_iterations": len(metrics_logger.iteration_times)
+        }
+    }
+
+    with open(output_path, 'w') as f:
+        json.dump(report, f, indent=2)
+
+    print(f"\n{'='*60}")
+    print("FINAL METRICS REPORT")
+    print(f"{'='*60}")
+    print(f"Report saved to: {output_path}")
+    print(f"Total evaluations: {report['total_evaluations']}")
+    if best_iter_train:
+        print(f"Best train iteration: {best_iter_train} (PSNR: {best_psnr_train:.2f} dB)")
+    if best_iter_test:
+        print(f"Best test iteration: {best_iter_test} (PSNR: {best_psnr_test:.2f} dB)")
+    print(f"{'='*60}\n")
+
+    return report
+
+
+def export_metrics_to_csv(metrics_logger: MetricsLogger, output_path: str = None):
+    """
+    Export evaluation metrics to CSV format for easy analysis.
+
+    Args:
+        metrics_logger: The MetricsLogger instance with accumulated data
+        output_path: Optional path for the CSV file
+    """
+    if output_path is None:
+        output_path = os.path.join(metrics_logger.metrics_dir, "metrics_summary.csv")
+
+    rows = []
+    headers = [
+        "iteration", "config", "num_viewpoints",
+        "psnr_albedo_mean", "psnr_albedo_std",
+        "psnr_shadowed_mean", "psnr_unshadowed_mean",
+        "ssim_albedo_mean", "ssim_shadowed_mean", "ssim_unshadowed_mean",
+        "lpips_albedo_mean", "lpips_shadowed_mean",
+        "l1_albedo_mean", "l1_shadowed_mean", "l1_unshadowed_mean",
+        "best_viewpoint", "worst_viewpoint"
+    ]
+
+    for iteration in sorted(metrics_logger.evaluation_summaries.keys()):
+        for config_name, summary in metrics_logger.evaluation_summaries[iteration].items():
+            row = [
+                iteration, config_name, summary.num_viewpoints,
+                summary.mean_psnr_albedo, summary.std_psnr_albedo,
+                summary.mean_psnr_shadowed, summary.mean_psnr_unshadowed,
+                summary.mean_ssim_albedo, summary.mean_ssim_shadowed, summary.mean_ssim_unshadowed,
+                summary.mean_lpips_albedo, summary.mean_lpips_shadowed,
+                summary.mean_l1_albedo, summary.mean_l1_shadowed, summary.mean_l1_unshadowed,
+                summary.best_psnr_viewpoint, summary.worst_psnr_viewpoint
+            ]
+            rows.append(row)
+
+    # Write CSV
+    with open(output_path, 'w') as f:
+        f.write(','.join(headers) + '\n')
+        for row in rows:
+            f.write(','.join(str(v) for v in row) + '\n')
+
+    print(f"Metrics exported to CSV: {output_path}")
+    return output_path
+
+
+# =============================================================================
+# Module Exports
+# =============================================================================
+
+__all__ = [
+    # Data classes
+    'ImageMetrics',
+    'LossComponents',
+    'TrainingPhase',
+    'EvaluationResult',
+    'EvaluationSummary',
+    # Classes
+    'MetricsCalculator',
+    'MetricsLogger',
+    # Functions
+    'create_loss_components',
+    'update_lambdas',
+    'get_training_phase',
+    'prepare_output_and_logger',
+    'training_report',
+    'generate_final_metrics_report',
+    'export_metrics_to_csv',
+    # Constants
+    'TENSORBOARD_FOUND',
+    'LPIPS_AVAILABLE',
+]

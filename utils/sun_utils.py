@@ -304,7 +304,7 @@ class SunModel(torch.nn.Module):
         # Learnable sun intensity multiplier per image (scalar, color from elevation prior)
         # Shape: [n_images, 1]
         self.sun_intensity_multiplier = nn.Parameter(
-            torch.ones(self.n_images, 1, device=device) * 3.0
+            torch.ones(self.n_images, 1, device=device) * 4.0  # Strong sun for outdoor
         )
 
         # Learnable color correction for sun (small adjustment to physical prior)
@@ -315,24 +315,25 @@ class SunModel(torch.nn.Module):
         )
 
         # Learnable ambient color per image (sky/indirect illumination)
-        # Shape: [n_images, 3] for RGB
+        # Shape: [n_images, 3] for RGB - keep low relative to sun
         self.ambient_color = nn.Parameter(
-            torch.ones(self.n_images, 3, device=device) * 0.3
+            torch.ones(self.n_images, 3, device=device) * 0.15  # ~3-4% of sun intensity
         )
 
         # GLOBAL sky SH coefficients (shared across all images)
         # This enables relighting with novel environments
-        # Shape: [3, n_sh_coeffs] - initialized with slight sky gradient (blue at top)
+        # Shape: [3, n_sh_coeffs] - initialized with subtle sky gradient
         if use_residual_sh:
-            # Initialize with slight upward bias for sky
+            # Initialize with very subtle sky color - let it be learned
+            # Keep low so direct sun dominates
             init_sh = torch.zeros(3, self.n_sh_coeffs, device=device)
-            # DC term - base sky color
-            init_sh[0, 0] = 0.2  # R
-            init_sh[1, 0] = 0.25  # G
-            init_sh[2, 0] = 0.4  # B (more blue)
+            # DC term - very subtle base sky color
+            init_sh[0, 0] = 0.05  # R
+            init_sh[1, 0] = 0.07  # G
+            init_sh[2, 0] = 0.1   # B (slight blue tint)
             if self.n_sh_coeffs >= 4:
-                # L1 z-component - gradient from ground to sky
-                init_sh[2, 2] = 0.1  # Blue increases upward
+                # L1 z-component - subtle gradient from ground to sky
+                init_sh[2, 2] = 0.02  # Blue increases slightly upward
 
             self.sky_sh = nn.Parameter(init_sh)
             print(f"SunModel: Using GLOBAL sky SH with {self.n_sh_coeffs} coefficients (degree {sh_degree})")
