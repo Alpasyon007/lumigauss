@@ -114,6 +114,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # ---- Adaptive grid-based densification setup ----
     adaptive_grid = None
     if opt.use_adaptive_dens:
+        train_cameras_for_center = scene.getTrainCameras()
+        camera_centers = torch.stack([cam.camera_center for cam in train_cameras_for_center], dim=0)
+        mean_camera_center = camera_centers.mean(dim=0)
         adaptive_grid = AdaptiveDensGrid(
             gaussians, scene.cameras_extent,
             grid_resolution=opt.adaptive_dens_grid_res,
@@ -127,6 +130,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             highfreq_boost=getattr(opt, "adaptive_dens_hf_boost", 0.75),
             highfreq_quantile=getattr(opt, "adaptive_dens_hf_quantile", 0.6),
             hole_score_quantile=getattr(opt, "adaptive_dens_hole_score_quantile", 0.5),
+            camera_center=mean_camera_center,
+            max_densify_distance=getattr(opt, "adaptive_dens_center_radius", -1.0),
         )
         print(f"[Adaptive Densification] Enabled  –  grid {opt.adaptive_dens_grid_res}³, "
               f"interval={opt.adaptive_dens_interval}, "
@@ -517,6 +522,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         loss_thresh_quantile=opt.adaptive_dens_loss_thresh,
                         count_thresh=opt.adaptive_dens_count_thresh,
                         max_new_gaussians=opt.adaptive_dens_max_gaussians,
+                        dens_everything=getattr(opt, "dens_everything", False),
+                        dens_everything_per_cell=getattr(opt, "dens_everything_per_cell", 1),
+                        dens_everything_max_gaussians=getattr(opt, "dens_everything_max_gaussians", 50000),
                     )
 
             # Sky mask loss is now applied during training loop (see sky_mask_loss computation above)

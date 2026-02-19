@@ -40,6 +40,8 @@ class AdaptiveDensGrid:
         highfreq_boost=0.75,
         highfreq_quantile=0.6,
         hole_score_quantile=0.5,
+        camera_center=None,
+        max_densify_distance=-1.0,
     ):
         """
         Args:
@@ -61,6 +63,8 @@ class AdaptiveDensGrid:
         self.highfreq_boost = float(highfreq_boost)
         self.highfreq_quantile = float(highfreq_quantile)
         self.hole_score_quantile = float(hole_score_quantile)
+        self.camera_center = camera_center.to(device) if torch.is_tensor(camera_center) else None
+        self.max_densify_distance = float(max_densify_distance)
 
         # Build AABB from current Gaussian positions with some padding
         xyz = gaussians.get_xyz.detach()
@@ -276,30 +280,82 @@ class AdaptiveDensGrid:
     # Trigger
     # ------------------------------------------------------------------
     def trigger_densification(self, gaussians, loss_thresh_quantile=0.7,
-                              count_thresh=2, max_new_gaussians=512):
+                              count_thresh=2, max_new_gaussians=512,
+                              dens_everything=False,
+                              dens_everything_per_cell=1,
+                              dens_everything_max_gaussians=50000):
         """Count Gaussians per cell, call adaptive densify, then reset."""
         device = self.loss_grid.device
-
-        # Normalise accumulated loss by hit count (average loss per pixel-hit)
-        avg_loss = self.loss_grid.clone()
-        observed = self.hit_count > 0
-        avg_loss[observed] /= self.hit_count[observed]
-
-        # Temporal smoothing to make densification decisions more stable.
-        self.loss_ema = self.ema_decay * self.loss_ema + (1.0 - self.ema_decay) * avg_loss
-        score_loss = torch.maximum(avg_loss, self.loss_ema)
+        center_mask = self._get_center_distance_mask(device)
 
         # Count Gaussians per cell
         grid_counts = self._count_gaussians_per_cell(gaussians)
 
-        # Delegate to GaussianModel
-        gaussians.adaptive_densify_from_loss_grid(
-            score_loss, grid_counts,
-            self.grid_min, self.grid_max,
-            loss_thresh_quantile=loss_thresh_quantile,
-            count_thresh=count_thresh,
-            max_new_gaussians=max_new_gaussians,
-        )
+        if dens_everything:
+            # Debug mode (constrained): densify every *scene-relevant* grid cell,
+            # not the whole padded AABB.
+            observed_cells = self.hit_count > 0
+            occupied_cells = grid_counts > 0
+
+            if occupied_cells.any():
+                occupied_dilated = F.max_pool3d(
+                    occupied_cells.float().unsqueeze(0).unsqueeze(0),
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                ).squeeze(0).squeeze(0) > 0.5
+            else:
+                occupied_dilated = torch.zeros_like(occupied_cells, dtype=torch.bool)
+
+            target_cells = observed_cells | occupied_dilated
+            if center_mask is not None:
+                target_cells = target_cells & center_mask
+            if not target_cells.any():
+                # If no scene evidence has been accumulated yet, avoid scattering
+                # Gaussians everywhere in empty space.
+                print("[Adaptive Densification][dens_everything] No observed/occupied cells yet; skipping this trigger.")
+                self.loss_grid.zero_()
+                self.hit_count.zero_()
+                self._update_aabb(gaussians)
+                return
+
+            score_loss = torch.zeros_like(self.loss_grid, device=device, dtype=torch.float32)
+            score_loss[target_cells] = 1.0
+
+            n_cells = int(target_cells.sum().item())
+            requested_budget = int(max(1, dens_everything_per_cell)) * n_cells
+            budget = min(int(max(1, dens_everything_max_gaussians)), requested_budget)
+
+            gaussians.adaptive_densify_from_loss_grid(
+                score_loss,
+                torch.zeros_like(grid_counts),
+                self.grid_min,
+                self.grid_max,
+                loss_thresh_quantile=0.0,
+                count_thresh=1,
+                max_new_gaussians=budget,
+            )
+            print(f"[Adaptive Densification][dens_everything] Requested {requested_budget} ({dens_everything_per_cell}/cell over {n_cells} scene cells), capped to {budget}.")
+        else:
+            # Normalise accumulated loss by hit count (average loss per pixel-hit)
+            avg_loss = self.loss_grid.clone()
+            observed = self.hit_count > 0
+            avg_loss[observed] /= self.hit_count[observed]
+
+            # Temporal smoothing to make densification decisions more stable.
+            self.loss_ema = self.ema_decay * self.loss_ema + (1.0 - self.ema_decay) * avg_loss
+            score_loss = torch.maximum(avg_loss, self.loss_ema)
+            if center_mask is not None:
+                score_loss = torch.where(center_mask, score_loss, torch.zeros_like(score_loss))
+
+            # Delegate to GaussianModel
+            gaussians.adaptive_densify_from_loss_grid(
+                score_loss, grid_counts,
+                self.grid_min, self.grid_max,
+                loss_thresh_quantile=loss_thresh_quantile,
+                count_thresh=count_thresh,
+                max_new_gaussians=max_new_gaussians,
+            )
 
         # Reset accumulators for next window
         self.loss_grid.zero_()
@@ -334,3 +390,26 @@ class AdaptiveDensGrid:
         pad = extent * padding_factor
         self.grid_min = torch.min(self.grid_min, pts_min - pad)
         self.grid_max = torch.max(self.grid_max, pts_max + pad)
+
+    def _get_center_distance_mask(self, device):
+        """Return voxel mask limited to a radius around mean camera center."""
+        if self.camera_center is None or self.max_densify_distance <= 0:
+            return None
+
+        G = self.grid_res
+        grid_shape = torch.tensor([G, G, G], device=device, dtype=torch.float32)
+        cell_size = (self.grid_max - self.grid_min) / grid_shape
+
+        ix = torch.arange(G, device=device, dtype=torch.float32)
+        iy = torch.arange(G, device=device, dtype=torch.float32)
+        iz = torch.arange(G, device=device, dtype=torch.float32)
+        gx, gy, gz = torch.meshgrid(ix, iy, iz, indexing='ij')
+
+        centers = torch.stack([
+            self.grid_min[0] + (gx + 0.5) * cell_size[0],
+            self.grid_min[1] + (gy + 0.5) * cell_size[1],
+            self.grid_min[2] + (gz + 0.5) * cell_size[2],
+        ], dim=-1)
+
+        dist = torch.norm(centers - self.camera_center.view(1, 1, 1, 3), dim=-1)
+        return dist <= self.max_densify_distance

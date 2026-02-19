@@ -294,11 +294,11 @@ def create_3d_sun_visualization(
     return buf
 
 
-def combine_render_and_visualization(render_img: np.ndarray, vis_3d: np.ndarray, time_str: str) -> np.ndarray:
+def combine_render_and_visualization(render_panel: np.ndarray, vis_3d: np.ndarray, time_str: str) -> np.ndarray:
     """
     Combine the rendered image and 3D visualization side by side.
     """
-    render_h, render_w = render_img.shape[:2]
+    render_h, render_w = render_panel.shape[:2]
     vis_h, vis_w = vis_3d.shape[:2]
 
     # Resize visualization to match render height
@@ -307,7 +307,7 @@ def combine_render_and_visualization(render_img: np.ndarray, vis_3d: np.ndarray,
     vis_3d_resized = np.array(Image.fromarray(vis_3d).resize((new_vis_w, render_h), Image.LANCZOS))
 
     # Combine side by side
-    combined = np.concatenate([render_img, vis_3d_resized], axis=1)
+    combined = np.concatenate([render_panel, vis_3d_resized], axis=1)
 
     # Add time label at top
     combined_pil = Image.fromarray(combined)
@@ -396,7 +396,7 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
         )
 
         frames_combined = []
-        frames_shadowed = []
+        frames_shadowed_direct = []
 
         print(f"\nRendering view: {view.image_name}")
 
@@ -440,6 +440,10 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
                     appearance_idx, normal_vectors, sun_dir, view.camera_center,
                     sun_elevation=elevation, shadow_mask=shadow_mask
                 )
+                if 'direct_pbr' in components:
+                    direct_light = components['direct_pbr']
+                else:
+                    direct_light = components['direct']
             else:
                 # Apply shadow to direct lighting only
                 direct_light = components['direct']
@@ -453,6 +457,17 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
                 albedo = gaussians.get_albedo
                 rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
 
+            # Render direct sun only (with shadow applied), matching train visualizations
+            casts_shadow_flag = gaussians.get_casts_shadow.unsqueeze(-1)  # [N, 1]
+            is_sky = casts_shadow_flag < 0.5
+            sun_intensity = gaussians.sun_model.get_sun_intensity(appearance_idx, sun_elevation=elevation).unsqueeze(0)  # [1, 3]
+            direct_for_vis = torch.where(is_sky, sun_intensity.expand(direct_light.shape[0], -1), direct_light)
+            direct_shadowed = direct_for_vis * shadow_mask
+            direct_shadowed_gamma = torch.clamp_min(direct_shadowed, 0.00001) ** (1 / 2.2)
+            direct_shadowed_rgb = torch.clamp(direct_shadowed_gamma * gaussians.get_albedo, 0.0)
+            render_pkg_direct = render(view, gaussians, pipeline, background, override_color=direct_shadowed_rgb)
+            rendering_direct = torch.clamp(render_pkg_direct["render"], 0.0, 1.0)
+
             # Render shadowed
             render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
             rendering_shadowed = torch.clamp(render_pkg["render"], 0.0, 1.0)
@@ -462,6 +477,8 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
 
             # Convert render to numpy
             frame_shadowed_np = (rendering_shadowed.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            frame_direct_np = (rendering_direct.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            frame_shadowed_direct_np = np.concatenate([frame_shadowed_np, frame_direct_np], axis=1)
 
             # Create 3D visualization if enabled
             if show_3d_vis:
@@ -480,7 +497,7 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
                 )
 
                 # Combine render and visualization
-                combined_frame = combine_render_and_visualization(frame_shadowed_np, vis_3d, time_str)
+                combined_frame = combine_render_and_visualization(frame_shadowed_direct_np, vis_3d, time_str)
                 frames_combined.append(combined_frame)
 
                 # Save combined frame
@@ -488,19 +505,28 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
                     os.path.join(view_render_path, f"frame_{frame_idx:04d}_combined_{time_str.replace(':', '')}.png")
                 )
 
-            # Save individual shadowed frame
+            # Save side-by-side actual render and direct-sun-only render
+            Image.fromarray(frame_shadowed_direct_np).save(
+                os.path.join(view_render_path, f"frame_{frame_idx:04d}_shadowed_direct_{time_str.replace(':', '')}.png")
+            )
+
+            # Save individual frames as well
             torchvision.utils.save_image(
                 rendering_shadowed,
                 os.path.join(view_render_path, f"frame_{frame_idx:04d}_shadowed_{time_str.replace(':', '')}.png")
             )
+            torchvision.utils.save_image(
+                rendering_direct,
+                os.path.join(view_render_path, f"frame_{frame_idx:04d}_direct_sun_only_{time_str.replace(':', '')}.png")
+            )
 
-            frames_shadowed.append(frame_shadowed_np)
+            frames_shadowed_direct.append(frame_shadowed_direct_np)
 
         # Save videos
-        if frames_shadowed:
-            video_path_shadowed = os.path.join(render_path, f"{view.image_name}_day_shadowed.mp4")
-            imageio.mimsave(video_path_shadowed, frames_shadowed, fps=args.fps)
-            print(f"Saved shadowed video to: {video_path_shadowed}")
+        if frames_shadowed_direct:
+            video_path_shadowed = os.path.join(render_path, f"{view.image_name}_day_shadowed_direct.mp4")
+            imageio.mimsave(video_path_shadowed, frames_shadowed_direct, fps=args.fps)
+            print(f"Saved shadowed+direct video to: {video_path_shadowed}")
 
         if frames_combined:
             video_path_combined = os.path.join(render_path, f"{view.image_name}_day_combined.mp4")

@@ -137,6 +137,10 @@ class OptimizationParams(ParamGroup):
         self.adaptive_dens_hf_quantile = 0.6              # Quantile threshold for high-frequency pixel detection
         self.adaptive_dens_hole_score_quantile = 0.5      # For depth==0 pixels, keep only higher-scoring half by default
         self.adaptive_dens_vis_interval = 100             # TensorBoard logging interval for adaptive densification maps
+        self.adaptive_dens_center_radius = -1.0           # If >0, only densify within this distance from mean camera center
+        self.dens_everything = False                      # Debug: force adaptive densification to populate all grid cells
+        self.dens_everything_per_cell = 1                 # Debug: target number of new gaussians per grid cell
+        self.dens_everything_max_gaussians = 50000        # Debug safety cap to avoid OOM when densifying every cell
 
         self.env_lr = 0.02
         self.mlp_lr = 0.002
