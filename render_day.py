@@ -1,7 +1,7 @@
 #
-# Render test views with sun moving through the day
-# Creates a video/image sequence showing lighting changes throughout the day
-# Includes 3D visualization of point cloud with sun position
+# Render test views with a light orbiting in a circle above the scene
+# Creates a video/image sequence showing lighting changes as the light circles
+# Includes 3D visualization of point cloud with light position
 #
 
 import torch
@@ -30,29 +30,29 @@ from PIL import Image, ImageDraw, ImageFont
 def compute_sun_direction_from_angles(azimuth_deg: float, elevation_deg: float, north_offset_deg: float = 0,
                                       flip_x: bool = True, flip_y: bool = False, flip_z: bool = True) -> torch.Tensor:
     """
-    Compute sun direction vector from azimuth and elevation angles.
+    Compute light direction vector from orbit angle and elevation.
+    The orbit circle is in the XZ plane with -Y as the up direction.
 
     Args:
-        azimuth_deg: Sun azimuth in degrees (0 = North, 90 = East, 180 = South, 270 = West)
-        elevation_deg: Sun elevation in degrees (0 = horizon, 90 = zenith)
-        north_offset_deg: North offset for coordinate system alignment (default from lk2 dataset)
+        azimuth_deg: Orbit angle in degrees (0-360, sweeps around -Y axis in XZ plane)
+        elevation_deg: Elevation angle in degrees (0 = horizon/XZ plane, 90 = straight down -Y)
+        north_offset_deg: Rotation offset in degrees
         flip_x: Negate X component
         flip_y: Negate Y component
         flip_z: Negate Z component
 
     Returns:
-        Sun direction vector [3] in Blender world coordinates
+        Light direction vector [3]
     """
     # Convert to radians
-    azimuth_rad = np.radians(azimuth_deg + north_offset_deg)
+    orbit_rad = np.radians(azimuth_deg + north_offset_deg)
     elevation_rad = np.radians(elevation_deg)
 
-    # Compute direction (spherical to cartesian)
-    # In Blender coordinate system: X=right, Y=forward, Z=up
+    # Orbit in XZ plane, -Y is up
     cos_elev = np.cos(elevation_rad)
-    x = cos_elev * np.sin(azimuth_rad)
-    y = -cos_elev * np.cos(azimuth_rad)
-    z = np.sin(elevation_rad)
+    x = cos_elev * np.sin(orbit_rad)
+    y = np.sin(elevation_rad)  # positive elevation -> -Y (up), but flip_y default is False
+    z = cos_elev * np.cos(orbit_rad)
 
     if flip_x:
         x = -x
@@ -65,54 +65,29 @@ def compute_sun_direction_from_angles(azimuth_deg: float, elevation_deg: float, 
     return direction / (torch.norm(direction) + 1e-8)
 
 
-def generate_day_sun_positions(latitude: float = 49.23, longitude: float = 7.0,
-                                start_hour: float = 6.0, end_hour: float = 20.0,
-                                num_frames: int = 60, day_of_year: int = 200) -> list:
+def generate_circular_light_positions(num_frames: int = 60, elevation_deg: float = 45.0,
+                                       start_azimuth: float = 0.0, num_orbits: float = 1.0) -> list:
     """
-    Generate sun positions throughout the day using simplified solar position calculation.
+    Generate light positions that orbit in a circle above the scene at a fixed elevation.
 
     Args:
-        latitude: Latitude in degrees
-        longitude: Longitude in degrees
-        start_hour: Start time (e.g., 6.0 for 6 AM)
-        end_hour: End time (e.g., 20.0 for 8 PM)
         num_frames: Number of frames to generate
-        day_of_year: Day of year (1-365, affects sun path)
+        elevation_deg: Fixed elevation angle in degrees (0 = horizon, 90 = directly above)
+        start_azimuth: Starting azimuth in degrees
+        num_orbits: Number of full orbits (1.0 = one complete circle)
 
     Returns:
-        List of (azimuth_deg, elevation_deg) tuples
+        List of (azimuth_deg, elevation_deg, progress) tuples
+            progress is a float from 0.0 to 1.0 indicating how far through the orbit
     """
     positions = []
+    total_degrees = 360.0 * num_orbits
 
-    # Simplified solar position calculation
-    lat_rad = np.radians(latitude)
-
-    # Solar declination (simplified)
-    declination = 23.45 * np.sin(np.radians(360 * (284 + day_of_year) / 365))
-    dec_rad = np.radians(declination)
-
-    hours = np.linspace(start_hour, end_hour, num_frames)
-
-    for hour in hours:
-        # Hour angle (15 degrees per hour from solar noon at 12:00)
-        hour_angle = 15 * (hour - 12)
-        ha_rad = np.radians(hour_angle)
-
-        # Solar elevation
-        sin_elev = np.sin(lat_rad) * np.sin(dec_rad) + \
-                   np.cos(lat_rad) * np.cos(dec_rad) * np.cos(ha_rad)
-        elevation = np.degrees(np.arcsin(np.clip(sin_elev, -1, 1)))
-
-        # Solar azimuth
-        cos_az = (np.sin(dec_rad) - np.sin(lat_rad) * sin_elev) / \
-                 (np.cos(lat_rad) * np.cos(np.radians(elevation)) + 1e-8)
-        azimuth = np.degrees(np.arccos(np.clip(cos_az, -1, 1)))
-
-        # Adjust azimuth based on hour
-        if hour > 12:
-            azimuth = 360 - azimuth
-
-        positions.append((azimuth, elevation, hour))
+    for i in range(num_frames):
+        progress = i / max(num_frames - 1, 1)
+        azimuth = start_azimuth + progress * total_degrees
+        azimuth = azimuth % 360.0  # keep in [0, 360)
+        positions.append((azimuth, elevation_deg, progress))
 
     return positions
 
@@ -132,11 +107,11 @@ def create_3d_sun_visualization(
     flip_x: bool = True, flip_y: bool = False, flip_z: bool = True,
 ) -> np.ndarray:
     """
-    Create a 3D visualization of the point cloud with sun position and sun path arc.
+    Create a 3D visualization of the point cloud with light position and orbit path.
     Returns a numpy array image.
 
     Args:
-        all_sun_positions: List of (azimuth, elevation, hour) tuples for the full day
+        all_sun_positions: List of (azimuth, elevation, progress) tuples for the orbit
         north_offset: North offset for coordinate system alignment
     """
     def swap_yz(arr):
@@ -147,13 +122,13 @@ def create_3d_sun_visualization(
             return np.stack([arr[:, 0], arr[:, 2], -arr[:, 1]], axis=1)
 
     def angles_to_direction(az_deg, el_deg, n_offset, fx=True, fy=False, fz=True):
-        """Convert azimuth/elevation to direction vector with configurable axis flips"""
-        az_rad = np.radians(az_deg + n_offset)
+        """Convert orbit angle/elevation to direction vector (-Y is up, orbit in XZ plane)"""
+        orbit_rad = np.radians(az_deg + n_offset)
         el_rad = np.radians(el_deg)
         cos_el = np.cos(el_rad)
-        x = cos_el * np.sin(az_rad)
-        y = -cos_el * np.cos(az_rad)
-        z = np.sin(el_rad)
+        x = cos_el * np.sin(orbit_rad)
+        y = np.sin(el_rad)  # positive elevation -> -Y (up), consistent with flip_y
+        z = cos_el * np.cos(orbit_rad)
         if fx:
             x = -x
         if fy:
@@ -206,22 +181,20 @@ def create_3d_sun_visualization(
     sun_dir_norm = sun_dir / (np.linalg.norm(sun_dir) + 1e-8)
     sun_pos = scene_center + sun_dir_norm * sun_arc_radius
 
-    # Precompute sun path points (shared across views)
+    # Precompute light orbit path points (shared across views)
     sun_path_data = None
     if all_sun_positions is not None:
         sun_path_points = []
         sun_path_colors = []
-        for i, (az, el, h) in enumerate(all_sun_positions):
+        for i, (az, el, p) in enumerate(all_sun_positions):
             if el >= 0:
                 dir_vec = angles_to_direction(az, el, north_offset, flip_x, flip_y, flip_z)
                 dir_vec = swap_yz(dir_vec)
                 pos = scene_center + dir_vec * sun_arc_radius
                 sun_path_points.append(pos)
                 t = i / max(len(all_sun_positions) - 1, 1)
-                if t < 0.5:
-                    c = (1.0, 0.5 + t, 0.0, 0.6)
-                else:
-                    c = (1.0, 1.0 - (t - 0.5), 0.0, 0.6)
+                # Color gradient around the circle: cycle through hues
+                c = (1.0, 0.5 + 0.5 * np.cos(2 * np.pi * t), 0.0, 0.6)
                 sun_path_colors.append(c)
         if len(sun_path_points) > 1:
             sun_path_data = (np.array(sun_path_points), sun_path_colors)
@@ -239,7 +212,7 @@ def create_3d_sun_visualization(
     pt_colors = plt.cm.coolwarm(z_norm)
     max_range = scene_extent * 0.9
     mid_x, mid_y, mid_z = scene_center[0], scene_center[1], scene_center[2]
-    time_str = f"{int(hour):02d}:{int((hour % 1) * 60):02d}"
+    time_str = f"{hour * 360:.0f}deg"
 
     cam_forward_norm = None
     if cam_forward is not None:
@@ -256,7 +229,7 @@ def create_3d_sun_visualization(
         ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2],
                    c=pt_colors, s=0.5, alpha=0.4)
 
-        # Sun path arc
+        # Light orbit path
         if sun_path_data is not None:
             spp, spc = sun_path_data
             ax.plot(spp[:, 0], spp[:, 1], spp[:, 2],
@@ -265,7 +238,7 @@ def create_3d_sun_visualization(
                 if i % 5 == 0:
                     ax.scatter([pt[0]], [pt[1]], [pt[2]], c=[col[:3]], s=20, alpha=0.5)
 
-        # Sun arrow + symbol
+        # Light arrow + symbol
         ax.quiver(scene_center[0], scene_center[1], scene_center[2],
                   sun_dir_norm[0] * arrow_length,
                   sun_dir_norm[1] * arrow_length,
@@ -296,6 +269,14 @@ def create_3d_sun_visualization(
 
         ax.set_title(f"{view_label}\n{time_str}  El:{elevation:.0f}° Az:{azimuth:.0f}°",
                      color='white', fontsize=8, pad=5)
+        # Draw arrow showing orbit direction
+        if sun_path_data is not None:
+            spp, _ = sun_path_data
+            if len(spp) > 2:
+                mid = len(spp) // 2
+                ax.quiver(spp[mid][0], spp[mid][1], spp[mid][2],
+                          spp[mid+1][0]-spp[mid][0], spp[mid+1][1]-spp[mid][1], spp[mid+1][2]-spp[mid][2],
+                          color='cyan', linewidth=1, arrow_length_ratio=0.4, alpha=0.6)
 
         ax.grid(False)
         ax.xaxis.pane.fill = False
@@ -357,8 +338,8 @@ def combine_render_and_visualization(render_panel: np.ndarray, vis_3d: np.ndarra
         except:
             font = ImageFont.load_default()
 
-    # Draw time text with shadow for visibility
-    text = f"Time: {time_str}"
+    # Draw orbit label with shadow for visibility
+    text = f"Orbit: {time_str}"
     draw.text((12, 12), text, fill=(0, 0, 0), font=font)
     draw.text((10, 10), text, fill=(255, 255, 255), font=font)
 
@@ -500,15 +481,14 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
     flip_y = getattr(args, 'flip_y', False)
     flip_z = getattr(args, 'flip_z', True)
 
-    print(f"Sun direction axis flips: X={flip_x} Y={flip_y} Z={flip_z}")
+    print(f"Light direction axis flips: X={flip_x} Y={flip_y} Z={flip_z}")
 
-    # Day rendering parameters
+    # Circular orbit parameters
     num_frames = getattr(args, 'num_frames', 60)
-    start_hour = getattr(args, 'start_hour', 6.0)
-    end_hour = getattr(args, 'end_hour', 20.0)
-    latitude = getattr(args, 'latitude', 49.23)  # Default: lk2 dataset location
-    day_of_year = getattr(args, 'day_of_year', 200)  # Mid-July
-    north_offset = getattr(args, 'north_offset', -134.0)  # lk2 dataset north offset
+    light_elevation = getattr(args, 'light_elevation', 45.0)
+    start_azimuth = getattr(args, 'start_azimuth', 90.0)
+    num_orbits = getattr(args, 'num_orbits', 1.0)
+    north_offset = getattr(args, 'north_offset', -134.0)  # coordinate system alignment
 
     # Visualization options
     show_3d_vis = getattr(args, 'show_3d', True)
@@ -516,14 +496,14 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
     render_path = os.path.join(model_path, f"render_day{output_suffix}", f"ours_{iteration}")
     makedirs(render_path, exist_ok=True)
 
-    # Generate sun positions for the day
-    sun_positions = generate_day_sun_positions(
-        latitude=latitude,
-        start_hour=start_hour,
-        end_hour=end_hour,
+    # Generate circular light positions
+    sun_positions = generate_circular_light_positions(
         num_frames=num_frames,
-        day_of_year=day_of_year
+        elevation_deg=light_elevation,
+        start_azimuth=start_azimuth,
+        num_orbits=num_orbits,
     )
+    print(f"Circular orbit: elevation={light_elevation}°, start_az={start_azimuth}°, orbits={num_orbits}, frames={num_frames}")
 
     # Select which views to render
     if selected_view_idx >= 0:
@@ -560,12 +540,8 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
 
         print(f"\nRendering view: {view.image_name}")
 
-        for frame_idx, (azimuth, elevation, hour) in enumerate(tqdm(sun_positions, desc="Sun positions")):
-            # Skip if sun is below horizon
-            if elevation < 0:
-                continue
-
-            # Compute sun direction for this time
+        for frame_idx, (azimuth, elevation, progress) in enumerate(tqdm(sun_positions, desc="Light orbit")):
+            # Compute light direction for this position on the circle
             sun_dir = compute_sun_direction_from_angles(azimuth, elevation, north_offset,
                                                          flip_x=flip_x, flip_y=flip_y, flip_z=flip_z)
 
@@ -639,7 +615,7 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
                 albedo = gaussians.get_albedo
                 rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
 
-            # Render direct sun only (with shadow applied), matching train visualizations
+            # Render direct light only (with shadow applied), matching train visualizations
             casts_shadow_flag = gaussians.get_casts_shadow.unsqueeze(-1)  # [N, 1]
             is_sky = casts_shadow_flag < 0.5
             sun_intensity = gaussians.sun_model.get_sun_intensity(appearance_idx, sun_elevation=elevation).unsqueeze(0)  # [1, 3]
@@ -654,8 +630,9 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
             render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_shadowed)
             rendering_shadowed = torch.clamp(render_pkg["render"], 0.0, 1.0)
 
-            # Time string
-            time_str = f"{int(hour):02d}:{int((hour % 1) * 60):02d}"
+            # Progress string (show degrees around orbit)
+            orbit_deg = progress * 360.0 * num_orbits
+            time_str = f"{orbit_deg:.0f}deg"
 
             # Convert render to numpy
             frame_shadowed_np = (rendering_shadowed.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
@@ -728,7 +705,7 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
                     sun_dir,
                     camera_position,
                     camera_forward,
-                    hour=hour,
+                    hour=progress,
                     elevation=elevation,
                     azimuth=azimuth,
                     all_sun_positions=sun_positions,
@@ -744,22 +721,22 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
 
                 # Save combined frame
                 Image.fromarray(combined_frame).save(
-                    os.path.join(view_render_path, f"frame_{frame_idx:04d}_combined_{time_str.replace(':', '')}.png")
+                    os.path.join(view_render_path, f"frame_{frame_idx:04d}_combined_{time_str}.png")
                 )
 
-            # Save side-by-side actual render and direct-sun-only render
+            # Save side-by-side actual render and direct-light-only render
             Image.fromarray(frame_shadowed_direct_np).save(
-                os.path.join(view_render_path, f"frame_{frame_idx:04d}_shadowed_direct_{time_str.replace(':', '')}.png")
+                os.path.join(view_render_path, f"frame_{frame_idx:04d}_shadowed_direct_{time_str}.png")
             )
 
             # Save individual frames as well
             torchvision.utils.save_image(
                 rendering_shadowed,
-                os.path.join(view_render_path, f"frame_{frame_idx:04d}_shadowed_{time_str.replace(':', '')}.png")
+                os.path.join(view_render_path, f"frame_{frame_idx:04d}_shadowed_{time_str}.png")
             )
             torchvision.utils.save_image(
                 rendering_direct,
-                os.path.join(view_render_path, f"frame_{frame_idx:04d}_direct_sun_only_{time_str.replace(':', '')}.png")
+                os.path.join(view_render_path, f"frame_{frame_idx:04d}_direct_light_only_{time_str}.png")
             )
 
             frames_shadowed_direct.append(frame_shadowed_direct_np)
@@ -828,7 +805,7 @@ def render_day(dataset: ModelParams, iteration: int, pipeline: PipelineParams, a
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Render scene with sun moving through the day")
+    parser = ArgumentParser(description="Render scene with a light orbiting in a circle above the scene")
     model = ModelParams(parser)
     pipeline = PipelineParams(parser)
 
@@ -836,12 +813,11 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", default=-1, type=int, help="Model iteration to load")
     parser.add_argument("--quiet", action="store_true")
 
-    # Day rendering args
-    parser.add_argument("--num_frames", default=60, type=int, help="Number of frames in day sequence")
-    parser.add_argument("--start_hour", default=6.0, type=float, help="Start time (e.g., 6.0 for 6 AM)")
-    parser.add_argument("--end_hour", default=20.0, type=float, help="End time (e.g., 20.0 for 8 PM)")
-    parser.add_argument("--latitude", default=49.23, type=float, help="Location latitude")
-    parser.add_argument("--day_of_year", default=200, type=int, help="Day of year (1-365)")
+    # Circular orbit args
+    parser.add_argument("--num_frames", default=60, type=int, help="Number of frames in orbit sequence")
+    parser.add_argument("--light_elevation", default=45.0, type=float, help="Fixed elevation angle in degrees (0=horizon, 90=zenith)")
+    parser.add_argument("--start_azimuth", default=90.0, type=float, help="Starting azimuth in degrees (default: 90, rotated 90deg around Z)")
+    parser.add_argument("--num_orbits", default=1.0, type=float, help="Number of full orbits (1.0 = one full circle)")
     parser.add_argument("--north_offset", default=-134.0, type=float, help="North offset in degrees")
     parser.add_argument("--fps", default=15, type=int, help="Video frames per second")
     parser.add_argument("--view_idx", default=0, type=int, help="Index of view to render (-1 for all)")
@@ -870,7 +846,7 @@ if __name__ == "__main__":
     # Convert no_3d flag to show_3d
     args.show_3d = not getattr(args, 'no_3d', False)
 
-    print(f"Rendering day sequence for: {args.model_path}")
+    print(f"Rendering circular orbit sequence for: {args.model_path}")
 
     safe_state(args.quiet)
     render_day(model.extract(args), args.iteration, pipeline.extract(args), args)
