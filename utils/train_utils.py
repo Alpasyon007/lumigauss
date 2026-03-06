@@ -11,8 +11,9 @@ import torch
 from gaussian_renderer import render
 import uuid
 from utils.image_utils import psnr, mse
-from utils.loss_utils import ssim
+from utils.loss_utils import ssim, img2mse, img2mae, mse2psnr
 from argparse import ArgumentParser, Namespace
+from skimage.metrics import structural_similarity as ssim_skimage
 import os
 from utils.sh_vis_utils import shReconstructDiffuseMap
 from utils.normal_utils import compute_normal_world_space
@@ -68,6 +69,7 @@ class LossComponents:
     shadow: float = 0.0
     sun_reg: float = 0.0
     sky_mask: float = 0.0
+    depth_est: float = 0.0
     total: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
@@ -301,6 +303,7 @@ class MetricsLogger:
         self.tb_writer.add_scalar('Loss_Regularization/dist', losses.dist, iteration)
         self.tb_writer.add_scalar('Loss_Regularization/sun_reg', losses.sun_reg, iteration)
         self.tb_writer.add_scalar('Loss_Regularization/sky_mask', losses.sky_mask, iteration)
+        self.tb_writer.add_scalar('Loss_Regularization/depth_est', losses.depth_est, iteration)
 
         # Group 4: SH/Lighting Losses
         self.tb_writer.add_scalar('Loss_Lighting/sh_gauss', losses.sh_gauss, iteration)
@@ -391,34 +394,8 @@ class MetricsLogger:
             self.tb_writer.add_scalar('SunModel/color_correction_b', color_corr[2].item(), iteration)
 
     def log_evaluation_result(self, result: EvaluationResult):
-        """Log a single evaluation result."""
+        """Log a single evaluation result (means only, no per-image TB scalars)."""
         self.evaluation_results[result.iteration].append(result)
-
-        if self.tb_writer is None:
-            return
-
-        prefix = f"Eval_{result.config_name}"
-
-        # Per-viewpoint metrics (use sanitized name for tag)
-        view_tag = result.viewpoint_name.replace('.', '_').replace('/', '_')
-
-        # Albedo metrics
-        self.tb_writer.add_scalar(f'{prefix}/psnr_albedo/{view_tag}',
-                                  result.albedo_metrics.psnr, result.iteration)
-        self.tb_writer.add_scalar(f'{prefix}/ssim_albedo/{view_tag}',
-                                  result.albedo_metrics.ssim, result.iteration)
-        self.tb_writer.add_scalar(f'{prefix}/l1_albedo/{view_tag}',
-                                  result.albedo_metrics.l1, result.iteration)
-
-        # Shadowed metrics
-        self.tb_writer.add_scalar(f'{prefix}/psnr_shadowed/{view_tag}',
-                                  result.shadowed_metrics.psnr, result.iteration)
-        self.tb_writer.add_scalar(f'{prefix}/ssim_shadowed/{view_tag}',
-                                  result.shadowed_metrics.ssim, result.iteration)
-
-        # Unshadowed metrics
-        self.tb_writer.add_scalar(f'{prefix}/psnr_unshadowed/{view_tag}',
-                                  result.unshadowed_metrics.psnr, result.iteration)
 
     def compute_and_log_summary(self, iteration: int, config_name: str) -> EvaluationSummary:
         """Compute and log summary statistics for an evaluation config."""
@@ -487,7 +464,6 @@ class MetricsLogger:
             self.tb_writer.add_scalar(f'{prefix}/psnr_albedo_mean', summary.mean_psnr_albedo, iteration)
             self.tb_writer.add_scalar(f'{prefix}/psnr_shadowed_mean', summary.mean_psnr_shadowed, iteration)
             self.tb_writer.add_scalar(f'{prefix}/psnr_unshadowed_mean', summary.mean_psnr_unshadowed, iteration)
-            self.tb_writer.add_scalar(f'{prefix}/psnr_albedo_std', summary.std_psnr_albedo, iteration)
 
             # SSIM
             self.tb_writer.add_scalar(f'{prefix}/ssim_albedo_mean', summary.mean_ssim_albedo, iteration)
@@ -497,22 +473,22 @@ class MetricsLogger:
             # LPIPS
             self.tb_writer.add_scalar(f'{prefix}/lpips_albedo_mean', summary.mean_lpips_albedo, iteration)
             self.tb_writer.add_scalar(f'{prefix}/lpips_shadowed_mean', summary.mean_lpips_shadowed, iteration)
+            self.tb_writer.add_scalar(f'{prefix}/lpips_unshadowed_mean', summary.mean_lpips_unshadowed, iteration)
 
             # L1
             self.tb_writer.add_scalar(f'{prefix}/l1_albedo_mean', summary.mean_l1_albedo, iteration)
             self.tb_writer.add_scalar(f'{prefix}/l1_shadowed_mean', summary.mean_l1_shadowed, iteration)
+            self.tb_writer.add_scalar(f'{prefix}/l1_unshadowed_mean', summary.mean_l1_unshadowed, iteration)
 
         return summary
 
     def save_evaluation_json(self, iteration: int):
-        """Save evaluation results to JSON file."""
-        results = self.evaluation_results.get(iteration, [])
+        """Save evaluation summary (means only) to JSON file."""
         summaries = self.evaluation_summaries.get(iteration, {})
 
         output = {
             "iteration": iteration,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "results": [r.to_dict() for r in results],
             "summaries": {k: v.to_dict() for k, v in summaries.items()}
         }
 
@@ -521,26 +497,22 @@ class MetricsLogger:
             json.dump(output, f, indent=2)
 
     def print_evaluation_summary(self, iteration: int, config_name: str):
-        """Print formatted evaluation summary."""
+        """Print formatted evaluation summary (mean metrics only)."""
         summary = self.evaluation_summaries.get(iteration, {}).get(config_name)
         if summary is None:
             return
 
-        print(f"\n{'='*60}")
-        print(f"[ITER {iteration}] Evaluation Summary - {config_name.upper()}")
-        print(f"{'='*60}")
-        print(f"  Viewpoints evaluated: {summary.num_viewpoints}")
-        print(f"  PSNR (albedo):    {summary.mean_psnr_albedo:.2f} ± {summary.std_psnr_albedo:.2f} dB")
-        print(f"  PSNR (shadowed):  {summary.mean_psnr_shadowed:.2f} ± {summary.std_psnr_shadowed:.2f} dB")
-        print(f"  PSNR (unshadowed):{summary.mean_psnr_unshadowed:.2f} ± {summary.std_psnr_unshadowed:.2f} dB")
-        print(f"  SSIM (albedo):    {summary.mean_ssim_albedo:.4f}")
-        print(f"  SSIM (shadowed):  {summary.mean_ssim_shadowed:.4f}")
+        print(f"\n{'='*70}")
+        print(f"[ITER {iteration}] Evaluation Summary - {config_name.upper()} ({summary.num_viewpoints} viewpoints)")
+        print(f"{'='*70}")
+        print(f"  {'Metric':<12} {'Albedo':>10} {'Unshadowed':>12} {'Shadowed':>12}")
+        print(f"  {'-'*12} {'-'*10} {'-'*12} {'-'*12}")
+        print(f"  {'PSNR (dB)':<12} {summary.mean_psnr_albedo:>10.2f} {summary.mean_psnr_unshadowed:>12.2f} {summary.mean_psnr_shadowed:>12.2f}")
+        print(f"  {'SSIM':<12} {summary.mean_ssim_albedo:>10.4f} {summary.mean_ssim_unshadowed:>12.4f} {summary.mean_ssim_shadowed:>12.4f}")
         if LPIPS_AVAILABLE:
-            print(f"  LPIPS (albedo):   {summary.mean_lpips_albedo:.4f}")
-        print(f"  L1 (albedo):      {summary.mean_l1_albedo:.5f}")
-        print(f"  Best viewpoint:   {summary.best_psnr_viewpoint} ({summary.best_psnr:.2f} dB)")
-        print(f"  Worst viewpoint:  {summary.worst_psnr_viewpoint} ({summary.worst_psnr:.2f} dB)")
-        print(f"{'='*60}\n")
+            print(f"  {'LPIPS':<12} {summary.mean_lpips_albedo:>10.4f} {summary.mean_lpips_unshadowed:>12.4f} {summary.mean_lpips_shadowed:>12.4f}")
+        print(f"  {'L1':<12} {summary.mean_l1_albedo:>10.5f} {summary.mean_l1_unshadowed:>12.5f} {summary.mean_l1_shadowed:>12.5f}")
+        print(f"{'='*70}\n")
 
 
 def create_loss_components(
@@ -556,6 +528,7 @@ def create_loss_components(
     shadow_loss: torch.Tensor,
     sun_reg_loss: torch.Tensor = None,
     sky_mask_loss: torch.Tensor = None,
+    depth_est_loss: torch.Tensor = None,
     total_loss: torch.Tensor = None
 ) -> LossComponents:
     """Helper to create LossComponents from tensor values."""
@@ -572,6 +545,7 @@ def create_loss_components(
         shadow=shadow_loss.item() if torch.is_tensor(shadow_loss) else shadow_loss,
         sun_reg=sun_reg_loss.item() if sun_reg_loss is not None and torch.is_tensor(sun_reg_loss) else (sun_reg_loss or 0.0),
         sky_mask=sky_mask_loss.item() if sky_mask_loss is not None and torch.is_tensor(sky_mask_loss) else (sky_mask_loss or 0.0),
+        depth_est=depth_est_loss.item() if depth_est_loss is not None and torch.is_tensor(depth_est_loss) else (depth_est_loss or 0.0),
         total=total_loss.item() if total_loss is not None and torch.is_tensor(total_loss) else (total_loss or 0.0)
     )
 
@@ -777,8 +751,54 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         test_cameras = scene.getTestCameras()
+
+        # Hardcoded test image names per dataset — these match the test_config.py
+        # files used for evaluation, so TensorBoard shows the exact same views.
+        TEST_IMAGES = {
+            "st": [
+                "01-09_14_00_IMG_0706.JPG",
+                "24-08_11_30_IMG_9690.JPG",
+                "24-08_16_30_IMG_0061.JPG",
+                "25-08_19_30_IMG_0306.JPG",
+                "31-08_07_30_IMG_0501.JPG",
+            ],
+            "lk2": [
+                "01-08_07_30_IMG_6710.JPG",
+                "08-08_16_00_IMG_7850.JPG",
+                "28-07_10_00_DSC_0055.jpg",
+                "29-07_12_00_IMG_5424.JPG",
+                "29-07_20_30_IMG_5607.JPG",
+            ],
+            "lwp": [
+                "01-09_14_00_IMG_0821.JPG",
+                "24-08_11_30_IMG_9765.JPG",
+                "24-08_16_30_IMG_0216.JPG",
+                "25-08_19_30_IMG_0406.JPG",
+                "31-08_07_30_IMG_0631.JPG",
+            ],
+        }
+
+        # Find which dataset we're working with
+        target_names = None
+        if source_path:
+            for key, names in TEST_IMAGES.items():
+                if key in source_path.lower():
+                    target_names = set(names)
+                    break
+
+        if target_names:
+            # Filter to only the hardcoded test images, preserving config order
+            test_cameras_filtered = [c for c in test_cameras if c.image_name in target_names]
+            if not test_cameras_filtered:
+                print(f"Warning: none of the hardcoded test images found in test set. "
+                      f"Available: {[c.image_name for c in test_cameras[:10]]}")
+                test_cameras_filtered = sorted(test_cameras, key=lambda c: c.image_name)[:5]
+        else:
+            # Unknown dataset — fall back to sorted first 5
+            test_cameras_filtered = sorted(test_cameras, key=lambda c: c.image_name)[:5]
+
         validation_configs = (
-            {'name': 'test', 'cameras': test_cameras[:5] if len(test_cameras) > 5 else test_cameras},
+            {'name': 'test', 'cameras': test_cameras_filtered},
             {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]}
         )
 
@@ -786,6 +806,12 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+
+                # Masked evaluation metric accumulators (matches test script exactly)
+                eval_psnrs_shadowed = []
+                eval_mse_shadowed = []
+                eval_mae_shadowed = []
+                eval_ssim_shadowed = []
 
                 for idx, viewpoint in enumerate(config['cameras']):
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -1186,9 +1212,47 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         l1_test += l1_loss(image_albedo, gt_image).mean().double()
                         psnr_test += psnr(image_albedo, gt_image).mean().double()
 
+                    # ---- Masked evaluation metrics (same formula as test script) ----
+                    if config['name'] == 'test' and image_shadowed is not None:
+                        # Use camera's training mask [1, H, W] -> [H, W]
+                        eval_mask = viewpoint.mask.squeeze(0)  # [H, W]
+                        # Erode mask (same 5x5 kernel as test script)
+                        import cv2 as _cv2
+                        mask_np = (eval_mask.cpu().numpy() * 255).astype(np.uint8)
+                        _kernel = np.ones((5, 5), np.uint8)
+                        mask_np = _cv2.erode(mask_np, _kernel, iterations=1)
+                        eval_mask = torch.from_numpy(mask_np // 255).to(gt_image.device)
+
+                        _mse_val = img2mse(image_shadowed, gt_image, mask=eval_mask)
+                        eval_mse_shadowed.append(float(_mse_val))
+                        eval_psnrs_shadowed.append(float(mse2psnr(_mse_val)))
+                        eval_mae_shadowed.append(float(img2mae(image_shadowed, gt_image, mask=eval_mask)))
+
+                        # SSIM (skimage, masked, matching test script exactly)
+                        _shad_np = image_shadowed.cpu().detach().numpy().transpose(1, 2, 0)
+                        _gt_np = gt_image.cpu().detach().numpy().transpose(1, 2, 0)
+                        _, _full = ssim_skimage(_shad_np, _gt_np, win_size=5,
+                                                channel_axis=2, full=True, data_range=1.0)
+                        _mssim = (torch.tensor(_full).to(gt_image.device) * eval_mask.unsqueeze(-1)).sum() / (3 * eval_mask.sum())
+                        eval_ssim_shadowed.append(float(_mssim))
+
                 # Compute averages
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
+
+                # Log masked evaluation scalars to TensorBoard
+                if tb_writer and config['name'] == 'test' and eval_psnrs_shadowed:
+                    mean_psnr = np.mean(eval_psnrs_shadowed)
+                    mean_mse = np.mean(eval_mse_shadowed)
+                    mean_mae = np.mean(eval_mae_shadowed)
+                    mean_ssim = np.mean(eval_ssim_shadowed)
+                    tb_writer.add_scalar('eval_masked/PSNR_shadowed', mean_psnr, iteration)
+                    tb_writer.add_scalar('eval_masked/MSE_shadowed', mean_mse, iteration)
+                    tb_writer.add_scalar('eval_masked/MAE_shadowed', mean_mae, iteration)
+                    tb_writer.add_scalar('eval_masked/SSIM_shadowed', mean_ssim, iteration)
+                    print(f"\n[ITER {iteration}] Eval masked (test): "
+                          f"PSNR={mean_psnr:.4f}  MSE={mean_mse:.6f}  "
+                          f"MAE={mean_mae:.6f}  SSIM={mean_ssim:.4f}")
 
                 # Log summary using MetricsLogger if available
                 if metrics_logger is not None:

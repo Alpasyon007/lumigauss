@@ -65,7 +65,14 @@ class ModelParams(ParamGroup):
         self.sun_json_path = ""  # Path to JSON file with sun positions per image
         self.sky_mask_path = ""  # Path to folder with sky masks (black=sky, white=not sky)
         self.use_residual_sh = True  # Use global sky SH for environment (enables relighting)
+        # Camera calibration refinement (jointly optimise camera poses during training)
+        self.use_cam_cal = False  # Enable learnable camera pose refinement
+        # Sun direction calibration (jointly optimise per-image sun directions during training)
+        self.use_sun_cal = False  # Enable learnable sun direction refinement
         # Shadow computation method: 'none', 'shadow_map', 'ray_march', 'voxel'
+        # Progressive resolution: train at low-res first, switch to high-res for detail
+        self.progressive_resolution = False  # Enable progressive resolution training
+        self.progressive_switch_iter = 15000  # Iteration to switch from low-res to full-res
         self.shadow_method = "shadow_map"
         self.shadow_map_resolution = 512  # Resolution for shadow mapping
         self.shadow_bias = 0.1  # Depth bias for shadow comparison
@@ -101,7 +108,7 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.opacity_cull = 0.05
-        self.lambda_dist = 100
+        self.lambda_dist = 0.01
         self.lambda_normal = 0.05
 
         self.start_shadowed = 20500
@@ -142,12 +149,35 @@ class OptimizationParams(ParamGroup):
         self.dens_everything_per_cell = 1                 # Debug: target number of new gaussians per grid cell
         self.dens_everything_max_gaussians = 50000        # Debug safety cap to avoid OOM when densifying every cell
 
+        # Monocular depth estimation regularisation (penalises Gaussians far from estimated surfaces)
+        self.use_depth_est = False                        # Enable depth estimation surface regularisation
+        self.depth_est_lambda = 0.1                       # Higher: stronger depth regularisation (surfaces snap to estimate); Lower: weaker constraint
+        self.depth_est_from_iter = 1000                   # Higher: start regularising later (geometry settles first); Lower: start earlier
+        self.depth_est_model = "Intel/dpt-hybrid-midas"   # HuggingFace model id for monocular depth estimation
+        # Depth-guided densification (spawns Gaussians in sparse areas using mono-depth)
+        self.depth_est_densify = True                     # Enable depth-guided densification (requires --use_depth_est)
+        self.depth_est_densify_interval = 500             # Higher: trigger less often; Lower: more frequent fills
+        self.depth_est_densify_from_iter = 1500           # Higher: start later (geometry must settle first); Lower: start earlier
+        self.depth_est_densify_until_iter = 15000         # Higher: keep filling longer; Lower: stop sooner
+        self.depth_est_densify_max_new = 1024             # Higher: more new Gaussians per trigger (stronger fill, more VRAM); Lower: fewer
+        self.depth_est_densify_alpha_thresh = 0.3         # Higher: stricter (more area considered sparse); Lower: only truly empty pixels
+        self.depth_est_densify_loss_quantile = 0.5        # Higher: only highest-loss sparse pixels get filled; Lower: more permissive
+
         self.env_lr = 0.02
         self.mlp_lr = 0.002
         self.mlp_lr_final_ratio = 10.0
         self.embedding_lr = 0.002
         self.embedding_lr_final_ratio = 10
         self.albedo_lr= 0.0025
+        # Camera calibration refinement learning rates
+        self.cam_cal_rot_lr = 0.0001   # Learning rate for camera rotation deltas (axis-angle)
+        self.cam_cal_trans_lr = 0.0005  # Learning rate for camera translation deltas
+        self.cam_cal_from_iter = 500    # Start camera calibration after this iteration
+        self.cam_cal_until_iter = 20000 # Stop camera calibration at this iteration
+        # Sun direction calibration learning rates
+        self.sun_cal_lr = 0.001         # Learning rate for sun direction deltas
+        self.sun_cal_from_iter = 500    # Start sun calibration after this iteration
+        self.sun_cal_until_iter = 30000 # Stop sun calibration at this iteration
 
         self.gauss_loss_lambda = 0.001
         self.env_loss_lambda = 0.05

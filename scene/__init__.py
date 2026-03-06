@@ -23,6 +23,9 @@ class Scene:
     gaussians : GaussianModel
 
     def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+        # Store progressive resolution config for use in training loop
+        self.progressive_resolution = getattr(args, 'progressive_resolution', False)
+        self.progressive_switch_iter = getattr(args, 'progressive_switch_iter', 15000)
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -116,6 +119,66 @@ class Scene:
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
+        # Camera calibration refinement state
+        self.cam_cal_enabled = False
+        self.optimizer_cam_cal = None
+
+        # Sun direction calibration state
+        self.sun_cal_enabled = False
+        self.optimizer_sun_cal = None
+
+    def setup_cam_cal(self, opt):
+        """Enable learnable camera pose refinement for all training cameras.
+
+        Creates a dedicated Adam optimizer for the rotation and translation
+        deltas on every training camera.
+
+        Args:
+            opt: OptimizationParams with cam_cal_rot_lr and cam_cal_trans_lr.
+        """
+        rot_params = []
+        trans_params = []
+        for cam in self.getTrainCameras():
+            cam.enable_cam_cal()
+            rot_params.append(cam.delta_rot)
+            trans_params.append(cam.delta_trans)
+
+        self.optimizer_cam_cal = torch.optim.Adam([
+            {"params": rot_params, "lr": opt.cam_cal_rot_lr, "name": "cam_cal_rot"},
+            {"params": trans_params, "lr": opt.cam_cal_trans_lr, "name": "cam_cal_trans"},
+        ], lr=0.0, eps=1e-15)
+        self.cam_cal_enabled = True
+        print(f"[Camera Calibration] Enabled for {len(rot_params)} training cameras "
+              f"(rot_lr={opt.cam_cal_rot_lr}, trans_lr={opt.cam_cal_trans_lr})")
+
+    def setup_sun_cal(self, opt):
+        """Enable learnable sun direction refinement for all training cameras.
+
+        Creates a dedicated Adam optimizer for the sun direction delta on every
+        training camera that has a sun_direction.
+
+        Args:
+            opt: OptimizationParams with sun_cal_lr.
+        """
+        sun_params = []
+        n_enabled = 0
+        for cam in self.getTrainCameras():
+            if cam.sun_direction is not None:
+                cam.enable_sun_cal()
+                sun_params.append(cam.delta_sun_dir)
+                n_enabled += 1
+
+        if not sun_params:
+            print("[Sun Calibration] WARNING: No cameras have sun_direction – nothing to optimise.")
+            return
+
+        self.optimizer_sun_cal = torch.optim.Adam([
+            {"params": sun_params, "lr": opt.sun_cal_lr, "name": "sun_cal"},
+        ], lr=0.0, eps=1e-15)
+        self.sun_cal_enabled = True
+        print(f"[Sun Calibration] Enabled for {n_enabled} training cameras "
+              f"(lr={opt.sun_cal_lr})")
+
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
@@ -126,6 +189,54 @@ class Scene:
             torch.save(self.gaussians.embedding.state_dict(), self.model_path + "/chkpnt_embedding" + str(iteration) + ".pth")
         else:
             torch.save(self.gaussians.env_params.state_dict(), self.model_path + "/chkpnt_env" + str(iteration) + ".pth")
+
+        # Save camera calibration deltas
+        if self.cam_cal_enabled:
+            cam_cal_state = {}
+            for cam in self.getTrainCameras():
+                cam_cal_state[cam.image_name] = {
+                    "delta_rot": cam.delta_rot.detach().cpu(),
+                    "delta_trans": cam.delta_trans.detach().cpu(),
+                }
+            torch.save(cam_cal_state, os.path.join(self.model_path, f"chkpnt_cam_cal{iteration}.pth"))
+
+        # Save sun direction calibration deltas
+        if self.sun_cal_enabled:
+            sun_cal_state = {}
+            for cam in self.getTrainCameras():
+                if cam._sun_cal_enabled:
+                    sun_cal_state[cam.image_name] = {
+                        "delta_sun_dir": cam.delta_sun_dir.detach().cpu(),
+                    }
+            torch.save(sun_cal_state, os.path.join(self.model_path, f"chkpnt_sun_cal{iteration}.pth"))
+
+    def load_cam_cal(self, iteration):
+        """Load camera calibration deltas from a checkpoint."""
+        path = os.path.join(self.model_path, f"chkpnt_cam_cal{iteration}.pth")
+        if not os.path.exists(path):
+            print(f"[Camera Calibration] No checkpoint found at {path}")
+            return
+        cam_cal_state = torch.load(path, weights_only=True)
+        for cam in self.getTrainCameras():
+            if cam.image_name in cam_cal_state:
+                entry = cam_cal_state[cam.image_name]
+                cam.delta_rot.data.copy_(entry["delta_rot"].cuda())
+                cam.delta_trans.data.copy_(entry["delta_trans"].cuda())
+                cam.apply_cam_cal()
+        print(f"[Camera Calibration] Loaded deltas for {len(cam_cal_state)} cameras from iter {iteration}")
+
+    def load_sun_cal(self, iteration):
+        """Load sun direction calibration deltas from a checkpoint."""
+        path = os.path.join(self.model_path, f"chkpnt_sun_cal{iteration}.pth")
+        if not os.path.exists(path):
+            print(f"[Sun Calibration] No checkpoint found at {path}")
+            return
+        sun_cal_state = torch.load(path, weights_only=True)
+        for cam in self.getTrainCameras():
+            if cam.image_name in sun_cal_state:
+                entry = sun_cal_state[cam.image_name]
+                cam.delta_sun_dir.data.copy_(entry["delta_sun_dir"].cuda())
+        print(f"[Sun Calibration] Loaded deltas for {len(sun_cal_state)} cameras from iter {iteration}")
 
 
     def getTrainCameras(self, scale=1.0):

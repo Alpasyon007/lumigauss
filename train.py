@@ -34,6 +34,7 @@ from utils.train_utils import (
 )
 from utils.shadow_utils import compute_shadows_for_gaussians
 from utils.adaptive_dens_utils import AdaptiveDensGrid
+from utils.depth_est_utils import precompute_depth_maps, scale_invariant_depth_loss, depth_guided_densify
 
 
 
@@ -79,7 +80,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if sky_masks:
             print(f"Loaded {len(sky_masks)} sky masks for sky mask loss training")
 
+    # Pre-compute monocular depth estimates for depth regularisation
+    depth_est_maps = {}
+    if opt.use_depth_est:
+        depth_est_maps = precompute_depth_maps(
+            scene.getTrainCameras(),
+            model_name=opt.depth_est_model,
+        )
+
     gaussians.training_setup(opt)
+
+    # Setup camera calibration refinement if enabled
+    if dataset.use_cam_cal:
+        scene.setup_cam_cal(opt)
+
+    # Setup sun direction calibration if enabled
+    if dataset.use_sun_cal and gaussians.use_sun:
+        scene.setup_sun_cal(opt)
 
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -93,6 +110,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             gaussians.env_params.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_env" + str(first_iter) + ".pth")))
         gaussians.optimizer_env.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_optimizer_env" + str(first_iter) + ".pth")))
+        # Load camera calibration checkpoint if enabled
+        if dataset.use_cam_cal:
+            scene.load_cam_cal(first_iter)
+            cam_cal_opt_path = os.path.join(checkpoint_dir, "chkpnt_optimizer_cam_cal" + str(first_iter) + ".pth")
+            if os.path.exists(cam_cal_opt_path):
+                scene.optimizer_cam_cal.load_state_dict(torch.load(cam_cal_opt_path))
+        # Load sun calibration checkpoint if enabled
+        if dataset.use_sun_cal and gaussians.use_sun:
+            scene.load_sun_cal(first_iter)
+            sun_cal_opt_path = os.path.join(checkpoint_dir, "chkpnt_optimizer_sun_cal" + str(first_iter) + ".pth")
+            if os.path.exists(sun_cal_opt_path):
+                scene.optimizer_sun_cal.load_state_dict(torch.load(sun_cal_opt_path))
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -152,6 +181,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
+        # Apply camera calibration deltas
+        # 1. apply_cam_cal() updates DETACHED camera matrices (for rasterizer settings)
+        # 2. transform_means3D() provides the DIFFERENTIABLE gradient path through means3D
+        cam_cal_active = (dataset.use_cam_cal
+                          and iteration >= opt.cam_cal_from_iter
+                          and iteration <= opt.cam_cal_until_iter)
+        override_xyz = None
+        if cam_cal_active:
+            viewpoint_cam.apply_cam_cal()
+            override_xyz = viewpoint_cam.transform_means3D(gaussians.get_xyz)
+
         gt_image = viewpoint_cam.original_image
         mask = viewpoint_cam.mask
 
@@ -194,8 +234,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if unshadowed_image_loss_lambda >0:
             if gaussians.use_sun:
                 # Use explicit directional lighting with sun color prior
-                # Get sun direction and elevation from camera
-                sun_dir = viewpoint_cam.sun_direction
+                # Get sun direction (with learnable delta if sun_cal active) and elevation
+                sun_dir = viewpoint_cam.get_adjusted_sun_direction()
                 sun_elev = viewpoint_cam.sun_elevation
                 if sun_dir is None:
                     raise ValueError(f"Sun direction missing for camera {viewpoint_cam.image_name}")
@@ -208,7 +248,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
             else:
                 rgb_precomp_unshadowed, _ = gaussians.compute_gaussian_rgb(sh_env+sh_random_noise, shadowed=False, normal_vectors=normal_vectors)
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_unshadowed)
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_unshadowed, override_xyz=override_xyz)
             image_unshadowed = render_pkg["render"]
             viewspace_point_tensor_unshadowed, visibility_filter, radii = render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -222,8 +262,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # photometric loss for shadowed
         if shadowed_image_loss_lambda >0:
             if gaussians.use_sun:
-                # Get sun direction and elevation from camera
-                sun_dir = viewpoint_cam.sun_direction
+                # Get sun direction (with learnable delta if sun_cal active) and elevation
+                sun_dir = viewpoint_cam.get_adjusted_sun_direction()
                 sun_elev = viewpoint_cam.sun_elevation
                 if sun_dir is None:
                     raise ValueError(f"Sun direction missing for camera {viewpoint_cam.image_name}")
@@ -266,7 +306,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
             else:
                 rgb_precomp_shadowed, _  = gaussians.compute_gaussian_rgb(sh_env+sh_random_noise, multiplier=multiplier)
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_shadowed)
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_shadowed, override_xyz=override_xyz)
             image_shadowed = render_pkg["render"]
             viewspace_point_tensor_shadowed, visibility_filter, radii = render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -331,7 +371,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if sky_masks and gaussians.use_sun and viewpoint_cam.image_name in sky_masks:
             sky_mask = sky_masks[viewpoint_cam.image_name]
             sky_mask_loss_raw, _ = gaussians.compute_sky_mask_loss(
-                viewpoint_cam, sky_mask, render, pipe, background
+                viewpoint_cam, sky_mask, render, pipe, background, override_xyz=override_xyz
             )
             sky_mask_loss = opt.sky_mask_loss_weight * sky_mask_loss_raw
 
@@ -347,7 +387,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             normal_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
             dist_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
 
-        total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss + sky_mask_loss
+        # Monocular depth regularisation
+        depth_est_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
+        if opt.use_depth_est and iteration >= opt.depth_est_from_iter and depth_est_maps:
+            est_depth = depth_est_maps.get(viewpoint_cam.image_name)
+            if est_depth is not None:
+                # Build combined mask: training mask + sky mask
+                depth_mask = mask
+                if sky_masks and viewpoint_cam.image_name in sky_masks:
+                    import torch.nn.functional as F
+                    sky_m = sky_masks[viewpoint_cam.image_name]  # [H,W], 1=non-sky
+                    target_h, target_w = render_pkg["surf_depth"].shape[1], render_pkg["surf_depth"].shape[2]
+                    if sky_m.shape[0] != target_h or sky_m.shape[1] != target_w:
+                        sky_m = F.interpolate(
+                            sky_m.unsqueeze(0).unsqueeze(0),
+                            size=(target_h, target_w), mode='nearest'
+                        ).squeeze(0).squeeze(0)
+                    if torch.is_tensor(depth_mask) and depth_mask.dim() == 3:
+                        depth_mask = depth_mask * sky_m.unsqueeze(0)
+                    elif torch.is_tensor(depth_mask):
+                        depth_mask = depth_mask * sky_m
+                    else:
+                        depth_mask = sky_m
+                depth_est_loss = opt.depth_est_lambda * scale_invariant_depth_loss(
+                    render_pkg["surf_depth"], est_depth,
+                    mask=depth_mask,
+                    render_alpha=render_pkg["rend_alpha"],
+                )
+
+        # Camera calibration regularization: penalize large pose deltas to prevent drift
+        cam_cal_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
+        if (dataset.use_cam_cal and scene.cam_cal_enabled
+                and iteration >= opt.cam_cal_from_iter and iteration <= opt.cam_cal_until_iter):
+            cam_cal_reg_loss = 0.01 * (viewpoint_cam.delta_rot.norm() ** 2 + viewpoint_cam.delta_trans.norm() ** 2)
+
+        # Sun direction calibration regularization: penalize large sun direction deltas
+        sun_cal_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
+        if (dataset.use_sun_cal and scene.sun_cal_enabled
+                and iteration >= opt.sun_cal_from_iter and iteration <= opt.sun_cal_until_iter):
+            sun_cal_reg_loss = 0.01 * (viewpoint_cam.delta_sun_dir.norm() ** 2)
+
+        total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss + sky_mask_loss + depth_est_loss + cam_cal_reg_loss + sun_cal_reg_loss
 
         # Only backward if we have a loss with gradients
         if torch.is_tensor(total_loss) and total_loss.requires_grad:
@@ -376,6 +456,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     shadow_loss=shadow_loss,
                     sun_reg_loss=sun_reg_loss,
                     sky_mask_loss=sky_mask_loss,
+                    depth_est_loss=depth_est_loss,
                     total_loss=total_loss
                 )
 
@@ -408,6 +489,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_dict["SunReg"] = f"{_val(sun_reg_loss):.5f}"
                     if sky_masks:
                         loss_dict["SkyMask"] = f"{_val(sky_mask_loss):.5f}"
+                if opt.use_depth_est:
+                    loss_dict["DepthEst"] = f"{_val(depth_est_loss):.5f}"
+                if dataset.use_cam_cal and scene.cam_cal_enabled:
+                    loss_dict["CamCal"] = f"{_val(cam_cal_reg_loss):.5f}"
+                if dataset.use_sun_cal and scene.sun_cal_enabled:
+                    loss_dict["SunCal"] = f"{_val(sun_cal_reg_loss):.5f}"
 
                 print(loss_dict)
 
@@ -530,6 +617,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Sky mask loss is now applied during training loop (see sky_mask_loss computation above)
             # No need for periodic update_sky_gaussians calls
 
+            # ---- Depth-guided densification: fill sparse areas using mono-depth ----
+            if (opt.use_depth_est and getattr(opt, "depth_est_densify", True)
+                    and depth_est_maps
+                    and iteration >= getattr(opt, "depth_est_densify_from_iter", 1500)
+                    and iteration <= getattr(opt, "depth_est_densify_until_iter", 15000)
+                    and iteration % getattr(opt, "depth_est_densify_interval", 500) == 0):
+                est_entry = depth_est_maps.get(viewpoint_cam.image_name)
+                if est_entry is not None:
+                    # Build per-pixel loss for prioritisation
+                    active_img = image_shadowed if shadowed_image_loss_lambda > 0 else image_unshadowed
+                    ppl = torch.abs(active_img - gt_image).mean(dim=0).detach()
+
+                    # Sky mask for exclusion
+                    dens_sky_mask = None
+                    if sky_masks and viewpoint_cam.image_name in sky_masks:
+                        dens_sky_mask = sky_masks[viewpoint_cam.image_name]
+
+                    depth_guided_densify(
+                        gaussians, viewpoint_cam, render_pkg,
+                        est_entry, sky_mask=dens_sky_mask,
+                        alpha_threshold=getattr(opt, "depth_est_densify_alpha_thresh", 0.3),
+                        max_new=getattr(opt, "depth_est_densify_max_new", 1024),
+                        per_pixel_loss=ppl,
+                        loss_quantile=getattr(opt, "depth_est_densify_loss_quantile", 0.5),
+                    )
+
             # update lrs
             if iteration>opt.warmup and iteration<=opt.start_shadowed:
                 if gaussians.use_sun:
@@ -580,6 +693,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 gaussians.optimizer_env.step()
                 gaussians.optimizer_env.zero_grad(set_to_none = True)
+                # Camera calibration optimizer step
+                if (scene.cam_cal_enabled
+                        and iteration >= opt.cam_cal_from_iter
+                        and iteration <= opt.cam_cal_until_iter):
+                    scene.optimizer_cam_cal.step()
+                    scene.optimizer_cam_cal.zero_grad(set_to_none=True)
+                # Sun direction calibration optimizer step
+                if (scene.sun_cal_enabled
+                        and iteration >= opt.sun_cal_from_iter
+                        and iteration <= opt.sun_cal_until_iter):
+                    scene.optimizer_sun_cal.step()
+                    scene.optimizer_sun_cal.zero_grad(set_to_none=True)
 
 
             # save checkpoints
@@ -590,6 +715,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if gaussians.use_sun:
                     torch.save(gaussians.sun_model.state_dict(), scene.model_path + "/chkpnt_sun" + str(iteration) + ".pth")
                     torch.save(gaussians.optimizer_env.state_dict(), scene.model_path + "/chkpnt_optimizer_env" + str(iteration) + ".pth")
+                    if scene.cam_cal_enabled:
+                        torch.save(scene.optimizer_cam_cal.state_dict(), scene.model_path + "/chkpnt_optimizer_cam_cal" + str(iteration) + ".pth")
+                    if scene.sun_cal_enabled:
+                        torch.save(scene.optimizer_sun_cal.state_dict(), scene.model_path + "/chkpnt_optimizer_sun_cal" + str(iteration) + ".pth")
                 elif gaussians.with_mlp:
                     torch.save(gaussians.mlp.state_dict(), scene.model_path + "/chkpnt_mlp" + str(iteration) + ".pth")
                     torch.save(gaussians.embedding.state_dict(), scene.model_path + "/chkpnt_embedding" + str(iteration) + ".pth")

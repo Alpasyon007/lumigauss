@@ -21,11 +21,23 @@ services:
     #command: python ./train.py -s="./data/st_colmap/undistorted" -m="./output/st_mlp" --with_mlp
     #command: python ./train.py -s="./data/lk2_colmap/undistorted" -m="./output/lk2_mlp" --with_mlp
     #command: python render_day.py -s="./data/st_colmap/undistorted" -m output/st_sun_shadow_map --use_sun --shadow_method shadow_map
-    command: python render_day.py -s="./data/st_colmap/undistorted" -m output/st_sun_shadow_map --use_sun --shadow_fix_bias 0.005 --shadow_map_resolution 8192 --shadow_fixes --shadow_debug_panels --no_flip_x --flip_y --no_flip_z
+    #command: python render_day.py -s="./data/st_colmap/undistorted" -m output/st_sun_shadow_map --use_sun --shadow_fix_bias 0.005 --shadow_map_resolution 8192 --shadow_fixes --shadow_debug_panels --no_flip_x --flip_y --no_flip_z
     #command: python ./train.py -s="./data/lk2_colmap/undistorted" --sun_json_path="./data/lk2_colmap/sun_directions_blender.json" -m="./output/lk2_sun_shadow_map" --use_sun --use_residual_sh --shadow_method shadow_map --shadow_map_resolution 8192 --sky_mask_path="./data/lk2_colmap/dynamic_masks/sky"
     #command: python ./train.py -s="./data/st_colmap/undistorted" --sun_json_path="./data/st_colmap/sun_directions_blender.json" -m="./output/st_sun_shadow_map" --use_sun --use_residual_sh --shadow_method shadow_map --shadow_map_resolution 8192 --sky_mask_path="./data/st_colmap/dynamic_masks/sky"
     #command: python ./train.py -s="./data/st_colmap/undistorted" --sun_json_path="./data/st_colmap/sun_directions_blender.json" -m="./output/st_sun_shadow_map_adaptive_dens" --use_sun --use_residual_sh --shadow_method shadow_map --shadow_map_resolution 8192 --sky_mask_path="./data/st_colmap/dynamic_masks/sky" --use_adaptive_dens
     #command: python ./train.py -s="./data/st_colmap/undistorted" --sun_json_path="./data/st_colmap/sun_directions_blender.json" -m="./output/st_sun_shadow_map_dens_all" --use_sun --use_residual_sh --shadow_method shadow_map --shadow_map_resolution 8192 --sky_mask_path="./data/st_colmap/dynamic_masks/sky" --use_adaptive_dens --dens_everything --dens_everything_per_cell 128 --dens_everything_max_gaussians 1000000 --adaptive_dens_
+    #command: python ./train.py -s="./data/st_colmap/undistorted" --sun_json_path="./data/st_colmap/sun_directions_blender.json" -m="./output/st_sun_shadow_pbr_sun_cal" --use_sun --use_residual_sh --shadow_method shadow_map --shadow_map_resolution 8192 --sky_mask_path="./data/st_colmap/dynamic_masks/sky" --full_pbr --use_sun_cal
+    #command: python ./train.py -s="./data/lk2_colmap/undistorted" --sun_json_path="./data/lk2_colmap/sun_directions_blender.json" -m="./output/lk2_sun_shadow_pbr_sun_cal" --use_sun --use_residual_sh --shadow_method shadow_map --shadow_map_resolution 8192 --sky_mask_path="./data/lk2_colmap/dynamic_masks/sky" --full_pbr --use_sun_cal
+    command: python ./train.py -s="./data/lwp_colmap/undistorted" --sun_json_path="./data/lwp_colmap/sun_directions_blender.json" -m="./output/lwp_sun_shadow_pbr_sun_cal" --use_sun --use_residual_sh --shadow_method shadow_map --shadow_map_resolution 8192 --sky_mask_path="./data/lwp_colmap/dynamic_masks/sky" --full_pbr --use_sun_cal
+    #command: python optimise_env.py -m output/st_mlp --iteration 40000 --opt_iters 10000 --lr 0.01 --save_images
+    #command: python test_gt_env_map.py -s="./data/st_colmap/undistorted" -m="./output/st_mlp" --with_mlp -r 1 --test_config="./data/st_colmap/eval_files"
+    # Sun model (directional lighting + shadow map)
+    #command: ["python", "test_gt_env_map_sun.py",
+    #  "-s=./data/st_colmap/undistorted",
+    #  "-m=./output/st_sun_shadow_map",
+    #  "--use_sun", "--use_residual_sh",
+    #  "--shadow_method", "shadow_map", "--shadow_map_resolution", "8192",
+    #  "-r", "1", "--test_config=./data/st_colmap/eval_files", "--no_sweep"   ]
     deploy:
       resources:
         reservations:

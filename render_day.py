@@ -362,11 +362,15 @@ def compute_shadow_mask_fixed(
     ones = torch.ones(N, 1, device=device, dtype=gaussian_positions.dtype)
     positions_homo = torch.cat([gaussian_positions, ones], dim=1)
 
+    # View-space depth (matches rasterizer output space)
+    view_coords = positions_homo @ sun_camera.world_view_transform
+    gaussian_depth = view_coords[:, 2]
+
+    # Clip/NDC for UV lookup
     clip_coords = positions_homo @ sun_camera.full_proj_transform
     ndc_coords = clip_coords[:, :3] / (clip_coords[:, 3:4] + 1e-8)
 
     uv = (ndc_coords[:, :2] + 1.0) * 0.5
-    gaussian_depth = ndc_coords[:, 2]
 
     grid = (uv * 2.0 - 1.0).view(1, 1, N, 2)
 

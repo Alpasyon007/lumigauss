@@ -45,11 +45,17 @@ def _get_rasterizer_backend(use_gaussians: bool):
         )
     return SurfelGaussianRasterizationSettings, SurfelGaussianRasterizer
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, gaussian_mask=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, gaussian_mask=None, override_xyz=None):
     """
     Render the scene.
 
     Background tensor (bg_color) must be on GPU!
+
+    Args:
+        override_xyz: Optional [N, 3] tensor of transformed gaussian positions.
+                      Used for camera calibration refinement where gradients
+                      must flow through means3D (rasterizer is differentiable
+                      w.r.t. means3D but not viewmatrix).
     """
     if not torch.is_tensor(gaussian_mask):
         gaussian_mask = torch.ones(pc.get_xyz.shape[0], dtype=bool)
@@ -93,7 +99,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz[gaussian_mask]
+    if override_xyz is not None:
+        means3D = override_xyz[gaussian_mask]
+    else:
+        means3D = pc.get_xyz[gaussian_mask]
     means2D = screenspace_points
     opacity = torch.clamp(pc.get_opacity[gaussian_mask], opacity_limit_min, opacity_limit_max)
 

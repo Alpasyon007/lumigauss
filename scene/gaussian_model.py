@@ -344,6 +344,23 @@ class GaussianModel:
             emb_idx, normal_vectors, sun_direction=sun_direction, sun_elevation=sun_elevation
         )
 
+        # Sky gaussians (casts_shadow < 0.5) are emissive — not affected by sun direction or shadows.
+        # Override their lighting to use flat sun intensity (no N·L modulation).
+        # By zeroing ambient/residual and setting direct = sun_int, the manual shadowed
+        # recomposition (direct * shadow_mask + ambient + residual) also stays correct
+        # because shadow_mask = 1 for sky gaussians (set in compute_shadows_for_gaussians).
+        casts_shadow = self.get_casts_shadow  # [N]
+        is_sky = (casts_shadow < 0.5).unsqueeze(-1)  # [N, 1]
+        sun_int_flat = components['sun_color'].unsqueeze(0).expand_as(components['direct'])  # [N, 3]
+        components['direct'] = torch.where(is_sky, sun_int_flat, components['direct'])
+        components['ambient'] = torch.where(is_sky, torch.zeros_like(components['ambient']), components['ambient'])
+        components['residual'] = torch.where(is_sky, torch.zeros_like(components['residual']), components['residual'])
+        components['sky_sh'] = components['residual']  # Keep in sync
+
+        # Recompute total intensity with sky-overridden components
+        intensity_hdr = components['direct'] + components['ambient'] + components['residual']
+        intensity_hdr = torch.clamp(intensity_hdr, min=0.0)
+
         # Apply gamma correction (linear to sRGB)
         intensity_hdr = torch.clamp_min(intensity_hdr, 0.00001)
         intensity = intensity_hdr ** (1 / 2.2)
@@ -432,8 +449,23 @@ class GaussianModel:
         intensity = torch.clamp_min(intensity_hdr, 1e-5) ** (1 / 2.2)
         rgb = torch.clamp(intensity, 0.0)
 
+        # Sky gaussians (casts_shadow < 0.5) are emissive — bypass all BRDF/lighting modulation.
+        # Their final color is just base_color with gamma correction, independent of sun direction.
+        casts_shadow_flag = self.get_casts_shadow  # [N]
+        is_sky = (casts_shadow_flag < 0.5).unsqueeze(-1)  # [N, 1]
+        sky_intensity_hdr = base_color  # Emissive: use base_color as HDR intensity
+        sky_intensity = torch.clamp_min(sky_intensity_hdr, 1e-5) ** (1 / 2.2)
+        sky_rgb = torch.clamp(sky_intensity, 0.0)
+        intensity_hdr = torch.where(is_sky, sky_intensity_hdr, intensity_hdr)
+        intensity = torch.where(is_sky, sky_intensity, intensity)
+        rgb = torch.where(is_sky, sky_rgb, rgb)
+
+        # Override components so sky gaussians have zero direct (shadow_mask irrelevant)
+        # and all energy in indirect (direction-independent)
+        direct = torch.where(is_sky, torch.zeros_like(direct), direct)
+
         components['direct_pbr'] = direct
-        components['indirect_pbr'] = indirect + indirect_spec
+        components['indirect_pbr'] = torch.where(is_sky, sky_intensity_hdr, indirect + indirect_spec)
         components['lambert_intensity'] = intensity_hdr_lambert
 
         return rgb, intensity, sun_dir, components
@@ -446,7 +478,7 @@ class GaussianModel:
         """
         pass
 
-    def compute_sky_mask_loss(self, viewpoint_cam, sky_mask, render_func, pipe, background):
+    def compute_sky_mask_loss(self, viewpoint_cam, sky_mask, render_func, pipe, background, override_xyz=None):
         """
         Compute loss between rendered casts_shadow values and sky mask.
 
@@ -459,6 +491,7 @@ class GaussianModel:
             render_func: The render function to use
             pipe: Pipeline parameters
             background: Background color tensor
+            override_xyz: Optional [N, 3] transformed positions for cam_cal
 
         Returns:
             sky_mask_loss: L1 loss between rendered casts_shadow and sky mask
@@ -472,7 +505,7 @@ class GaussianModel:
 
         # Render with black background so we can see the mask clearly
         black_bg = torch.zeros(3, device="cuda")
-        render_pkg = render_func(viewpoint_cam, self, pipe, black_bg, override_color=casts_shadow_rgb)
+        render_pkg = render_func(viewpoint_cam, self, pipe, black_bg, override_color=casts_shadow_rgb, override_xyz=override_xyz)
         rendered_casts_shadow = render_pkg["render"]  # [3, H, W]
 
         # Convert to grayscale (all channels should be same, take first)
@@ -627,6 +660,7 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        l.append('casts_shadow')
         return l
 
     def save_ply(self, path):
@@ -644,11 +678,12 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        casts_shadow = self._casts_shadow.detach().cpu().numpy().reshape(-1, 1)
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc_positive, f_rest_positive, f_dc_negative, f_rest_negative, albedo, roughness, metallic, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc_positive, f_rest_positive, f_dc_negative, f_rest_negative, albedo, roughness, metallic, opacities, scale, rotation, casts_shadow), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -739,8 +774,16 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
-        # Initialize _casts_shadow if not present (default: all gaussians cast shadows)
-        self._casts_shadow = nn.Parameter(torch.ones((xyz.shape[0],), dtype=torch.float, device="cuda").requires_grad_(False))
+        # Load _casts_shadow from PLY if present, otherwise default to all shadow-casting
+        casts_shadow_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("casts_shadow")]
+        if casts_shadow_names:
+            casts_shadow_vals = np.asarray(plydata.elements[0]["casts_shadow"])
+            self._casts_shadow = nn.Parameter(torch.tensor(casts_shadow_vals, dtype=torch.float, device="cuda").requires_grad_(False))
+            n_sky = int((casts_shadow_vals < 0.5).sum())
+            print(f"Loaded _casts_shadow from PLY: {n_sky}/{len(casts_shadow_vals)} sky gaussians")
+        else:
+            self._casts_shadow = nn.Parameter(torch.ones((xyz.shape[0],), dtype=torch.float, device="cuda").requires_grad_(False))
+            print("Warning: _casts_shadow not found in PLY, defaulting to all shadow-casting")
 
         self.active_sh_degree = self.max_sh_degree
 

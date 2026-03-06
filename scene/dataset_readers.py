@@ -60,16 +60,23 @@ def load_sun_data_from_path(path: str) -> Optional[dict]:
     Returns:
         Dictionary with sun data, or None if not found
     """
-    sun_file_names = ["sun_data.json", "sun_positions.json", "sun.json"]
+    sun_file_names = ["sun_data.json", "sun_positions.json", "sun.json", "sun_directions_blender.json"]
 
-    for filename in sun_file_names:
-        sun_path = os.path.join(path, filename)
-        if os.path.exists(sun_path):
-            print(f"Loading sun data from: {sun_path}")
-            with open(sun_path, 'r') as f:
-                sun_data = json.load(f)
-            print(f"Loaded sun data for {len(sun_data)} images")
-            return sun_data
+    # Search in the given path and its parent directory
+    search_dirs = [path]
+    parent = os.path.dirname(path.rstrip(os.sep))
+    if parent and parent != path:
+        search_dirs.append(parent)
+
+    for search_dir in search_dirs:
+        for filename in sun_file_names:
+            sun_path = os.path.join(search_dir, filename)
+            if os.path.exists(sun_path):
+                print(f"Loading sun data from: {sun_path}")
+                with open(sun_path, 'r') as f:
+                    sun_data = json.load(f)
+                print(f"Loaded sun data for {len(sun_data)} images")
+                return sun_data
 
     return None
 
@@ -329,11 +336,15 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir, sun_dat
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path)
 
-        # Skip specific lk2 PNG images without EXIF data (C1-C6 series) - only for lk2 dataset
-        import re
-        if 'lk2' in path.lower() and re.match(r'^C[1-6]_DSC_\d+.*\.png$', image_name, re.IGNORECASE):
-            print(f"\nSkipping {image_name} - lk2 PNG without EXIF data")
-            continue
+        # Skip images without sun data when sun data is provided (e.g. PNGs without EXIF)
+        sun_direction = None
+        sun_elevation = None
+        if sun_data is not None:
+            sun_direction = get_sun_direction_for_image(sun_data, image_name)
+            if sun_direction is None:
+                print(f"\nSkipping {image_name} - no sun data available")
+                continue
+            sun_elevation = get_sun_elevation_for_image(sun_data, image_name)
 
         image = Image.open(image_path)
 
@@ -348,13 +359,6 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir, sun_dat
                 raise FileNotFoundError(f"No mask found for {base_image_name} in {mask_path}")
         else:
             mask = Image.fromarray(np.uint8(np.ones_like(image)*255)).convert('L')
-
-        # Get sun direction and elevation for this image if available
-        sun_direction = None
-        sun_elevation = None
-        if sun_data is not None:
-            sun_direction = get_sun_direction_for_image(sun_data, image_name)
-            sun_elevation = get_sun_elevation_for_image(sun_data, image_name)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height,
