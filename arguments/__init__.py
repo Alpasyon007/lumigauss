@@ -169,15 +169,12 @@ class OptimizationParams(ParamGroup):
         self.embedding_lr = 0.002
         self.embedding_lr_final_ratio = 10
         self.albedo_lr= 0.0025
-        # Camera calibration refinement learning rates
-        self.cam_cal_rot_lr = 0.0001   # Learning rate for camera rotation deltas (axis-angle)
-        self.cam_cal_trans_lr = 0.0005  # Learning rate for camera translation deltas
-        self.cam_cal_from_iter = 500    # Start camera calibration after this iteration
-        self.cam_cal_until_iter = 20000 # Stop camera calibration at this iteration
         # Sun direction calibration learning rates
-        self.sun_cal_lr = 0.001         # Learning rate for sun direction deltas
-        self.sun_cal_from_iter = 500    # Start sun calibration after this iteration
+        #self.sun_cal_lr = 0.001         # Learning rate for sun direction deltas
+        self.sun_cal_lr = 0.1
+        self.sun_cal_from_iter = 10000    # Start sun calibration after this iteration
         self.sun_cal_until_iter = 30000 # Stop sun calibration at this iteration
+        self.sun_cal_reg_lambda = 0.0001  # L2 regularization pulling delta_sun_dir toward zero (higher = tighter to input)
 
         self.gauss_loss_lambda = 0.001
         self.env_loss_lambda = 0.05

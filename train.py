@@ -425,7 +425,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sun_cal_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
         if (dataset.use_sun_cal and scene.sun_cal_enabled
                 and iteration >= opt.sun_cal_from_iter and iteration <= opt.sun_cal_until_iter):
-            sun_cal_reg_loss = 0.01 * (viewpoint_cam.delta_sun_dir.norm() ** 2)
+            sun_cal_reg_loss = opt.sun_cal_reg_lambda * (viewpoint_cam.delta_sun_dir.norm() ** 2)
 
         total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss + sky_mask_loss + depth_est_loss + cam_cal_reg_loss + sun_cal_reg_loss
 
@@ -740,7 +740,7 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    iter_list = [1, 1000, 5000, 7500, *list(range(10000, 1000001, 2500))] #[30000]
+    iter_list = [1, 500, 1000, 1500, 2000, *list(range(2500, 1000001, 2500))] #[30000]
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)

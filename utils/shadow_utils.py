@@ -57,7 +57,7 @@ def create_sun_camera(
 
     # Build rotation matrix (world to camera)
     # diff-surfel-rasterization convention: +Z is forward (p_view.z > 0 for visible points)
-    R = torch.stack([right, up, forward], dim=0)  # [3, 3]
+    R = torch.stack([right, up, -forward], dim=0)  # [3, 3]
 
     # Translation: camera position in world, need to convert to camera space
     T = -R @ cam_pos  # [3]
@@ -279,8 +279,8 @@ def compute_shadow_mask(
 
     # View-space positions (for depth comparison with rasterizer output)
     # The rasterizer returns depth in view/camera space, so we must compare in the same space.
-    view_coords = positions_homo @ sun_camera.world_view_transform  # [N, 4]
-    gaussian_depth = view_coords[:, 2]  # [N] - z in view space (same space as shadow map)
+    #view_coords = positions_homo @ sun_camera.world_view_transform  # [N, 4]
+    #gaussian_depth = view_coords[:, 2]  # [N] - z in view space (same space as shadow map)
 
     # Clip-space positions (for UV lookup into shadow map texture)
     clip_coords = positions_homo @ sun_camera.full_proj_transform  # [N, 4]
@@ -291,6 +291,8 @@ def compute_shadow_mask(
     # NDC to texture coordinates [0, 1]
     # NDC is in [-1, 1], convert to [0, 1] for sampling
     uv = (ndc_coords[:, :2] + 1.0) * 0.5  # [N, 2]
+
+    gaussian_depth = ndc_coords[:, 2]
 
     # Sample shadow map at UV coordinates
     # Need to convert to grid_sample format: [1, 1, N, 2] with values in [-1, 1]
