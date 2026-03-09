@@ -7,6 +7,7 @@
 import torch
 from scene import Scene
 import os
+import math
 from tqdm import tqdm
 from os import makedirs
 from gaussian_renderer import render
@@ -362,15 +363,26 @@ def compute_shadow_mask_fixed(
     ones = torch.ones(N, 1, device=device, dtype=gaussian_positions.dtype)
     positions_homo = torch.cat([gaussian_positions, ones], dim=1)
 
-    # View-space depth (matches rasterizer output space)
+    # View-space positions (depth + screen projection)
+    # Must use pinhole projection for UV to match rasterizer's pixel placement
     view_coords = positions_homo @ sun_camera.world_view_transform
-    gaussian_depth = view_coords[:, 2]
+    vx = view_coords[:, 0]
+    vy = view_coords[:, 1]
+    vz = view_coords[:, 2]
+    gaussian_depth = vz
 
-    # Clip/NDC for UV lookup
-    clip_coords = positions_homo @ sun_camera.full_proj_transform
-    ndc_coords = clip_coords[:, :3] / (clip_coords[:, 3:4] + 1e-8)
+    # Pinhole projection matching rasterizer
+    W = sun_camera.image_width
+    H = sun_camera.image_height
+    focal_x = W / (2.0 * math.tan(sun_camera.FoVx * 0.5))
+    focal_y = H / (2.0 * math.tan(sun_camera.FoVy * 0.5))
 
-    uv = (ndc_coords[:, :2] + 1.0) * 0.5
+    screen_x = focal_x * (vx / vz.clamp(min=1e-6)) + W * 0.5
+    screen_y = focal_y * (vy / vz.clamp(min=1e-6)) + H * 0.5
+
+    u = screen_x / W
+    v = screen_y / H
+    uv = torch.stack([u, v], dim=-1)
 
     grid = (uv * 2.0 - 1.0).view(1, 1, N, 2)
 
@@ -765,7 +777,10 @@ def render_day(dataset: ModelParams, iteration: int, pipeline: PipelineParams, a
             gaussians = GaussianModel(
                 dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
                 use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh,
-                full_pbr=dataset.full_pbr
+                full_pbr=dataset.full_pbr, use_ao=dataset.use_ao,
+                sky_sh_degree=dataset.sky_sh_degree,
+                use_color_bias=dataset.use_color_bias,
+                optimize_casts_shadow=dataset.optimize_casts_shadow
             )
         else:
             raise ValueError("render_day.py requires --use_sun flag")
@@ -810,7 +825,7 @@ def render_day(dataset: ModelParams, iteration: int, pipeline: PipelineParams, a
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Render scene with a light orbiting in a circle above the scene")
-    model = ModelParams(parser)
+    model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
 
     # Standard args

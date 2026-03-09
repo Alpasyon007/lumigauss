@@ -15,10 +15,15 @@ from utils.loss_utils import ssim, img2mse, img2mae, mse2psnr
 from argparse import ArgumentParser, Namespace
 from skimage.metrics import structural_similarity as ssim_skimage
 import os
-from utils.sh_vis_utils import shReconstructDiffuseMap
+from utils.sh_vis_utils import shReconstructDiffuseMap, getCoefficientsFromImage
+from utils.sh_rotate_utils import Rotation
 from utils.normal_utils import compute_normal_world_space
 from utils.shadow_utils import compute_shadows_for_gaussians, create_sun_camera_visualization_tensor
 from scene import Scene
+import cv2 as _cv2
+import matplotlib.pyplot as _plt
+import importlib
+import sys
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -70,6 +75,9 @@ class LossComponents:
     sun_reg: float = 0.0
     sky_mask: float = 0.0
     depth_est: float = 0.0
+    ao_reg: float = 0.0
+    manhattan: float = 0.0
+    casts_shadow_reg: float = 0.0
     total: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
@@ -304,6 +312,9 @@ class MetricsLogger:
         self.tb_writer.add_scalar('Loss_Regularization/sun_reg', losses.sun_reg, iteration)
         self.tb_writer.add_scalar('Loss_Regularization/sky_mask', losses.sky_mask, iteration)
         self.tb_writer.add_scalar('Loss_Regularization/depth_est', losses.depth_est, iteration)
+        self.tb_writer.add_scalar('Loss_Regularization/ao_reg', losses.ao_reg, iteration)
+        self.tb_writer.add_scalar('Loss_Regularization/manhattan', losses.manhattan, iteration)
+        self.tb_writer.add_scalar('Loss_Regularization/casts_shadow_reg', losses.casts_shadow_reg, iteration)
 
         # Group 4: SH/Lighting Losses
         self.tb_writer.add_scalar('Loss_Lighting/sh_gauss', losses.sh_gauss, iteration)
@@ -367,6 +378,14 @@ class MetricsLogger:
             sky_ratio = (casts_shadow < 0.5).float().mean().item()
             self.tb_writer.add_scalar('Gaussians/sky_ratio', sky_ratio, iteration)
             self.tb_writer.add_histogram('Gaussians/casts_shadow_hist', casts_shadow, iteration)
+
+        # AO statistics
+        if gaussians.use_ao:
+            ao = gaussians.get_ao
+            self.tb_writer.add_scalar('Gaussians/ao_mean', ao.mean().item(), iteration)
+            self.tb_writer.add_scalar('Gaussians/ao_min', ao.min().item(), iteration)
+            self.tb_writer.add_scalar('Gaussians/ao_max', ao.max().item(), iteration)
+            self.tb_writer.add_histogram('Gaussians/ao_hist', ao, iteration)
 
     def log_sun_model_params(self, iteration: int, sun_model, emb_idx: int = 0):
         """Log sun model parameters for use_sun mode."""
@@ -529,6 +548,9 @@ def create_loss_components(
     sun_reg_loss: torch.Tensor = None,
     sky_mask_loss: torch.Tensor = None,
     depth_est_loss: torch.Tensor = None,
+    ao_reg_loss: torch.Tensor = None,
+    manhattan_loss: torch.Tensor = None,
+    casts_shadow_reg_loss: torch.Tensor = None,
     total_loss: torch.Tensor = None
 ) -> LossComponents:
     """Helper to create LossComponents from tensor values."""
@@ -546,6 +568,9 @@ def create_loss_components(
         sun_reg=sun_reg_loss.item() if sun_reg_loss is not None and torch.is_tensor(sun_reg_loss) else (sun_reg_loss or 0.0),
         sky_mask=sky_mask_loss.item() if sky_mask_loss is not None and torch.is_tensor(sky_mask_loss) else (sky_mask_loss or 0.0),
         depth_est=depth_est_loss.item() if depth_est_loss is not None and torch.is_tensor(depth_est_loss) else (depth_est_loss or 0.0),
+        ao_reg=ao_reg_loss.item() if ao_reg_loss is not None and torch.is_tensor(ao_reg_loss) else (ao_reg_loss or 0.0),
+        manhattan=manhattan_loss.item() if manhattan_loss is not None and torch.is_tensor(manhattan_loss) else (manhattan_loss or 0.0),
+        casts_shadow_reg=casts_shadow_reg_loss.item() if casts_shadow_reg_loss is not None and torch.is_tensor(casts_shadow_reg_loss) else (casts_shadow_reg_loss or 0.0),
         total=total_loss.item() if total_loss is not None and torch.is_tensor(total_loss) else (total_loss or 0.0)
     )
 
@@ -703,10 +728,90 @@ def prepare_output_and_logger(args) -> tuple:
 
 
 @torch.no_grad()
+def _process_environment_map_image(img_path, scale_high, threshold):
+    """Process an environment map image into SH coefficients (from test_gt_env_map.py)."""
+    img = _plt.imread(img_path)
+    img = torch.from_numpy(img).float() / 255
+    img[img > threshold] *= scale_high
+    coeffs = getCoefficientsFromImage(img.numpy(), 2)
+    return coeffs
+
+
+def _sun_direction_from_azimuth(azimuth_rad, base_sun_direction):
+    """Rotate a sun direction around the vertical (Y) axis (from test_gt_env_map_sun.py)."""
+    cos_a = np.cos(azimuth_rad)
+    sin_a = np.sin(azimuth_rad)
+    rot_y = torch.tensor([
+        [cos_a,  0, sin_a],
+        [0,      1, 0    ],
+        [-sin_a, 0, cos_a]
+    ], dtype=torch.float32)
+    if isinstance(base_sun_direction, torch.Tensor):
+        d = base_sun_direction.cpu().float()
+    else:
+        d = torch.tensor(base_sun_direction, dtype=torch.float32)
+    rotated = rot_y @ d
+    rotated = rotated / (torch.norm(rotated) + 1e-8)
+    return rotated.cuda()
+
+
+def _render_shadowed_sun(gaussians, viewpoint_cam, pipeline, background,
+                         normal_vectors, multiplier, emb_idx,
+                         sun_direction, sun_elevation,
+                         shadow_method="shadow_map", shadow_map_resolution=512,
+                         shadow_bias=0.1, ray_march_steps=64, voxel_resolution=128):
+    """Render a shadowed image using the sun model (from test_gt_env_map_sun.py)."""
+    if gaussians.full_pbr:
+        rgb_unshadowed, _, sun_dir_out, components = gaussians.compute_directional_pbr(
+            emb_idx, normal_vectors, sun_direction, viewpoint_cam.camera_center,
+            sun_elevation=sun_elevation
+        )
+    else:
+        rgb_unshadowed, _, sun_dir_out, components = gaussians.compute_directional_rgb(
+            emb_idx, normal_vectors, sun_direction, sun_elevation=sun_elevation
+        )
+
+    effective_shadow_method = shadow_method
+    if getattr(pipeline, "use_gaussians", False) and effective_shadow_method == "shadow_map":
+        effective_shadow_method = "ray_march"
+
+    shadow_mask, _, _ = compute_shadows_for_gaussians(
+        gaussians, sun_dir_out, pipeline,
+        method=effective_shadow_method,
+        shadow_map_resolution=shadow_map_resolution,
+        shadow_bias=shadow_bias,
+        ray_march_steps=ray_march_steps,
+        voxel_resolution=voxel_resolution,
+        device="cuda"
+    )
+    shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
+
+    if gaussians.full_pbr:
+        rgb_shadowed, _, _, _ = gaussians.compute_directional_pbr(
+            emb_idx, normal_vectors, sun_direction, viewpoint_cam.camera_center,
+            sun_elevation=sun_elevation, shadow_mask=shadow_mask
+        )
+    else:
+        direct_light = components['direct']
+        ambient_light = components['ambient']
+        residual_light = components['residual']
+        intensity_hdr = direct_light * shadow_mask + ambient_light + residual_light
+        intensity_hdr = torch.clamp_min(intensity_hdr, 0.00001)
+        intensity = intensity_hdr ** (1 / 2.2)
+        albedo = gaussians.get_albedo
+        rgb_shadowed = torch.clamp(intensity * albedo, 0.0)
+
+    render_pkg = render(viewpoint_cam, gaussians, pipeline, background,
+                        override_color=rgb_shadowed)
+    rendering_shadowed = torch.clamp(render_pkg["render"], 0.0, 1.0)
+    return rendering_shadowed
+
+
 def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss, elapsed,
                     testing_iterations, scene: Scene, renderFunc, renderArgs,
                     appearance_lut=None, source_path=None, sky_masks=None,
-                    metrics_logger: Optional[MetricsLogger] = None):
+                    metrics_logger: Optional[MetricsLogger] = None,
+                    test_config_path: str = None):
     """
     Generate training report with detailed metrics logging.
 
@@ -725,6 +830,9 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
         source_path: Source data path
         sky_masks: Sky masks dictionary
         metrics_logger: MetricsLogger instance for detailed logging
+        test_config_path: Path to test config directory (containing test_config.py).
+                          When provided, eval_masked uses the full test_gt_env_map /
+                          test_gt_env_map_sun protocol (GT env map + angle sweep).
 
     Returns:
         float: PSNR value from evaluation (or large number if not evaluating)
@@ -813,6 +921,23 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                 eval_mae_shadowed = []
                 eval_ssim_shadowed = []
 
+                # Load test config dict once per validation config
+                _test_config_dict = {}
+                if config['name'] == 'test' and test_config_path:
+                    try:
+                        _tc_path = test_config_path
+                        if _tc_path not in sys.path:
+                            sys.path.insert(0, _tc_path)
+                        # Force reimport in case module was cached from a previous iteration
+                        if 'test_config' in sys.modules:
+                            del sys.modules['test_config']
+                        _test_config_dict = importlib.import_module("test_config").config
+                        print(f"[ITER {iteration}] Loaded test config from {_tc_path} "
+                              f"({len(_test_config_dict)} images)")
+                    except Exception as e:
+                        print(f"[ITER {iteration}] Warning: failed to load test config: {e}")
+                        _test_config_dict = {}
+
                 for idx, viewpoint in enumerate(config['cameras']):
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
 
@@ -899,11 +1024,9 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         shadow_map_vis = torch.clamp(render_pkg_shadow["render"], 0.0, 1.0)
 
                         # Render direct light only (with shadow applied)
-                        casts_shadow_flag = scene.gaussians.get_casts_shadow.unsqueeze(-1)  # [N, 1]
-                        is_sky = casts_shadow_flag < 0.5
-                        sun_intensity = scene.gaussians.sun_model.get_sun_intensity(emb_idx, sun_elevation=sun_elev).unsqueeze(0)  # [1, 3]
-                        direct_for_vis = torch.where(is_sky, sun_intensity.expand(direct_light.shape[0], -1), direct_light)
-                        direct_shadowed = direct_for_vis * shadow_mask  # [N, 3]
+                        # direct_light already contains sun_color * I * max(N·L, 0) for all gaussians
+                        # (casts_shadow only controls shadow map opacity, not lighting mode)
+                        direct_shadowed = direct_light * shadow_mask  # [N, 3]
                         direct_shadowed_gamma = torch.clamp_min(direct_shadowed, 0.00001) ** (1 / 2.2)
                         direct_shadowed_rgb = torch.clamp(direct_shadowed_gamma * albedo, 0.0)
                         render_pkg_direct = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=direct_shadowed_rgb)
@@ -1122,12 +1245,19 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                                 view_matrix = viewpoint.world_view_transform
                                 cam_forward = -view_matrix[:3, 2]  # Forward is -Z in camera space
 
+                                # Get adjusted (optimised) sun direction if sun_cal is active
+                                adjusted_sun = viewpoint.get_adjusted_sun_direction()
+                                # original_sun = viewpoint.sun_direction (already used as sun_dir above)
+                                # If sun_cal changed the direction, show both; otherwise just one
+                                original_sun = viewpoint.sun_direction
+
                                 sun_cam_vis = create_sun_camera_visualization_tensor(
                                     gaussian_positions=scene.gaussians.get_xyz,
-                                    sun_direction=sun_dir,
+                                    sun_direction=adjusted_sun if adjusted_sun is not None else sun_dir,
                                     camera_position=viewpoint.camera_center,
                                     camera_forward=cam_forward,
                                     shadow_mask=shadow_mask.squeeze() if shadow_mask is not None else None,
+                                    original_sun_direction=original_sun,
                                     max_points=3000
                                 )
                                 tb_writer.add_images(view_tag + "/10_sun_camera_3d", sun_cam_vis[None], global_step=iteration)
@@ -1212,12 +1342,122 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         l1_test += l1_loss(image_albedo, gt_image).mean().double()
                         psnr_test += psnr(image_albedo, gt_image).mean().double()
 
-                    # ---- Masked evaluation metrics (same formula as test script) ----
-                    if config['name'] == 'test' and image_shadowed is not None:
-                        # Use camera's training mask [1, H, W] -> [H, W]
-                        eval_mask = viewpoint.mask.squeeze(0)  # [H, W]
-                        # Erode mask (same 5x5 kernel as test script)
-                        import cv2 as _cv2
+                    # ---- Masked evaluation metrics (test_gt_env_map protocol) ----
+                    if config['name'] == 'test' and test_config_path and viewpoint.image_name in _test_config_dict:
+                        image_config = _test_config_dict[viewpoint.image_name]
+                        mask_path = image_config["mask_path"]
+                        sun_angle_range = image_config["sun_angles"]
+
+                        # Load and erode mask from test config (same as test_gt_env_map.py)
+                        eval_mask = _cv2.imread(mask_path, _cv2.IMREAD_GRAYSCALE)
+                        eval_mask = _cv2.resize(eval_mask, (gt_image.shape[2], gt_image.shape[1]))
+                        _kernel = np.ones((5, 5), np.uint8)
+                        eval_mask = _cv2.erode(eval_mask, _kernel, iterations=1)
+                        eval_mask = torch.from_numpy(eval_mask // 255).to(gt_image.device)
+
+                        if scene.gaussians.use_sun:
+                            # --- Sun method: sweep sun azimuth (test_gt_env_map_sun.py) ---
+                            if appearance_lut and viewpoint.image_name in appearance_lut:
+                                _emb_idx = appearance_lut[viewpoint.image_name]
+                            elif appearance_lut:
+                                _emb_idx = list(appearance_lut.values())[0]
+                            else:
+                                _emb_idx = 0
+
+                            base_sun_dir = viewpoint.sun_direction
+                            _sun_elev = viewpoint.sun_elevation
+                            if base_sun_dir is None:
+                                base_sun_dir = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32)
+
+                            best_psnr_sweep = 0
+                            n_sweep = 51
+                            angle_list = torch.linspace(sun_angle_range[0], sun_angle_range[1], n_sweep)
+                            best_angle = angle_list[0]
+
+                            for _angle in angle_list:
+                                _sun_dir = _sun_direction_from_azimuth(float(_angle), base_sun_direction=base_sun_dir)
+                                _rendering = _render_shadowed_sun(
+                                    scene.gaussians, viewpoint, renderArgs[0], renderArgs[1],
+                                    normal_vectors, multiplier, _emb_idx,
+                                    _sun_dir, _sun_elev)
+                                _cur_psnr = float(mse2psnr(img2mse(_rendering, gt_image, mask=eval_mask)))
+                                if _cur_psnr > best_psnr_sweep:
+                                    best_psnr_sweep = _cur_psnr
+                                    best_angle = _angle
+
+                            # Render best angle for final metrics
+                            best_sun_dir = _sun_direction_from_azimuth(float(best_angle), base_sun_direction=base_sun_dir)
+                            eval_shadowed = _render_shadowed_sun(
+                                scene.gaussians, viewpoint, renderArgs[0], renderArgs[1],
+                                normal_vectors, multiplier, _emb_idx,
+                                best_sun_dir, _sun_elev)
+                        else:
+                            # --- Non-sun method: GT env map + angle sweep (test_gt_env_map.py) ---
+                            envmap_img_path = image_config["env_map_path"]
+                            init_rot_x = image_config["initial_env_map_rotation"]["x"]
+                            init_rot_y = image_config["initial_env_map_rotation"]["y"]
+                            init_rot_z = image_config["initial_env_map_rotation"]["z"]
+                            threshold = image_config["env_map_scaling"]["threshold"]
+                            scale = image_config["env_map_scaling"]["scale"]
+
+                            env_sh_gt = _process_environment_map_image(envmap_img_path, scale, threshold)
+
+                            best_psnr_sweep = 0
+                            n_sweep = 51
+                            angle_list = torch.linspace(sun_angle_range[0], sun_angle_range[1], n_sweep)
+                            sun_angles_list = [torch.tensor([a, 0, 0]) for a in angle_list]
+                            best_angle = sun_angles_list[0]
+
+                            rotation = Rotation()
+                            init_rot = np.float32(np.dot(rotation.rot_y(init_rot_y),
+                                                         np.dot(rotation.rot_x(init_rot_x), rotation.rot_z(init_rot_z))))
+
+                            for _angle in sun_angles_list:
+                                env_sh = np.matmul(init_rot, env_sh_gt)
+                                rotation2 = Rotation()
+                                rot2 = np.float32(np.dot(rotation2.rot_y(_angle[0]),
+                                                         np.dot(rotation2.rot_x(_angle[1]), rotation2.rot_z(_angle[2]))))
+                                env_sh = np.matmul(rot2, env_sh)
+                                env_sh_torch = torch.tensor(env_sh.T, dtype=torch.float32).cuda()
+
+                                rgb_precomp_sweep, _ = scene.gaussians.compute_gaussian_rgb(env_sh_torch, multiplier=multiplier)
+                                render_pkg_sweep = render(viewpoint, scene.gaussians, renderArgs[0], renderArgs[1],
+                                                          override_color=rgb_precomp_sweep)
+                                _rendering = torch.clamp(render_pkg_sweep["render"], 0.0, 1.0)
+                                _cur_psnr = float(mse2psnr(img2mse(_rendering, gt_image, mask=eval_mask)))
+                                if _cur_psnr > best_psnr_sweep:
+                                    best_psnr_sweep = _cur_psnr
+                                    best_angle = _angle
+
+                            # Render best angle for final metrics
+                            env_sh = np.matmul(init_rot, env_sh_gt)
+                            rotation3 = Rotation()
+                            rot3 = np.float32(np.dot(rotation3.rot_y(best_angle[0]),
+                                                     np.dot(rotation3.rot_x(best_angle[1]), rotation3.rot_z(best_angle[2]))))
+                            env_sh = np.matmul(rot3, env_sh)
+                            env_sh_torch = torch.tensor(env_sh.T, dtype=torch.float32).cuda()
+
+                            rgb_precomp_best, _ = scene.gaussians.compute_gaussian_rgb(env_sh_torch, multiplier=multiplier)
+                            render_pkg_best = render(viewpoint, scene.gaussians, renderArgs[0], renderArgs[1],
+                                                     override_color=rgb_precomp_best)
+                            eval_shadowed = torch.clamp(render_pkg_best["render"], 0.0, 1.0)
+
+                        # Compute metrics on the best-angle rendering
+                        _mse_val = img2mse(eval_shadowed, gt_image, mask=eval_mask)
+                        eval_mse_shadowed.append(float(_mse_val))
+                        eval_psnrs_shadowed.append(float(mse2psnr(_mse_val)))
+                        eval_mae_shadowed.append(float(img2mae(eval_shadowed, gt_image, mask=eval_mask)))
+
+                        _shad_np = eval_shadowed.cpu().detach().numpy().transpose(1, 2, 0)
+                        _gt_np = gt_image.cpu().detach().numpy().transpose(1, 2, 0)
+                        _, _full = ssim_skimage(_shad_np, _gt_np, win_size=5,
+                                                channel_axis=2, full=True, data_range=1.0)
+                        _mssim = (torch.tensor(_full).to(gt_image.device) * eval_mask.unsqueeze(-1)).sum() / (3 * eval_mask.sum())
+                        eval_ssim_shadowed.append(float(_mssim))
+
+                    elif config['name'] == 'test' and image_shadowed is not None:
+                        # Fallback: no test_config provided, use old behavior
+                        eval_mask = viewpoint.mask.squeeze(0)
                         mask_np = (eval_mask.cpu().numpy() * 255).astype(np.uint8)
                         _kernel = np.ones((5, 5), np.uint8)
                         mask_np = _cv2.erode(mask_np, _kernel, iterations=1)
@@ -1228,7 +1468,6 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         eval_psnrs_shadowed.append(float(mse2psnr(_mse_val)))
                         eval_mae_shadowed.append(float(img2mae(image_shadowed, gt_image, mask=eval_mask)))
 
-                        # SSIM (skimage, masked, matching test script exactly)
                         _shad_np = image_shadowed.cpu().detach().numpy().transpose(1, 2, 0)
                         _gt_np = gt_image.cpu().detach().numpy().transpose(1, 2, 0)
                         _, _full = ssim_skimage(_shad_np, _gt_np, win_size=5,

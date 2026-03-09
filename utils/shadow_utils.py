@@ -57,6 +57,7 @@ def create_sun_camera(
 
     # Build rotation matrix (world to camera)
     # diff-surfel-rasterization convention: +Z is forward (p_view.z > 0 for visible points)
+    #R = torch.stack([right, up, forward], dim=0)  # [3, 3]
     R = torch.stack([right, up, forward], dim=0)  # [3, 3]
 
     # Translation: camera position in world, need to convert to camera space
@@ -255,10 +256,15 @@ def compute_shadow_mask(
     shadow_depth_map: torch.Tensor,
     shadow_alpha_map: torch.Tensor,
     bias: float = 0.05,
+    sharpness: float = 50.0,
     device: str = "cuda"
 ) -> torch.Tensor:
     """
-    Compute shadow mask for each Gaussian by comparing its depth to the shadow map.
+    Compute soft shadow mask for each Gaussian by comparing its depth to the shadow map.
+
+    Uses a sigmoid-based soft transition instead of a hard threshold so that
+    gradients can flow through the shadow mask to Gaussian positions (and
+    indirectly to albedo-shadow disentanglement).
 
     Args:
         gaussian_positions: World positions of Gaussians [N, 3]
@@ -266,34 +272,47 @@ def compute_shadow_mask(
         shadow_depth_map: Rendered depth from sun view [1, H, W]
         shadow_alpha_map: Rendered alpha from sun view [1, H, W]
         bias: Depth bias to avoid self-shadowing artifacts
+        sharpness: Sigmoid steepness for the lit/shadow transition.
+                   Higher values → harder edges; lower → softer penumbra.
         device: Device
 
     Returns:
-        Shadow mask [N] where 1=lit, 0=shadowed
+        Shadow mask [N] where 1=lit, 0=shadowed (soft/differentiable)
     """
     N = gaussian_positions.shape[0]
 
-    # Transform Gaussian positions to sun camera's view space AND clip space
+    # Transform Gaussian positions to sun camera's view space
     ones = torch.ones(N, 1, device=device, dtype=gaussian_positions.dtype)
     positions_homo = torch.cat([gaussian_positions, ones], dim=1)  # [N, 4]
 
-    # View-space positions (for depth comparison with rasterizer output)
-    # The rasterizer returns depth in view/camera space, so we must compare in the same space.
+    # View-space positions (depth + screen projection)
+    # The rasterizer computes depth and screen position in view space using
+    # a pinhole camera model, NOT the orthographic projection matrix.
+    # We must use the same projection for the UV lookup to match.
     view_coords = positions_homo @ sun_camera.world_view_transform  # [N, 4]
-    gaussian_depth = view_coords[:, 2]  # [N] - z in view space (same space as shadow map)
+    vx = view_coords[:, 0]
+    vy = view_coords[:, 1]
+    vz = view_coords[:, 2]
+    gaussian_depth = vz  # [N] - view-space z (same as rasterizer's allmap[0])
 
-    # Clip-space positions (for UV lookup into shadow map texture)
-    clip_coords = positions_homo @ sun_camera.full_proj_transform  # [N, 4]
+    # Compute UV using the pinhole camera model (matching the rasterizer)
+    # The rasterizer uses: screen_x = focal_x * (vx / vz) + W/2
+    # where focal_x = W / (2 * tan(FoVx/2))
+    W = sun_camera.image_width
+    H = sun_camera.image_height
+    focal_x = W / (2.0 * math.tan(sun_camera.FoVx * 0.5))
+    focal_y = H / (2.0 * math.tan(sun_camera.FoVy * 0.5))
 
-    # Perspective divide (for orthographic w should be 1, but do it anyway)
-    ndc_coords = clip_coords[:, :3] / (clip_coords[:, 3:4] + 1e-8)  # [N, 3]
+    screen_x = focal_x * (vx / vz.clamp(min=1e-6)) + W * 0.5
+    screen_y = focal_y * (vy / vz.clamp(min=1e-6)) + H * 0.5
 
-    # NDC to texture coordinates [0, 1]
-    # NDC is in [-1, 1], convert to [0, 1] for sampling
-    uv = (ndc_coords[:, :2] + 1.0) * 0.5  # [N, 2]
+    # Convert to UV [0, 1]
+    u = screen_x / W
+    v = screen_y / H
 
     # Sample shadow map at UV coordinates
-    # Need to convert to grid_sample format: [1, 1, N, 2] with values in [-1, 1]
+    # grid_sample expects values in [-1, 1]
+    uv = torch.stack([u, v], dim=-1)  # [N, 2]
     grid = (uv * 2.0 - 1.0).view(1, 1, N, 2)  # [1, 1, N, 2]
 
     # Sample depth map
@@ -314,16 +333,22 @@ def compute_shadow_mask(
         align_corners=False
     ).view(N)  # [N]
 
-    # Compare depths: if gaussian_depth > sampled_depth + bias, it's in shadow
-    # Also check if the sampled location has valid geometry (alpha > threshold)
-    in_shadow = (gaussian_depth > sampled_depth + bias) & (sampled_alpha > 0.1)
+    # Soft shadow transition using sigmoid:
+    # depth_diff > 0 → point is behind the shadow caster → in shadow
+    # depth_diff < 0 → point is in front → lit
+    # sigmoid(sharpness * -depth_diff) smoothly transitions between 0 and 1
+    depth_diff = gaussian_depth - (sampled_depth + bias)  # [N]
+    shadow_mask = torch.sigmoid(-sharpness * depth_diff)  # [N], ~1 when lit, ~0 when shadowed
 
-    # Shadow mask: 1 = lit, 0 = shadowed
-    shadow_mask = (~in_shadow).float()
+    # Blend with alpha: regions with no shadow-map geometry should be fully lit
+    # alpha=0 → no occluder → shadow_mask = 1.0 (fully lit)
+    # alpha=1 → solid occluder → shadow_mask = depth-based result
+    # This is exact at alpha=0 (unlike a sigmoid gate which leaks)
+    shadow_mask = 1.0 - sampled_alpha.clamp(0, 1) * (1.0 - shadow_mask)
 
-    # Points outside the shadow map frustum should be lit (or could be marked specially)
+    # Points outside the shadow map frustum should be lit
     out_of_bounds = (uv[:, 0] < 0) | (uv[:, 0] > 1) | (uv[:, 1] < 0) | (uv[:, 1] > 1)
-    shadow_mask[out_of_bounds] = 1.0
+    shadow_mask = torch.where(out_of_bounds, torch.ones_like(shadow_mask), shadow_mask)
 
     return shadow_mask
 
@@ -363,6 +388,7 @@ def compute_shadows_shadow_map(
     pipe,
     shadow_map_resolution: int = 512,
     shadow_bias: float = 0.1,
+    shadow_sharpness: float = 50.0,
     device: str = "cuda"
 ) -> Tuple[torch.Tensor, torch.Tensor, SunShadowCamera]:
     """
@@ -376,6 +402,7 @@ def compute_shadows_shadow_map(
         pipe: Pipeline parameters
         shadow_map_resolution: Resolution of shadow map
         shadow_bias: Depth comparison bias
+        shadow_sharpness: Sigmoid sharpness for soft shadow edges
         device: Device
 
     Returns:
@@ -403,6 +430,7 @@ def compute_shadows_shadow_map(
         shadow_depth_map,
         shadow_alpha_map,
         bias=shadow_bias,
+        sharpness=shadow_sharpness,
         device=device
     )
 
@@ -475,7 +503,7 @@ def compute_shadows_ray_march(
 
     # Assign Gaussians to grid cells
     grid_coords = ((positions - pos_min) / cell_size).long()
-    grid_coords = torch.clamp(grid_coords, 0, grid_size.unsqueeze(0) - 1)
+    grid_coords = torch.clamp(grid_coords, min=torch.zeros_like(grid_size).unsqueeze(0), max=(grid_size.unsqueeze(0) - 1))
 
     # Create a dictionary mapping grid cells to Gaussian indices
     # Use a flat index for the grid
@@ -690,6 +718,7 @@ def compute_shadows_for_gaussians(
     method: str = "shadow_map",
     shadow_map_resolution: int = 512,
     shadow_bias: float = 0.1,
+    shadow_sharpness: float = 50.0,
     ray_march_steps: int = 64,
     voxel_resolution: int = 128,
     device: str = "cuda"
@@ -733,7 +762,7 @@ def compute_shadows_for_gaussians(
         else:
             shadow_mask, shadow_depth_map, sun_camera = compute_shadows_shadow_map(
                 gaussians, sun_direction, pipe,
-                shadow_map_resolution, shadow_bias, device
+                shadow_map_resolution, shadow_bias, shadow_sharpness, device
             )
 
     elif method == "ray_march":
@@ -750,11 +779,9 @@ def compute_shadows_for_gaussians(
         raise ValueError(f"Unknown shadow method: {method}. "
                         f"Choose from: 'none', 'shadow_map', 'ray_march', 'voxel'")
 
-    # Sky gaussians (casts_shadow=0) should always be fully lit (not in shadow)
-    # They represent the sky which doesn't receive shadows
-    casts_shadow = gaussians.get_casts_shadow  # [N]
-    is_sky_gaussian = casts_shadow < 0.5
-    shadow_mask = torch.where(is_sky_gaussian, torch.ones_like(shadow_mask), shadow_mask)
+    # casts_shadow only controls whether sun rays pass through a gaussian.
+    # It does NOT determine whether a gaussian is lit or not — that is determined
+    # by the shadow mask depth comparison above. No override needed here.
 
     return shadow_mask, shadow_depth_map, sun_camera
 
@@ -765,6 +792,7 @@ def visualize_sun_and_camera(
     camera_position: torch.Tensor,
     camera_forward: torch.Tensor = None,
     shadow_mask: torch.Tensor = None,
+    original_sun_direction: torch.Tensor = None,
     max_points: int = 5000,
     figsize: Tuple[int, int] = (12, 12),
     title: str = "Scene with Sun and Camera",
@@ -775,15 +803,19 @@ def visualize_sun_and_camera(
     Visualize the point cloud with sun direction and camera position in 3D.
     Shows a 2x2 grid with Front, Top, Left, and Right views.
 
+    When original_sun_direction is provided (and differs from sun_direction),
+    both the input (cyan) and optimised (orange) sun directions are shown.
+
     Note: Scene uses Y-up coordinate system. We swap Y and Z for matplotlib
     which uses Z-up, so the visualization appears correct.
 
     Args:
         gaussian_positions: Positions of Gaussians [N, 3] in Y-up coordinate system
-        sun_direction: Direction vector pointing TOWARD the sun [3]
+        sun_direction: Direction vector pointing TOWARD the sun [3] (optimised if sun_cal active)
         camera_position: Camera position in world space [3]
         camera_forward: Camera forward/look direction [3] (optional)
         shadow_mask: Optional shadow mask [N] for coloring points (1=lit, 0=shadow)
+        original_sun_direction: Original (input) sun direction before optimisation [3] (optional)
         max_points: Maximum number of points to display (for performance)
         figsize: Figure size tuple
         title: Plot title
@@ -827,6 +859,14 @@ def visualize_sun_and_camera(
     else:
         cam_forward = np.array(camera_forward) if camera_forward is not None else None
 
+    if original_sun_direction is not None:
+        if torch.is_tensor(original_sun_direction):
+            orig_sun_dir = original_sun_direction.detach().cpu().numpy()
+        else:
+            orig_sun_dir = np.array(original_sun_direction)
+    else:
+        orig_sun_dir = None
+
     if shadow_mask is not None and torch.is_tensor(shadow_mask):
         shadows = shadow_mask.detach().cpu().numpy()
     else:
@@ -845,15 +885,26 @@ def visualize_sun_and_camera(
     cam_pos = swap_yz(cam_pos)
     if cam_forward is not None:
         cam_forward = swap_yz(cam_forward)
+    if orig_sun_dir is not None:
+        orig_sun_dir = swap_yz(orig_sun_dir)
 
     # Compute scene center and extent for arrow scaling
     scene_center = positions.mean(axis=0)
     scene_extent = np.linalg.norm(positions - scene_center, axis=1).max()
     arrow_length = scene_extent * 0.5
 
-    # Normalize sun direction
+    # Normalize sun direction(s)
     sun_dir_norm = sun_dir / (np.linalg.norm(sun_dir) + 1e-8)
     sun_pos = scene_center + sun_dir_norm * arrow_length * 1.1
+
+    # Determine whether to show both original and optimised directions
+    show_both_suns = False
+    if orig_sun_dir is not None:
+        orig_sun_dir_norm = orig_sun_dir / (np.linalg.norm(orig_sun_dir) + 1e-8)
+        orig_sun_pos = scene_center + orig_sun_dir_norm * arrow_length * 1.1
+        # Only show both if they actually differ
+        if np.linalg.norm(sun_dir_norm - orig_sun_dir_norm) > 1e-4:
+            show_both_suns = True
 
     # Prepare colors
     if shadows is not None:
@@ -899,16 +950,36 @@ def visualize_sun_and_camera(
             ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2],
                        c='gray', s=1, alpha=0.5)
 
-        # Plot sun direction arrow
-        ax.quiver(scene_center[0], scene_center[1], scene_center[2],
-                  sun_dir_norm[0] * arrow_length,
-                  sun_dir_norm[1] * arrow_length,
-                  sun_dir_norm[2] * arrow_length,
-                  color='orange', linewidth=2, arrow_length_ratio=0.15)
+        if show_both_suns:
+            # Plot ORIGINAL (input) sun direction — cyan dashed
+            ax.quiver(scene_center[0], scene_center[1], scene_center[2],
+                      orig_sun_dir_norm[0] * arrow_length,
+                      orig_sun_dir_norm[1] * arrow_length,
+                      orig_sun_dir_norm[2] * arrow_length,
+                      color='cyan', linewidth=1.5, arrow_length_ratio=0.15,
+                      linestyle='dashed')
+            ax.scatter([orig_sun_pos[0]], [orig_sun_pos[1]], [orig_sun_pos[2]],
+                       c='cyan', s=70, marker='o', edgecolors='darkblue', linewidths=1.5,
+                       label='Input sun')
 
-        # Sun symbol
-        ax.scatter([sun_pos[0]], [sun_pos[1]], [sun_pos[2]],
-                   c='yellow', s=100, marker='o', edgecolors='orange', linewidths=2)
+            # Plot OPTIMISED sun direction — orange solid
+            ax.quiver(scene_center[0], scene_center[1], scene_center[2],
+                      sun_dir_norm[0] * arrow_length,
+                      sun_dir_norm[1] * arrow_length,
+                      sun_dir_norm[2] * arrow_length,
+                      color='orange', linewidth=2, arrow_length_ratio=0.15)
+            ax.scatter([sun_pos[0]], [sun_pos[1]], [sun_pos[2]],
+                       c='yellow', s=100, marker='o', edgecolors='orange', linewidths=2,
+                       label='Optimised sun')
+        else:
+            # Single sun direction (no sun_cal or no change)
+            ax.quiver(scene_center[0], scene_center[1], scene_center[2],
+                      sun_dir_norm[0] * arrow_length,
+                      sun_dir_norm[1] * arrow_length,
+                      sun_dir_norm[2] * arrow_length,
+                      color='orange', linewidth=2, arrow_length_ratio=0.15)
+            ax.scatter([sun_pos[0]], [sun_pos[1]], [sun_pos[2]],
+                       c='yellow', s=100, marker='o', edgecolors='orange', linewidths=2)
 
         # Camera position
         ax.scatter([cam_pos[0]], [cam_pos[1]], [cam_pos[2]],
@@ -925,6 +996,10 @@ def visualize_sun_and_camera(
         # Scene center
         ax.scatter([scene_center[0]], [scene_center[1]], [scene_center[2]],
                    c='green', s=30, marker='x')
+
+        # Legend (only on first subplot to avoid clutter)
+        if show_both_suns and idx == 0:
+            ax.legend(loc='upper right', fontsize=7, framealpha=0.7)
 
         # Set view angle
         ax.view_init(elev=elev, azim=azim)
@@ -967,10 +1042,14 @@ def create_sun_camera_visualization_tensor(
     camera_position: torch.Tensor,
     camera_forward: torch.Tensor = None,
     shadow_mask: torch.Tensor = None,
+    original_sun_direction: torch.Tensor = None,
     max_points: int = 5000,
 ) -> torch.Tensor:
     """
     Create a visualization tensor suitable for TensorBoard.
+
+    When original_sun_direction is provided, both input and optimised sun
+    directions are shown on the 3D plot.
 
     Returns:
         Tensor of shape [3, H, W] suitable for tb_writer.add_images()
@@ -981,6 +1060,7 @@ def create_sun_camera_visualization_tensor(
         camera_position=camera_position,
         camera_forward=camera_forward,
         shadow_mask=shadow_mask,
+        original_sun_direction=original_sun_direction,
         max_points=max_points,
         return_image=True
     )

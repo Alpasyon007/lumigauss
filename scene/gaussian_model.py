@@ -56,7 +56,8 @@ class GaussianModel:
 
     def __init__(self, sh_degree : int, with_mlp: bool = False, mlp_W=128, mlp_D=4, N_a = 32,
                  use_sun: bool = False, n_images: int = None, use_residual_sh: bool = True,
-                 full_pbr: bool = False):
+                 full_pbr: bool = False, use_ao: bool = False, sky_sh_degree: int = 1,
+                 use_color_bias: bool = False, optimize_casts_shadow: bool = False):
 
         # We only implement deg 2 for SH_gauss and SH_env.
         # More on environment map degree: https://cseweb.ucsd.edu/~ravir/papers/envmap/envmap.pdf
@@ -76,6 +77,7 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self._casts_shadow = torch.empty(0)  # Per-gaussian shadow casting flag (1=casts shadow, 0=sky/transparent)
+        self._ao = torch.empty(0)  # Per-gaussian ambient occlusion (1=unoccluded, 0=fully occluded)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -89,11 +91,21 @@ class GaussianModel:
 
         # Sun model parameters (explicit directional lighting, no SH for environment)
         self.use_sun = use_sun
+        self.use_ao = bool(use_ao and use_sun)
+        if use_ao and not use_sun:
+            print("Warning: --use_ao requires --use_sun. Disabling AO.")
         self.full_pbr = bool(full_pbr and use_sun)
         if full_pbr and not use_sun:
             print("Warning: --full_pbr requires --use_sun. Disabling full_pbr.")
         self.n_images = n_images
         self.use_residual_sh = use_residual_sh  # Whether to use residual SH for environment details
+        self.sky_sh_degree = sky_sh_degree  # SH degree for global sky model
+        self.use_color_bias = bool(use_color_bias and use_sun)
+        if use_color_bias and not use_sun:
+            print("Warning: --use_color_bias requires --use_sun. Disabling color bias.")
+        self.optimize_casts_shadow = bool(optimize_casts_shadow and use_sun)
+        if optimize_casts_shadow and not use_sun:
+            print("Warning: --optimize_casts_shadow requires --use_sun. Disabling.")
         self.sun_model = None
 
         self.setup_functions()
@@ -151,7 +163,9 @@ class GaussianModel:
         self.sun_model = SunModel(
             n_images=self.n_images,
             device="cuda",
-            use_residual_sh=self.use_residual_sh
+            use_residual_sh=self.use_residual_sh,
+            sh_degree=self.sky_sh_degree,
+            use_color_bias=self.use_color_bias
         )
         print(f"Initialized SunModel for {self.n_images} images (use_residual_sh={self.use_residual_sh})")
 
@@ -175,10 +189,31 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._ao,
         )
 
     def restore(self, model_args, training_args):
-        if len(model_args) >= 17:
+        ao_data = None
+        if len(model_args) >= 18:
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc_positive,
+            self._features_rest_positive,
+            self._features_dc_negative,
+            self._features_rest_negative,
+            self._albedo,
+            self._roughness,
+            self._metallic,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            ao_data) = model_args
+        elif len(model_args) >= 17:
             (self.active_sh_degree,
             self._xyz,
             self._features_dc_positive,
@@ -222,9 +257,14 @@ class GaussianModel:
         # Ensure PBR material params are trainable only when full_pbr is enabled.
         self._roughness = nn.Parameter(self._roughness.detach().requires_grad_(self.full_pbr))
         self._metallic = nn.Parameter(self._metallic.detach().requires_grad_(self.full_pbr))
-        # Reinitialize _casts_shadow as learnable parameter with correct size (default: all shadow-casting)
-        # Will be optimized via sky mask loss during training
-        self._casts_shadow = nn.Parameter(torch.ones(self._xyz.shape[0], device="cuda", dtype=torch.float32).requires_grad_(True))
+        # Reinitialize _casts_shadow as learnable parameter with correct size (default: non-shadow-casting)
+        # Sky mask loss will mark non-sky regions as casts_shadow=1 during training
+        self._casts_shadow = nn.Parameter(torch.zeros(self._xyz.shape[0], device="cuda", dtype=torch.float32).requires_grad_(True))
+        # Restore or initialize AO
+        if ao_data is not None:
+            self._ao = nn.Parameter(ao_data.detach().requires_grad_(self.use_ao))
+        else:
+            self._ao = nn.Parameter(torch.ones(self._xyz.shape[0], 1, device="cuda", dtype=torch.float32).requires_grad_(self.use_ao))
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -286,6 +326,15 @@ class GaussianModel:
         # Clamp to [0, 1] since it's now a learnable parameter
         return torch.clamp(self._casts_shadow, 0.0, 1.0)
 
+    @property
+    def get_ao(self):
+        """Get per-gaussian ambient occlusion [N, 1]. 1=unoccluded, 0=fully occluded."""
+        if self.use_ao:
+            return torch.clamp(self._ao, 0.0, 1.0)
+        else:
+            # AO disabled — return all ones (no occlusion)
+            return torch.ones(self._xyz.shape[0], 1, device=self._xyz.device)
+
     def compute_embedding(self, emb_idx):
         return self.embedding(torch.full((1,),emb_idx).cuda())
 
@@ -344,18 +393,14 @@ class GaussianModel:
             emb_idx, normal_vectors, sun_direction=sun_direction, sun_elevation=sun_elevation
         )
 
-        # Sky gaussians (casts_shadow < 0.5) are emissive — not affected by sun direction or shadows.
-        # Override their lighting to use flat sun intensity (no N·L modulation).
-        # By zeroing ambient/residual and setting direct = sun_int, the manual shadowed
-        # recomposition (direct * shadow_mask + ambient + residual) also stays correct
-        # because shadow_mask = 1 for sky gaussians (set in compute_shadows_for_gaussians).
-        casts_shadow = self.get_casts_shadow  # [N]
-        is_sky = (casts_shadow < 0.5).unsqueeze(-1)  # [N, 1]
-        sun_int_flat = components['sun_color'].unsqueeze(0).expand_as(components['direct'])  # [N, 3]
-        components['direct'] = torch.where(is_sky, sun_int_flat, components['direct'])
-        components['ambient'] = torch.where(is_sky, torch.zeros_like(components['ambient']), components['ambient'])
-        components['residual'] = torch.where(is_sky, torch.zeros_like(components['residual']), components['residual'])
-        components['sky_sh'] = components['residual']  # Keep in sync
+        # Sky gaussians are handled purely by casts_shadow in the shadow map (opacity gating).
+        # All gaussians receive the same physically-based lighting here.
+
+        # Apply ambient occlusion to ambient + sky (not direct sun)
+        ao = self.get_ao  # [N, 1], 1=unoccluded, 0=fully occluded
+        components['ambient'] = components['ambient'] * ao
+        components['residual'] = components['residual'] * ao
+        components['sky_sh'] = components['residual']  # Keep in sync after AO
 
         # Recompute total intensity with sky-overridden components
         intensity_hdr = components['direct'] + components['ambient'] + components['residual']
@@ -400,6 +445,11 @@ class GaussianModel:
         sun_int = torch.clamp(components['sun_color'], min=1e-6).unsqueeze(0)
         ambient_light = components['ambient']
         residual_light = components['residual']
+
+        # Apply ambient occlusion to ambient + sky (not direct sun)
+        ao = self.get_ao  # [N, 1], 1=unoccluded, 0=fully occluded
+        ambient_light = ambient_light * ao
+        residual_light = residual_light * ao
 
         normals_norm = normal_vectors / (torch.norm(normal_vectors, dim=-1, keepdim=True) + 1e-8)
 
@@ -449,23 +499,11 @@ class GaussianModel:
         intensity = torch.clamp_min(intensity_hdr, 1e-5) ** (1 / 2.2)
         rgb = torch.clamp(intensity, 0.0)
 
-        # Sky gaussians (casts_shadow < 0.5) are emissive — bypass all BRDF/lighting modulation.
-        # Their final color is just base_color with gamma correction, independent of sun direction.
-        casts_shadow_flag = self.get_casts_shadow  # [N]
-        is_sky = (casts_shadow_flag < 0.5).unsqueeze(-1)  # [N, 1]
-        sky_intensity_hdr = base_color  # Emissive: use base_color as HDR intensity
-        sky_intensity = torch.clamp_min(sky_intensity_hdr, 1e-5) ** (1 / 2.2)
-        sky_rgb = torch.clamp(sky_intensity, 0.0)
-        intensity_hdr = torch.where(is_sky, sky_intensity_hdr, intensity_hdr)
-        intensity = torch.where(is_sky, sky_intensity, intensity)
-        rgb = torch.where(is_sky, sky_rgb, rgb)
-
-        # Override components so sky gaussians have zero direct (shadow_mask irrelevant)
-        # and all energy in indirect (direction-independent)
-        direct = torch.where(is_sky, torch.zeros_like(direct), direct)
+        # casts_shadow only controls shadow map opacity (whether sun rays pass through).
+        # All gaussians receive the same PBR lighting — no sky/surface blend here.
 
         components['direct_pbr'] = direct
-        components['indirect_pbr'] = torch.where(is_sky, sky_intensity_hdr, indirect + indirect_spec)
+        components['indirect_pbr'] = indirect + indirect_spec
         components['lambert_intensity'] = intensity_hdr_lambert
 
         return rgb, intensity, sun_dir, components
@@ -578,8 +616,10 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        # Initialize all gaussians as shadow-casting (1.0), learnable via sky mask loss
-        self._casts_shadow = nn.Parameter(torch.ones((fused_point_cloud.shape[0],), dtype=torch.float32, device="cuda").requires_grad_(True))
+        # Initialize all gaussians as non-shadow-casting (0.0); sky mask loss will push non-sky toward 1.0
+        self._casts_shadow = nn.Parameter(torch.zeros((fused_point_cloud.shape[0],), dtype=torch.float32, device="cuda").requires_grad_(True))
+        # Initialize ambient occlusion to 1.0 (fully unoccluded), only trained when use_ao
+        self._ao = nn.Parameter(torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float32, device="cuda").requires_grad_(self.use_ao))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
 
@@ -600,7 +640,8 @@ class GaussianModel:
             {'params': [self._albedo], 'lr': training_args.albedo_lr, "name": "albedo"},
             {'params': [self._roughness], 'lr': (training_args.albedo_lr * 0.5) if self.full_pbr else 0.0, "name": "roughness"},
             {'params': [self._metallic], 'lr': (training_args.albedo_lr * 0.5) if self.full_pbr else 0.0, "name": "metallic"},
-            {'params': [self._casts_shadow], 'lr': training_args.opacity_lr, "name": "casts_shadow"}
+            {'params': [self._casts_shadow], 'lr': (training_args.casts_shadow_lr if self.optimize_casts_shadow else training_args.opacity_lr), "name": "casts_shadow"},
+            {'params': [self._ao], 'lr': (training_args.ao_lr if self.use_ao else 0.0), "name": "ao"}
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -621,6 +662,9 @@ class GaussianModel:
             # Add global sky SH parameters if enabled
             if self.sun_model.use_residual_sh:
                 l_env.append({'params': [self.sun_model.sky_sh], 'lr': training_args.env_lr, "name": "sky_sh"})
+            # Add additive sun color bias if enabled
+            if self.sun_model.sun_color_bias is not None:
+                l_env.append({'params': [self.sun_model.sun_color_bias], 'lr': training_args.color_bias_lr, "name": "sun_color_bias"})
         elif self.with_mlp:
             l_env = [{'params': [*self.embedding.parameters()], 'lr': training_args.embedding_lr, "name": "embedding"},
                      {'params': [*self.mlp.parameters()], 'lr': training_args.mlp_lr, "name": "mlp"},
@@ -661,6 +705,7 @@ class GaussianModel:
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
         l.append('casts_shadow')
+        l.append('ao_0')
         return l
 
     def save_ply(self, path):
@@ -679,11 +724,12 @@ class GaussianModel:
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
         casts_shadow = self._casts_shadow.detach().cpu().numpy().reshape(-1, 1)
+        ao = self._ao.detach().cpu().numpy().reshape(-1, 1)
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc_positive, f_rest_positive, f_dc_negative, f_rest_negative, albedo, roughness, metallic, opacities, scale, rotation, casts_shadow), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc_positive, f_rest_positive, f_dc_negative, f_rest_negative, albedo, roughness, metallic, opacities, scale, rotation, casts_shadow, ao), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -782,8 +828,17 @@ class GaussianModel:
             n_sky = int((casts_shadow_vals < 0.5).sum())
             print(f"Loaded _casts_shadow from PLY: {n_sky}/{len(casts_shadow_vals)} sky gaussians")
         else:
-            self._casts_shadow = nn.Parameter(torch.ones((xyz.shape[0],), dtype=torch.float, device="cuda").requires_grad_(False))
-            print("Warning: _casts_shadow not found in PLY, defaulting to all shadow-casting")
+            self._casts_shadow = nn.Parameter(torch.zeros((xyz.shape[0],), dtype=torch.float, device="cuda").requires_grad_(False))
+            print("Warning: _casts_shadow not found in PLY, defaulting to non-shadow-casting (0.0)")
+
+        # Load _ao from PLY if present, otherwise default to 1.0 (unoccluded)
+        ao_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("ao_")]
+        if ao_names:
+            ao_vals = np.asarray(plydata.elements[0]["ao_0"])[..., np.newaxis]
+            self._ao = nn.Parameter(torch.tensor(ao_vals, dtype=torch.float, device="cuda").requires_grad_(self.use_ao))
+            print(f"Loaded _ao from PLY (mean={ao_vals.mean():.3f})")
+        else:
+            self._ao = nn.Parameter(torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda").requires_grad_(self.use_ao))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -838,6 +893,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._casts_shadow = optimizable_tensors["casts_shadow"]
+        if "ao" in optimizable_tensors:
+            self._ao = optimizable_tensors["ao"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -869,16 +926,19 @@ class GaussianModel:
     def densification_postfix(self, new_xyz, new_features_dc_positive, new_features_rest_positive,
                               new_features_dc_negative, new_features_rest_negative,
                               new_albedo, new_opacities, new_scaling, new_rotation, new_casts_shadow=None,
-                              new_roughness=None, new_metallic=None):
-        # Default new gaussians to shadow-casting (1.0)
+                              new_roughness=None, new_metallic=None, new_ao=None):
+        # Default new gaussians to non-shadow-casting (0.0); sky mask loss will push non-sky toward 1.0
         if new_casts_shadow is None:
-            new_casts_shadow = torch.ones(new_xyz.shape[0], device="cuda", dtype=torch.float32)
+            new_casts_shadow = torch.zeros(new_xyz.shape[0], device="cuda", dtype=torch.float32)
         if new_roughness is None:
             new_roughness = torch.full((new_xyz.shape[0], 1), 0.6, device="cuda", dtype=torch.float32)
         if new_metallic is None:
             new_metallic = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        if new_ao is None:
+            new_ao = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
         new_roughness = new_roughness.requires_grad_(self.full_pbr)
         new_metallic = new_metallic.requires_grad_(self.full_pbr)
+        new_ao = new_ao.requires_grad_(self.use_ao)
 
         d = {"xyz": new_xyz,
         "f_dc_positive": new_features_dc_positive,
@@ -891,7 +951,8 @@ class GaussianModel:
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation,
-        "casts_shadow": new_casts_shadow}
+        "casts_shadow": new_casts_shadow,
+        "ao": new_ao}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -908,6 +969,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._casts_shadow = optimizable_tensors["casts_shadow"]
+        if "ao" in optimizable_tensors:
+            self._ao = optimizable_tensors["ao"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -1038,14 +1101,17 @@ class GaussianModel:
         new_roughness = mean_roughness.expand(n_new, -1).clone()
         new_metallic = mean_metallic.expand(n_new, -1).clone()
 
-        # Shadow casting: default on
-        new_casts_shadow = torch.ones(n_new, device=device)
+        # Shadow casting: default off (sky mask loss will push non-sky toward 1.0)
+        new_casts_shadow = torch.zeros(n_new, device=device)
+        # AO: default unoccluded
+        new_ao = torch.ones(n_new, 1, device=device)
 
         self.densification_postfix(
             new_xyz, new_features_dc_pos, new_features_rest_pos,
             new_features_dc_neg, new_features_rest_neg,
             new_albedo, new_opacity, new_scaling, new_rotation,
-            new_casts_shadow, new_roughness=new_roughness, new_metallic=new_metallic
+            new_casts_shadow, new_roughness=new_roughness, new_metallic=new_metallic,
+            new_ao=new_ao
         )
 
         print(f"[Adaptive Densification] Added {n_new} Gaussians across "
@@ -1078,8 +1144,9 @@ class GaussianModel:
         new_metallic = self._metallic[selected_pts_mask].repeat(N,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_casts_shadow = self._casts_shadow[selected_pts_mask].repeat(N)  # Inherit shadow-casting from parent
+        new_ao = self._ao[selected_pts_mask].repeat(N, 1)  # Inherit AO from parent
 
-        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacity, new_scaling, new_rotation, new_casts_shadow, new_roughness=new_roughness, new_metallic=new_metallic)
+        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacity, new_scaling, new_rotation, new_casts_shadow, new_roughness=new_roughness, new_metallic=new_metallic, new_ao=new_ao)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -1102,8 +1169,9 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_casts_shadow = self._casts_shadow[selected_pts_mask]  # Inherit shadow-casting from parent
+        new_ao = self._ao[selected_pts_mask]  # Inherit AO from parent
 
-        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacities, new_scaling, new_rotation, new_casts_shadow, new_roughness=new_roughness, new_metallic=new_metallic)
+        self.densification_postfix(new_xyz, new_features_dc_positive, new_features_rest_positive,new_features_dc_negative, new_features_rest_negative, new_albedo, new_opacities, new_scaling, new_rotation, new_casts_shadow, new_roughness=new_roughness, new_metallic=new_metallic, new_ao=new_ao)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
 

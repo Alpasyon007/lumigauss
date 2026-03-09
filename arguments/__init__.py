@@ -61,10 +61,15 @@ class ModelParams(ParamGroup):
         self.N_a = 24
         # Sun position parameters - explicit directional lighting with sun color prior
         self.use_sun = False  # Enable physical sun model with explicit directional lighting
+        self.use_ao = False  # Enable per-Gaussian learnable ambient occlusion (modulates ambient+sky)
+        self.use_manhattan = False  # Enable relaxed Manhattan world prior on surfel normals
+        self.use_color_bias = False  # Enable learnable additive sun color bias (corrects Nishita prior)
+        self.optimize_casts_shadow = False  # Allow per-Gaussian casts_shadow to be optimised through photometric loss
         self.full_pbr = False  # Enable full PBR shading path (guarded, use with --use_sun)
         self.sun_json_path = ""  # Path to JSON file with sun positions per image
         self.sky_mask_path = ""  # Path to folder with sky masks (black=sky, white=not sky)
         self.use_residual_sh = True  # Use global sky SH for environment (enables relighting)
+        self.sky_sh_degree = 1  # Degree of SH for global sky model (0=DC only, 1=4 coeffs, 2=9 coeffs)
         # Camera calibration refinement (jointly optimise camera poses during training)
         self.use_cam_cal = False  # Enable learnable camera pose refinement
         # Sun direction calibration (jointly optimise per-image sun directions during training)
@@ -76,6 +81,7 @@ class ModelParams(ParamGroup):
         self.shadow_method = "shadow_map"
         self.shadow_map_resolution = 512  # Resolution for shadow mapping
         self.shadow_bias = 0.1  # Depth bias for shadow comparison
+        self.shadow_sharpness = 50.0  # Sigmoid sharpness for soft shadow transition (higher=harder edges)
         self.ray_march_steps = 64  # Number of steps for ray marching
         self.voxel_resolution = 128  # Resolution for voxel grid
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -96,30 +102,30 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 40_000
-        self.position_lr_init = 0.00016
-        self.position_lr_final = 0.0000016
-        self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30_000
-        self.feature_lr = 0.002 # for SH_gauss
-        self.opacity_lr = 0.05
-        self.scaling_lr = 0.005
-        self.rotation_lr = 0.001
-        self.percent_dense = 0.01
-        self.lambda_dssim = 0.2
-        self.opacity_cull = 0.05
-        self.lambda_dist = 0.01
-        self.lambda_normal = 0.05
+        self.iterations = 40_000              # Total training iterations. Higher: better convergence but slower; Lower: faster but under-trained
+        self.position_lr_init = 0.00016        # Initial learning rate for Gaussian positions. Higher: faster movement but may overshoot; Lower: slower, more stable placement
+        self.position_lr_final = 0.0000016     # Final position LR (decays from init to this). Higher: positions keep moving late in training; Lower: positions freeze earlier
+        self.position_lr_delay_mult = 0.01     # Multiplier delaying position LR warmup. Higher: slower ramp-up (more cautious early movement); Lower: positions move freely from start
+        self.position_lr_max_steps = 30_000    # Iteration at which position LR reaches final value. Higher: slower decay (positions adjust longer); Lower: faster decay (positions lock in sooner)
+        self.feature_lr = 0.002                # Learning rate for SH_gauss (view-dependent color). Higher: faster color fitting but may overfit to views; Lower: slower, more consistent colors
+        self.opacity_lr = 0.05                 # Learning rate for Gaussian opacity. Higher: faster opacity changes (quicker pruning/solidifying); Lower: slower, more gradual transparency changes
+        self.scaling_lr = 0.005                # Learning rate for Gaussian scale. Higher: Gaussians resize faster (risk of blobs); Lower: sizes change slowly (more stable geometry)
+        self.rotation_lr = 0.001               # Learning rate for Gaussian rotation quaternions. Higher: faster orientation changes; Lower: more stable surfel orientations
+        self.percent_dense = 0.01              # Fraction of scene extent used as densification threshold. Higher: more Gaussians cloned/split (denser, more memory); Lower: fewer splits (sparser)
+        self.lambda_dssim = 0.2                # Weight of SSIM loss vs L1. Higher: prioritises structural similarity (sharper edges); Lower: prioritises pixel-wise accuracy (smoother)
+        self.opacity_cull = 0.05               # Opacity below which Gaussians are pruned. Higher: more aggressive pruning (fewer Gaussians); Lower: keeps more transparent Gaussians
+        self.lambda_dist = 0.01                # Weight for depth distortion regularization. Higher: flatter/thinner surfels (less overlap); Lower: allows more depth spread
+        self.lambda_normal = 0.05              # Weight for normal consistency regularization. Higher: smoother normals (less noise); Lower: allows sharper normal variation
 
-        self.start_shadowed = 20500
-        self.warmup = 20000
+        self.start_shadowed = 1000             # Iteration to start using shadowed image loss. Higher: longer unshadowed-only warmup (stabler geometry); Lower: shadows influence training earlier
+        self.warmup = 500                      # Iterations of linear loss weight ramp-up for shadowed loss. Higher: gentler transition (less shock); Lower: sharper switch to full shadow loss
 
-        self.start_regularization = 6000
-        self.densification_interval = 500
-        self.opacity_reset_interval = 3000
-        self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
-        self.densify_grad_threshold = 0.0002
+        self.start_regularization = 6000       # Iteration to start geometry regularization (dist/normal). Higher: geometry freely forms first; Lower: regularization constrains geometry earlier
+        self.densification_interval = 500      # Iterations between densification attempts. Higher: less frequent splits/clones (slower growth); Lower: more frequent (faster coverage, more memory)
+        self.opacity_reset_interval = 3000     # Iterations between opacity resets (all opacities pushed low). Higher: less frequent resets (stable but may keep floaters); Lower: more aggressive cleanup
+        self.densify_from_iter = 500           # Iteration to start densification. Higher: delays splitting (lets initial points settle); Lower: starts filling gaps sooner
+        self.densify_until_iter = 15_000       # Iteration to stop densification. Higher: keeps adding Gaussians longer (more detail, more memory); Lower: freezes count earlier (faster late training)
+        self.densify_grad_threshold = 0.0002   # Gradient magnitude threshold for densification. Higher: fewer Gaussians split (only high-error regions); Lower: more splits (denser, more memory)
 
         # Adaptive grid-based densification (populates empty high-loss regions)
         self.use_adaptive_dens = False
@@ -175,9 +181,11 @@ class OptimizationParams(ParamGroup):
         self.cam_cal_from_iter = 500    # Start camera calibration after this iteration
         self.cam_cal_until_iter = 20000 # Stop camera calibration at this iteration
         # Sun direction calibration learning rates
-        self.sun_cal_lr = 0.001         # Learning rate for sun direction deltas
-        self.sun_cal_from_iter = 500    # Start sun calibration after this iteration
+        #self.sun_cal_lr = 0.001         # Learning rate for sun direction deltas
+        self.sun_cal_lr = 0.1
+        self.sun_cal_from_iter = 10000    # Start sun calibration after this iteration
         self.sun_cal_until_iter = 30000 # Stop sun calibration at this iteration
+        self.sun_cal_reg_lambda = 0.0001  # L2 regularization pulling delta_sun_dir toward zero (higher = tighter to input)
 
         self.gauss_loss_lambda = 0.001
         self.env_loss_lambda = 0.05
@@ -185,6 +193,24 @@ class OptimizationParams(ParamGroup):
         self.consistency_loss_lambda_final_ratio = 1.0
         self.shadow_loss_lambda=10.0
         self.sky_mask_loss_weight = 0.5
+
+        # Ambient occlusion parameters (only active when --use_ao is set)
+        self.ao_lr = 0.002             # Learning rate for per-Gaussian AO parameter
+        self.ao_reg_lambda = 0.01      # Regularization weight: penalises AO deviating from 1 (unoccluded)
+        self.ao_from_iter = 500        # Iteration to start optimising AO (let geometry settle first)
+
+        # Relaxed Manhattan world prior (encourages surfel normals to align with world axes)
+        self.manhattan_lambda = 0.01   # Weight for Manhattan normal alignment loss
+        self.manhattan_from_iter = 7000  # Start after geometry has settled (needs stable normals)
+
+        # Learnable per-Gaussian casts_shadow (only active when --optimize_casts_shadow is set)
+        self.casts_shadow_lr = 0.005        # Learning rate for per-Gaussian casts_shadow flag
+        self.casts_shadow_reg_lambda = 0.01 # L2 regularization pulling casts_shadow toward 1.0 (most gaussians should cast)
+        self.casts_shadow_from_iter = 1000  # Start optimising casts_shadow after geometry settles
+
+        # Additive sun color bias (only active when --use_color_bias is set)
+        self.color_bias_lr = 0.005     # Learning rate for per-image additive sun color bias
+        self.color_bias_reg_lambda = 0.01  # L2 regularization toward zero (keeps bias small)
 
         super().__init__(parser, "Optimization Parameters")
 

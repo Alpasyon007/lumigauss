@@ -169,7 +169,10 @@ def render_set(dataset: ModelParams, iteration: int, pipeline: PipelineParams,
         dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
         use_sun=True, n_images=1700,
         use_residual_sh=dataset.use_residual_sh,
-        full_pbr=dataset.full_pbr
+        full_pbr=dataset.full_pbr, use_ao=dataset.use_ao,
+        sky_sh_degree=dataset.sky_sh_degree,
+        use_color_bias=dataset.use_color_bias,
+        optimize_casts_shadow=dataset.optimize_casts_shadow
     )
 
     scene = Scene(dataset, gaussians, load_iteration=iteration)
@@ -416,7 +419,7 @@ def render_set(dataset: ModelParams, iteration: int, pipeline: PipelineParams,
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Test sun-based models with GT env map protocol")
-    model = ModelParams(parser)
+    model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     opt = OptimizationParams(parser)
 

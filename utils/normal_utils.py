@@ -8,7 +8,7 @@ def quat_to_rot(q):
     batch_size, _ = q.shape
     q = F.normalize(q, dim=1)
     R = torch.zeros((batch_size, 3,3)).cuda()
-    
+
     qr=q[:,0]
     qi = q[:, 1]
     qj = q[:, 2]
@@ -53,4 +53,38 @@ def compute_normal_world_space(quaternions, scales, viewmat, points_world):
     tn*=multiplier.unsqueeze(1)
     normal_vectors = tn / (tn.norm(dim=1, keepdim=True)+0.000001)
     return normal_vectors, multiplier
+
+
+# ---- Relaxed Manhattan World Prior ----
+# Manhattan axes for Z-up coordinate system
+_MANHATTAN_AXES = None  # lazily created on correct device
+
+def _get_manhattan_axes(device):
+    """Return [3, 3] tensor of Manhattan world axes (rows = axes), cached per device."""
+    global _MANHATTAN_AXES
+    if _MANHATTAN_AXES is None or _MANHATTAN_AXES.device != device:
+        _MANHATTAN_AXES = torch.eye(3, device=device)  # [[1,0,0],[0,1,0],[0,0,1]]
+    return _MANHATTAN_AXES
+
+
+def manhattan_loss(normals: torch.Tensor) -> torch.Tensor:
+    """Relaxed Manhattan world prior on surfel normals.
+
+    Encourages each normal to align with its nearest Manhattan axis (X, Y, or Z).
+    For each normal n_i the loss contribution is  1 - max_k (n_i · a_k)^2,
+    which is zero when the normal is perfectly axis-aligned and 1 at 45°.
+
+    Args:
+        normals: [N, 3] unit normals in world space (gradients flow through
+                 quaternion / scale via compute_normal_world_space).
+
+    Returns:
+        Scalar mean loss (already reduced).
+    """
+    axes = _get_manhattan_axes(normals.device)  # [3, 3]
+    # dots[i, k] = n_i · a_k   →  [N, 3]
+    dots = normals @ axes.T
+    # Best squared alignment per Gaussian
+    max_cos2, _ = (dots * dots).max(dim=1)  # [N]
+    return (1.0 - max_cos2).mean()
 

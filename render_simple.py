@@ -265,7 +265,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             # Temporary n_images - will be updated after Scene creation
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
                                        use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh,
-                                       full_pbr=dataset.full_pbr)
+                                       full_pbr=dataset.full_pbr, use_ao=dataset.use_ao,
+                                       sky_sh_degree=dataset.sky_sh_degree,
+                                       use_color_bias=dataset.use_color_bias,
+                                       optimize_casts_shadow=dataset.optimize_casts_shadow)
         else:
             gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
@@ -305,7 +308,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")
-    model = ModelParams(parser)
+    model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--appearance_list", type=str, default = '')

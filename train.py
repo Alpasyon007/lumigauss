@@ -25,7 +25,7 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import json
 import os
-from utils.normal_utils import compute_normal_world_space
+from utils.normal_utils import compute_normal_world_space, manhattan_loss
 from utils.loss_utils import compute_sh_gauss_losses, compute_sh_env_loss
 from utils.train_utils import (
     prepare_output_and_logger, training_report, update_lambdas,
@@ -38,7 +38,7 @@ from utils.depth_est_utils import precompute_depth_maps, scale_invariant_depth_l
 
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, test_config_path=None):
     assert opt.warmup <= opt.start_shadowed
 
     first_iter = 0
@@ -51,7 +51,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # This will be set properly after Scene is created
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
                                    use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh,
-                                   full_pbr=dataset.full_pbr)  # Temporary, will be reset
+                                   full_pbr=dataset.full_pbr, use_ao=dataset.use_ao,
+                                   sky_sh_degree=dataset.sky_sh_degree,
+                                   use_color_bias=dataset.use_color_bias,
+                                   optimize_casts_shadow=dataset.optimize_casts_shadow)  # Temporary, will be reset
     else:
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
@@ -278,6 +281,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     method=shadow_method,
                     shadow_map_resolution=dataset.shadow_map_resolution,
                     shadow_bias=dataset.shadow_bias,
+                    shadow_sharpness=dataset.shadow_sharpness,
                     ray_march_steps=dataset.ray_march_steps,
                     voxel_resolution=dataset.voxel_resolution,
                     device="cuda"
@@ -366,6 +370,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if sky_dc > ambient.mean() * 0.5:
                     sun_reg_loss = sun_reg_loss + 0.05 * (sky_dc - ambient.mean() * 0.5) ** 2
 
+            # 4. Regularize additive sun color bias toward zero (keep it small)
+            if gaussians.sun_model.sun_color_bias is not None:
+                bias = gaussians.sun_model.sun_color_bias[emb_idx]  # [3]
+                sun_reg_loss = sun_reg_loss + opt.color_bias_reg_lambda * (bias ** 2).mean()
+
         # Sky mask loss: train _casts_shadow to match sky mask via rendering
         sky_mask_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
         if sky_masks and gaussians.use_sun and viewpoint_cam.image_name in sky_masks:
@@ -425,9 +434,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sun_cal_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
         if (dataset.use_sun_cal and scene.sun_cal_enabled
                 and iteration >= opt.sun_cal_from_iter and iteration <= opt.sun_cal_until_iter):
-            sun_cal_reg_loss = 0.01 * (viewpoint_cam.delta_sun_dir.norm() ** 2)
+            sun_cal_reg_loss = opt.sun_cal_reg_lambda * (viewpoint_cam.delta_sun_dir.norm() ** 2)
 
-        total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss + sky_mask_loss + depth_est_loss + cam_cal_reg_loss + sun_cal_reg_loss
+        # Ambient occlusion regularization: bias AO toward 1 (unoccluded)
+        # This is L_aor from SOL-NeRF: penalise deviation from 1.0 so AO only
+        # activates where the photometric loss truly needs it.
+        ao_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
+        if gaussians.use_ao and iteration >= opt.ao_from_iter:
+            ao_vals = gaussians.get_ao  # [N, 1]
+            ao_reg_loss = opt.ao_reg_lambda * ((ao_vals - 1.0) ** 2).mean()
+
+        # Relaxed Manhattan world prior: encourage surfel normals to align with
+        # one of the three orthogonal world axes (X, Y, Z-up). Gradients flow
+        # through quaternion/scale so the surfels physically reorient.
+        manhattan_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
+        if dataset.use_manhattan and iteration >= opt.manhattan_from_iter:
+            manhattan_reg_loss = opt.manhattan_lambda * manhattan_loss(normal_vectors)
+
+        # Learnable casts_shadow regularization: bias casts_shadow toward 0.0 (default non-casting)
+        # Sky mask loss promotes non-sky gaussians to 1.0; this reg prevents drift for unmasked gaussians
+        casts_shadow_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
+        if gaussians.optimize_casts_shadow and iteration >= opt.casts_shadow_from_iter:
+            cs_vals = gaussians.get_casts_shadow  # [N]
+            casts_shadow_reg_loss = opt.casts_shadow_reg_lambda * (cs_vals ** 2).mean()
+
+        total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss + sky_mask_loss + depth_est_loss + cam_cal_reg_loss + sun_cal_reg_loss + ao_reg_loss + manhattan_reg_loss + casts_shadow_reg_loss
 
         # Only backward if we have a loss with gradients
         if torch.is_tensor(total_loss) and total_loss.requires_grad:
@@ -457,6 +488,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     sun_reg_loss=sun_reg_loss,
                     sky_mask_loss=sky_mask_loss,
                     depth_est_loss=depth_est_loss,
+                    ao_reg_loss=ao_reg_loss,
+                    manhattan_loss=manhattan_reg_loss,
+                    casts_shadow_reg_loss=casts_shadow_reg_loss,
                     total_loss=total_loss
                 )
 
@@ -495,6 +529,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_dict["CamCal"] = f"{_val(cam_cal_reg_loss):.5f}"
                 if dataset.use_sun_cal and scene.sun_cal_enabled:
                     loss_dict["SunCal"] = f"{_val(sun_cal_reg_loss):.5f}"
+                if gaussians.use_ao:
+                    loss_dict["AO_reg"] = f"{_val(ao_reg_loss):.5f}"
+                if dataset.use_manhattan:
+                    loss_dict["Manhattan"] = f"{_val(manhattan_reg_loss):.5f}"
+                if gaussians.optimize_casts_shadow:
+                    loss_dict["CastsShadow"] = f"{_val(casts_shadow_reg_loss):.5f}"
 
                 print(loss_dict)
 
@@ -504,7 +544,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             psnr_metric = training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background),
                                           appearance_lut=appearance_lut, source_path=dataset.source_path, sky_masks=sky_masks,
-                                          metrics_logger=metrics_logger)
+                                          metrics_logger=metrics_logger, test_config_path=test_config_path)
 
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -740,7 +780,7 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    iter_list = [1, 1000, 5000, 7500, *list(range(10000, 1000001, 2500))] #[30000]
+    iter_list = [1, 500, 1000, 1500, 2000, *list(range(2500, 1000001, 2500))] #[30000]
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
@@ -749,6 +789,9 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=iter_list)
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--test_config", type=str, default=None,
+                        help="Path to test config directory (containing test_config.py) "
+                             "for eval_masked metrics using test_gt_env_map protocol")
     args = parser.parse_args(sys.argv[1:])
 
     args.save_iterations.append(args.iterations)
@@ -763,7 +806,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(False) #args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, test_config_path=args.test_config)
 
     # All done
     print("\nTraining complete.")

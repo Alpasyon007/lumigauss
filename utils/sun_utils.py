@@ -283,7 +283,8 @@ class SunModel(torch.nn.Module):
     """
 
     def __init__(self, n_images: int, device: str = "cuda",
-                 use_residual_sh: bool = True, sh_degree: int = 1):
+                 use_residual_sh: bool = True, sh_degree: int = 1,
+                 use_color_bias: bool = False):
         """
         Initialize the directional sun model with sun color prior.
 
@@ -292,12 +293,14 @@ class SunModel(torch.nn.Module):
             device: Device to store tensors on.
             use_residual_sh: Whether to use global sky SH (kept for API compatibility).
             sh_degree: Degree of spherical harmonics (default 1 = 4 coefficients for global sky).
+            use_color_bias: Whether to learn an additive RGB bias on top of the Nishita sun color prior.
         """
         super().__init__()
 
         self.n_images = n_images
         self.device = device
         self.use_residual_sh = use_residual_sh
+        self.use_color_bias = use_color_bias
         self.sh_degree = sh_degree
         self.n_sh_coeffs = (sh_degree + 1) ** 2  # 4 for degree 1
 
@@ -337,6 +340,17 @@ class SunModel(torch.nn.Module):
 
             self.sky_sh = nn.Parameter(init_sh)
             print(f"SunModel: Using GLOBAL sky SH with {self.n_sh_coeffs} coefficients (degree {sh_degree})")
+
+        # Learnable additive sun color bias per image (correction to Nishita prior)
+        # Initialized to zero = no bias. Gated by use_color_bias flag.
+        # Shape: [n_images, 3]
+        if use_color_bias:
+            self.sun_color_bias = nn.Parameter(
+                torch.zeros(self.n_images, 3, device=device)
+            )
+            print(f"SunModel: Using learnable additive sun color bias")
+        else:
+            self.sun_color_bias = None
 
         # Keep legacy attribute for compatibility
         self.sun_intensity = self.sun_intensity_multiplier  # Alias
@@ -422,6 +436,10 @@ class SunModel(torch.nn.Module):
         color_correction = torch.clamp(self.sun_color_correction[image_idx], min=0.5, max=2.0)
         sun_color = sun_color_prior * color_correction  # [3]
 
+        # Apply additive color bias (captures atmospheric effects not in Nishita model)
+        if self.sun_color_bias is not None:
+            sun_color = sun_color + self.sun_color_bias[image_idx]  # [3]
+
         # Get intensity multiplier and ambient
         intensity_mult = torch.clamp(self.sun_intensity_multiplier[image_idx], min=0.01)  # [1]
         sun_int = sun_color * intensity_mult  # [3]
@@ -470,8 +488,11 @@ class SunModel(torch.nn.Module):
             sun_elevation = 45.0
         sun_color_prior = compute_sun_color_from_elevation(sun_elevation, self.device)
         color_correction = torch.clamp(self.sun_color_correction[image_idx], min=0.5, max=2.0)
+        sun_color = sun_color_prior * color_correction
+        if self.sun_color_bias is not None:
+            sun_color = sun_color + self.sun_color_bias[image_idx]
         intensity_mult = torch.clamp(self.sun_intensity_multiplier[image_idx], min=0.01)
-        return sun_color_prior * color_correction * intensity_mult
+        return sun_color * intensity_mult
 
     def get_ambient(self, image_idx: int) -> torch.Tensor:
         """Get the ambient color for a specific image."""
