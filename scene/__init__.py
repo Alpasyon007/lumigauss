@@ -57,9 +57,11 @@ class Scene:
 
         # Get sun_json_path if available
         sun_json_path = getattr(args, 'sun_json_path', None)
+        use_sun = getattr(args, 'use_sun', False)
+        eval_config_path = getattr(args, 'eval_config_path', None)
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.eval_file, sun_json_path=sun_json_path)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.eval_file, sun_json_path=sun_json_path, use_sun=use_sun, eval_config_path=eval_config_path)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args.eval_file)
@@ -108,8 +110,25 @@ class Scene:
                 # Setup sun_model with correct n_images before loading checkpoint
                 n_images = len(scene_info.train_cameras)
                 self.gaussians.n_images = n_images
+
+                # Auto-detect checkpoint mode and sky SH degree from saved keys
+                sun_ckpt = torch.load(self.model_path + "/chkpnt_sun" + str(self.loaded_iter) + ".pth", weights_only=True)
+                ckpt_scene_sh = "intensity_sh" in sun_ckpt
+                ckpt_sky_degree = self.gaussians.sky_sh_degree
+                if "sky_sh" in sun_ckpt:
+                    n_coeffs = sun_ckpt["sky_sh"].shape[1]
+                    ckpt_sky_degree = int(n_coeffs ** 0.5) - 1
+
+                if ckpt_scene_sh != self.gaussians.scene_lighting_sh:
+                    mode = "scene-global SH" if ckpt_scene_sh else "per-image"
+                    print(f"Note: checkpoint uses {mode} mode, reconfiguring SunModel to match")
+                    self.gaussians.scene_lighting_sh = ckpt_scene_sh
+                if ckpt_sky_degree != self.gaussians.sky_sh_degree:
+                    print(f"Note: checkpoint sky_sh degree={ckpt_sky_degree}, reconfiguring (was {self.gaussians.sky_sh_degree})")
+                    self.gaussians.sky_sh_degree = ckpt_sky_degree
+
                 self.gaussians.setup_sun_model()
-                self.gaussians.sun_model.load_state_dict(torch.load(self.model_path + "/chkpnt_sun" + str(self.loaded_iter) + ".pth", weights_only=True))
+                self.gaussians.sun_model.load_state_dict(sun_ckpt)
             elif self.gaussians.with_mlp:
                 self.gaussians.mlp.load_state_dict(torch.load(self.model_path + "/chkpnt_mlp" + str(self.loaded_iter) + ".pth", weights_only=True))
                 self.gaussians.embedding.load_state_dict(torch.load(self.model_path + "/chkpnt_embedding" + str(self.loaded_iter) + ".pth", weights_only=True))

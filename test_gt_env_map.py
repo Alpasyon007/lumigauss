@@ -37,6 +37,33 @@ import json
 TINY_NUMBER = 1e-6
 
 
+def rebase_config_path(path, config_dir):
+    """Rebase an absolute path from test_config.py to be relative to config_dir.
+
+    Config files from the original authors may contain hardcoded absolute paths
+    (e.g. /home/jk/...). This extracts the portion after 'eval_files/' and
+    reconstructs it relative to config_dir (which IS the eval_files directory).
+    If the file already exists at the given path, it's returned unchanged.
+    """
+    if os.path.isfile(path):
+        return path
+    # Try to find 'eval_files/' in the path and take everything after it
+    marker = 'eval_files' + os.sep
+    alt_marker = 'eval_files/'
+    for m in (marker, alt_marker):
+        idx = path.find(m)
+        if idx != -1:
+            relative = path[idx + len(m):]
+            rebased = os.path.join(config_dir, relative)
+            if os.path.isfile(rebased):
+                return rebased
+    # Last resort: just the basename in config_dir
+    basename_path = os.path.join(config_dir, os.path.basename(path))
+    if os.path.isfile(basename_path):
+        return basename_path
+    return path  # Return original so the downstream error is clear
+
+
 def process_environment_map_image(img_path, scale_high, threshold):
 
     img = plt.imread(img_path)
@@ -58,7 +85,9 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
         # Temporary n_images - will be updated after Scene creation
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
                                    use_sun=True, n_images=1700, use_residual_sh=dataset.use_residual_sh,
-                                   full_pbr=dataset.full_pbr)
+                                   full_pbr=dataset.full_pbr,
+                                   scene_lighting_sh=dataset.scene_lighting_sh,
+                                   sky_sh_degree=dataset.sky_sh_degree)
     else:
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
@@ -105,8 +134,8 @@ def render_set(dataset : ModelParams, iteration : int, pipeline : PipelineParams
         print(viewpoint_cam.image_name)
 
         image_config = config[viewpoint_cam.image_name]
-        mask_path = image_config["mask_path"]
-        envmap_img_path = image_config["env_map_path"]
+        mask_path = rebase_config_path(image_config["mask_path"], test_config)
+        envmap_img_path = rebase_config_path(image_config["env_map_path"], test_config)
         init_rot_x = image_config["initial_env_map_rotation"]["x"]
         init_rot_y = image_config["initial_env_map_rotation"]["y"]
         init_rot_z = image_config["initial_env_map_rotation"]["z"]

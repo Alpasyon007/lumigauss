@@ -20,17 +20,12 @@
 \newlabel{sec:related}{{II}{1}{Related Work}{section.2}{}}
 \@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {II-}0a}Neural Scene Relighting.}{1}{paragraph.2.0.0.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {II-}0b}Outdoor Illumination Modeling.}{1}{paragraph.2.0.0.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {II-}0c}Shadow Computation.}{1}{paragraph.2.0.0.3}\protected@file@percent }
 \citation{huang20242dgs}
 \citation{joaxkal2024lumigauss}
-\citation{kerbl20233dgs}
-\citation{ye2024absgs}
-\citation{bulo2024revising}
 \citation{huang20242dgs}
 \citation{joaxkal2024lumigauss}
-\citation{williams1978casting}
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {II-}0c}Shadow Computation.}{2}{paragraph.2.0.0.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {II-}0d}2D Gaussian Splatting.}{2}{paragraph.2.0.0.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {II-}0e}Adaptive Densification.}{2}{paragraph.2.0.0.5}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {III}Method}{2}{section.3}\protected@file@percent }
 \newlabel{sec:method}{{III}{2}{Method}{section.3}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-A}}Explicit Directional Sun Model}{2}{subsection.3.1}\protected@file@percent }
@@ -38,62 +33,52 @@
 \newlabel{eq:lighting}{{1}{2}{Explicit Directional Sun Model}{equation.1}{}}
 \@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-A}0a}Sun color prior $C_{\text  {sun}}(\theta )$.}{2}{paragraph.3.1.0.1}\protected@file@percent }
 \newlabel{eq:sun_color}{{2}{2}{Sun color prior $C_{\text {sun}}(\theta )$}{equation.2}{}}
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-A}0b}Per-image parameters.}{2}{paragraph.3.1.0.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-A}0b}Scene-global SH lighting parameters.}{2}{paragraph.3.1.0.2}\protected@file@percent }
+\newlabel{eq:scene_sh_int}{{4}{2}{Scene-global SH lighting parameters}{equation.4}{}}
+\newlabel{eq:scene_sh_col}{{5}{2}{Scene-global SH lighting parameters}{equation.5}{}}
+\newlabel{eq:scene_sh_amb}{{6}{2}{Scene-global SH lighting parameters}{equation.6}{}}
 \@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-A}0c}Global sky SH.}{2}{paragraph.3.1.0.3}\protected@file@percent }
-\newlabel{eq:sky_sh}{{3}{2}{Global sky SH}{equation.3}{}}
+\newlabel{eq:sky_sh}{{7}{2}{Global sky SH}{equation.7}{}}
 \@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-A}0d}Final per-Gaussian color.}{2}{paragraph.3.1.0.4}\protected@file@percent }
-\newlabel{eq:final_color}{{4}{2}{Final per-Gaussian color}{equation.4}{}}
+\newlabel{eq:final_color}{{8}{2}{Final per-Gaussian color}{equation.8}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-B}}Surface Normals from Surfel Geometry}{2}{subsection.3.2}\protected@file@percent }
 \newlabel{sec:normals}{{\mbox  {III-B}}{2}{Surface Normals from Surfel Geometry}{subsection.3.2}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-C}}Shadow Computation}{2}{subsection.3.3}\protected@file@percent }
-\newlabel{sec:shadows}{{\mbox  {III-C}}{2}{Shadow Computation}{subsection.3.3}{}}
-\newlabel{eq:shadowed}{{7}{2}{Shadow Computation}{equation.7}{}}
-\newlabel{sec:shadow_map}{{\mbox  {III-C}1}{2}{Shadow Mapping}{subsubsection.3.3.1}{}}
-\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-C}1}Shadow Mapping}{2}{subsubsection.3.3.1}\protected@file@percent }
-\citation{kerbl20233dgs}
+\citation{williams1978casting}
+\citation{yu2021outdoor}
+\citation{philip2019multiview}
+\citation{rudnev2022nerfOSR}
+\citation{rudnev2022nerfOSR}
+\citation{jin2023tensoir}
+\citation{fegr2024}
+\citation{solnerf2024}
+\citation{neusky2024}
+\citation{joaxkal2024lumigauss}
+\citation{meeus1991astronomical}
+\citation{rudnev2022nerfOSR}
 \@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Overview of the \textsc  {SunGauss}{} pipeline. Per-Gaussian normals from the surfel orientation are used for Lambert shading with the sun direction. A shadow map rendered from an orthographic sun camera provides per-Gaussian shadow masks. The shadowed direct light, ambient, and sky SH components are composed and multiplied by learned albedo to produce the final image.}}{3}{figure.caption.1}\protected@file@percent }
 \providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
 \newlabel{fig:pipeline}{{1}{3}{Overview of the \ours {} pipeline. Per-Gaussian normals from the surfel orientation are used for Lambert shading with the sun direction. A shadow map rendered from an orthographic sun camera provides per-Gaussian shadow masks. The shadowed direct light, ambient, and sky SH components are composed and multiplied by learned albedo to produce the final image}{figure.caption.1}{}}
-\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-C}2}Volumetric Ray Marching}{3}{subsubsection.3.3.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-C}3}Voxel-Based Tracing}{3}{subsubsection.3.3.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-D}}Learnable Sky-Scene Distinction}{3}{subsection.3.4}\protected@file@percent }
-\newlabel{sec:sky_mask}{{\mbox  {III-D}}{3}{Learnable Sky-Scene Distinction}{subsection.3.4}{}}
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-D}0a}Supervision.}{3}{paragraph.3.4.0.1}\protected@file@percent }
-\newlabel{eq:sky_loss}{{10}{3}{Supervision}{equation.10}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-E}}Adaptive Loss-Driven Densification}{3}{subsection.3.5}\protected@file@percent }
-\newlabel{sec:adaptive_dens}{{\mbox  {III-E}}{3}{Adaptive Loss-Driven Densification}{subsection.3.5}{}}
-\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-E}1}Loss Accumulation in 3D}{3}{subsubsection.3.5.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-E}1a}High-frequency boosting.}{3}{paragraph.3.5.1.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-E}1b}Hole filling.}{3}{paragraph.3.5.1.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-E}2}Triggering and Budget Allocation}{3}{subsubsection.3.5.2}\protected@file@percent }
-\citation{huang20242dgs}
-\citation{meeus1991astronomical}
-\citation{rudnev2022nerfOSR}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-C}}Shadow Computation}{3}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:shadows}{{\mbox  {III-C}}{3}{Shadow Computation}{subsection.3.3}{}}
+\newlabel{eq:shadowed}{{11}{3}{Shadow Computation}{equation.11}{}}
+\newlabel{sec:shadow_map}{{\mbox  {III-C}1}{3}{Shadow Mapping}{subsubsection.3.3.1}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {III-C}1}Shadow Mapping}{3}{subsubsection.3.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-D}}Learnable Sun Direction Calibration}{3}{subsection.3.4}\protected@file@percent }
+\newlabel{sec:sun_cal}{{\mbox  {III-D}}{3}{Learnable Sun Direction Calibration}{subsection.3.4}{}}
+\newlabel{eq:sun_cal}{{13}{3}{Learnable Sun Direction Calibration}{equation.13}{}}
+\newlabel{eq:sun_cal_reg}{{14}{3}{Learnable Sun Direction Calibration}{equation.14}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-E}}Learnable Sky-Scene Distinction}{3}{subsection.3.5}\protected@file@percent }
+\newlabel{sec:sky_mask}{{\mbox  {III-E}}{3}{Learnable Sky-Scene Distinction}{subsection.3.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-E}0a}Supervision.}{3}{paragraph.3.5.0.1}\protected@file@percent }
+\newlabel{eq:sky_loss}{{15}{3}{Supervision}{equation.15}{}}
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {III-E}0b}Sky distance regularisation.}{3}{paragraph.3.5.0.2}\protected@file@percent }
+\newlabel{eq:sky_dist}{{16}{3}{Sky distance regularisation}{equation.16}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {IV}Training}{3}{section.4}\protected@file@percent }
+\newlabel{sec:training}{{IV}{3}{Training}{section.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {V}Day-Cycle Relighting}{3}{section.5}\protected@file@percent }
+\newlabel{sec:relighting}{{V}{3}{Day-Cycle Relighting}{section.5}{}}
 \citation{joaxkal2024lumigauss}
 \citation{rudnev2022nerfOSR}
-\citation{rudnev2022nerfOSR}
-\citation{joaxkal2024lumigauss}
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-F}}Cook-Torrance PBR Rendering}{4}{subsection.3.6}\protected@file@percent }
-\newlabel{sec:pbr}{{\mbox  {III-F}}{4}{Cook-Torrance PBR Rendering}{subsection.3.6}{}}
-\newlabel{eq:brdf}{{13}{4}{Cook-Torrance PBR Rendering}{equation.13}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {IV}Training}{4}{section.4}\protected@file@percent }
-\newlabel{sec:training}{{IV}{4}{Training}{section.4}{}}
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {IV-}0a}Phase 1: Geometry warmup (iterations 0--$T_w$).}{4}{paragraph.4.0.0.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {IV-}0b}Phase 2: Transition ($T_w$--$T_s$).}{4}{paragraph.4.0.0.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {IV-}0c}Phase 3: Shadowed training (iterations $> T_s$).}{4}{paragraph.4.0.0.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {IV-}0d}Loss function.}{4}{paragraph.4.0.0.4}\protected@file@percent }
-\newlabel{eq:total_loss}{{18}{4}{Loss function}{equation.18}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces Novel-view synthesis quality on NeRF-OSR scenes.}}{4}{table.caption.2}\protected@file@percent }
-\newlabel{tab:nvs}{{I}{4}{Novel-view synthesis quality on NeRF-OSR scenes}{table.caption.2}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {V}Day-Cycle Relighting}{4}{section.5}\protected@file@percent }
-\newlabel{sec:relighting}{{V}{4}{Day-Cycle Relighting}{section.5}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {VI}Experiments}{4}{section.6}\protected@file@percent }
-\newlabel{sec:experiments}{{VI}{4}{Experiments}{section.6}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-A}}Datasets}{4}{subsection.6.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-B}}Implementation Details}{4}{subsection.6.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-C}}Baselines}{4}{subsection.6.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-D}}Novel-View Synthesis}{4}{subsection.6.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-E}}Relighting Quality}{4}{subsection.6.5}\protected@file@percent }
 \bibstyle{IEEEtran}
 \bibcite{mildenhall2020nerf}{1}
 \bibcite{kerbl20233dgs}{2}
@@ -105,21 +90,32 @@
 \bibcite{preetham1999practical}{8}
 \bibcite{nishita1993display}{9}
 \bibcite{lalonde2012estimating}{10}
+\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces Quantitative comparison on NeRF-OSR scenes.}}{4}{table.caption.2}\protected@file@percent }
+\newlabel{tab:nvs}{{I}{4}{Quantitative comparison on NeRF-OSR scenes}{table.caption.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {VI}Experiments}{4}{section.6}\protected@file@percent }
+\newlabel{sec:experiments}{{VI}{4}{Experiments}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-A}}Datasets}{4}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-B}}Implementation Details}{4}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-C}}Baselines}{4}{subsection.6.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-D}}Novel-View Synthesis}{4}{subsection.6.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-E}}Relighting Quality}{4}{subsection.6.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-F}}Ablation Studies}{4}{subsection.6.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {VII}Limitations and Future Work}{4}{section.7}\protected@file@percent }
+\newlabel{sec:limitations}{{VII}{4}{Limitations and Future Work}{section.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {VII-}0a}Single directional light.}{4}{paragraph.7.0.0.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {VII-}0b}Shadow map resolution.}{4}{paragraph.7.0.0.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {VII-}0c}Static geometry.}{4}{paragraph.7.0.0.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {VII-}0d}Normal quality.}{4}{paragraph.7.0.0.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {VII-}0e}Future directions.}{4}{paragraph.7.0.0.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {VIII}Conclusion}{4}{section.8}\protected@file@percent }
+\newlabel{sec:conclusion}{{VIII}{4}{Conclusion}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{References}{4}{section*.3}\protected@file@percent }
 \bibcite{hold-geoffroy2019deep}{11}
 \bibcite{meeus1991astronomical}{12}
-\bibcite{ye2024absgs}{13}
-\bibcite{bulo2024revising}{14}
-\@writefile{lot}{\contentsline {table}{\numberline {II}{\ignorespaces Ablation study on the \texttt  {lk2} scene.}}{5}{table.caption.3}\protected@file@percent }
-\newlabel{tab:ablation}{{II}{5}{Ablation study on the \texttt {lk2} scene}{table.caption.3}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-F}}Ablation Studies}{5}{subsection.6.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {VII}Limitations and Future Work}{5}{section.7}\protected@file@percent }
-\newlabel{sec:limitations}{{VII}{5}{Limitations and Future Work}{section.7}{}}
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {VII-}0a}Single directional light.}{5}{paragraph.7.0.0.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {VII-}0b}Shadow map resolution.}{5}{paragraph.7.0.0.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {VII-}0c}Static geometry.}{5}{paragraph.7.0.0.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {VII-}0d}Normal quality.}{5}{paragraph.7.0.0.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{\numberline {\mbox  {VII-}0e}Future directions.}{5}{paragraph.7.0.0.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {VIII}Conclusion}{5}{section.8}\protected@file@percent }
-\newlabel{sec:conclusion}{{VIII}{5}{Conclusion}{section.8}{}}
-\@writefile{toc}{\contentsline {section}{References}{5}{section*.4}\protected@file@percent }
+\bibcite{yu2021outdoor}{13}
+\bibcite{philip2019multiview}{14}
+\bibcite{jin2023tensoir}{15}
+\bibcite{fegr2024}{16}
+\bibcite{solnerf2024}{17}
+\bibcite{neusky2024}{18}
 \gdef \@abspage@last{5}

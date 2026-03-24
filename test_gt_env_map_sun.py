@@ -37,6 +37,31 @@ from skimage.metrics import structural_similarity as ssim_skimage
 TINY_NUMBER = 1e-6
 
 
+def rebase_config_path(path, config_dir):
+    """Rebase an absolute path from test_config.py to be relative to config_dir.
+
+    Config files from the original authors may contain hardcoded absolute paths
+    (e.g. /home/jk/...). This extracts the portion after 'eval_files/' and
+    reconstructs it relative to config_dir (which IS the eval_files directory).
+    If the file already exists at the given path, it's returned unchanged.
+    """
+    if os.path.isfile(path):
+        return path
+    marker = 'eval_files' + os.sep
+    alt_marker = 'eval_files/'
+    for m in (marker, alt_marker):
+        idx = path.find(m)
+        if idx != -1:
+            relative = path[idx + len(m):]
+            rebased = os.path.join(config_dir, relative)
+            if os.path.isfile(rebased):
+                return rebased
+    basename_path = os.path.join(config_dir, os.path.basename(path))
+    if os.path.isfile(basename_path):
+        return basename_path
+    return path
+
+
 def sun_direction_from_azimuth(azimuth_rad, elevation_rad=None, base_sun_direction=None):
     """
     Rotate a sun direction around the vertical (Y) axis by a given azimuth angle.
@@ -169,7 +194,9 @@ def render_set(dataset: ModelParams, iteration: int, pipeline: PipelineParams,
         dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
         use_sun=True, n_images=1700,
         use_residual_sh=dataset.use_residual_sh,
-        full_pbr=dataset.full_pbr
+        full_pbr=dataset.full_pbr,
+        scene_lighting_sh=dataset.scene_lighting_sh,
+        sky_sh_degree=dataset.sky_sh_degree
     )
 
     scene = Scene(dataset, gaussians, load_iteration=iteration)
@@ -240,7 +267,7 @@ def render_set(dataset: ModelParams, iteration: int, pipeline: PipelineParams,
         print(viewpoint_cam.image_name)
 
         image_config = config[viewpoint_cam.image_name]
-        mask_path = image_config["mask_path"]
+        mask_path = rebase_config_path(image_config["mask_path"], test_config)
         sun_angle_range = image_config["sun_angles"]
 
         # ---- Appearance index ----

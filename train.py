@@ -51,7 +51,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # This will be set properly after Scene is created
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
                                    use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh,
-                                   full_pbr=dataset.full_pbr)  # Temporary, will be reset
+                                   full_pbr=dataset.full_pbr,
+                                   scene_lighting_sh=dataset.scene_lighting_sh,
+                                   sky_sh_degree=dataset.sky_sh_degree)  # Temporary, will be reset
     else:
         gaussians = GaussianModel(dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a)
 
@@ -99,29 +101,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         scene.setup_sun_cal(opt)
 
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         checkpoint_dir = os.path.dirname(checkpoint)
         gaussians.restore(model_params, opt)
         if gaussians.use_sun:
-            gaussians.sun_model.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_sun" + str(first_iter) + ".pth")))
+            gaussians.sun_model.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_sun" + str(first_iter) + ".pth"), weights_only=False))
         elif gaussians.with_mlp:
-            gaussians.mlp.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_mlp" + str(first_iter) + ".pth")))
-            gaussians.embedding.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_embedding" + str(first_iter) + ".pth")))
+            gaussians.mlp.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_mlp" + str(first_iter) + ".pth"), weights_only=False))
+            gaussians.embedding.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_embedding" + str(first_iter) + ".pth"), weights_only=False))
         else:
-            gaussians.env_params.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_env" + str(first_iter) + ".pth")))
-        gaussians.optimizer_env.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_optimizer_env" + str(first_iter) + ".pth")))
+            gaussians.env_params.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_env" + str(first_iter) + ".pth"), weights_only=False))
+        gaussians.optimizer_env.load_state_dict(torch.load(os.path.join(checkpoint_dir, "chkpnt_optimizer_env" + str(first_iter) + ".pth"), weights_only=False))
         # Load camera calibration checkpoint if enabled
         if dataset.use_cam_cal:
             scene.load_cam_cal(first_iter)
             cam_cal_opt_path = os.path.join(checkpoint_dir, "chkpnt_optimizer_cam_cal" + str(first_iter) + ".pth")
             if os.path.exists(cam_cal_opt_path):
-                scene.optimizer_cam_cal.load_state_dict(torch.load(cam_cal_opt_path))
+                scene.optimizer_cam_cal.load_state_dict(torch.load(cam_cal_opt_path, weights_only=False))
         # Load sun calibration checkpoint if enabled
         if dataset.use_sun_cal and gaussians.use_sun:
             scene.load_sun_cal(first_iter)
             sun_cal_opt_path = os.path.join(checkpoint_dir, "chkpnt_optimizer_sun_cal" + str(first_iter) + ".pth")
             if os.path.exists(sun_cal_opt_path):
-                scene.optimizer_sun_cal.load_state_dict(torch.load(sun_cal_opt_path))
+                scene.optimizer_sun_cal.load_state_dict(torch.load(sun_cal_opt_path, weights_only=False))
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -165,6 +167,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"[Adaptive Densification] Enabled  –  grid {opt.adaptive_dens_grid_res}³, "
               f"interval={opt.adaptive_dens_interval}, "
               f"iters [{opt.adaptive_dens_from_iter}, {opt.adaptive_dens_until_iter}]")
+
+    # Compute late prune iterations: evenly spaced between end-of-densification and final iter
+    late_prune_iters = set()
+    if opt.late_prune:
+        d_end = opt.densify_until_iter
+        total = opt.iterations
+        # Three passes: shortly after densification ends, midpoint, and near end
+        late_prune_iters = {d_end + 1000, (d_end + total) // 2, total - 5000}
+        late_prune_iters = {it for it in late_prune_iters if d_end < it < total}
+        print(f"[Late Prune] Will run at iterations: {sorted(late_prune_iters)}")
 
     print("\n[Saving Gaussians before trainig")
     scene.save(0)
@@ -342,27 +354,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sun_reg_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
         if gaussians.use_sun:
             # Get current lighting parameters
-            sun_int = gaussians.sun_model.get_sun_intensity(emb_idx)  # [3]
-            ambient = gaussians.sun_model.get_ambient(emb_idx)  # [3]
+            sun_dir_reg = viewpoint_cam.get_adjusted_sun_direction()
+            sun_elev_reg = viewpoint_cam.sun_elevation
+            emb_idx = viewpoint_cam.uid
+
+            if gaussians.sun_model.scene_sh:
+                # ---- Scene-global SH mode ----
+                sun_int = gaussians.sun_model.get_sun_intensity(sun_dir_reg, sun_elevation=sun_elev_reg)
+                ambient = gaussians.sun_model.get_ambient(sun_dir_reg, sun_elevation=sun_elev_reg)
+            else:
+                # ---- Per-image mode ----
+                sun_int = gaussians.sun_model.get_sun_intensity(emb_idx, sun_elevation=sun_elev_reg)
+                ambient = gaussians.sun_model.get_ambient(emb_idx, sun_elevation=sun_elev_reg)
 
             # 1. Regularize ambient to stay lower than sun intensity
-            # Ambient should be ~10-30% of sun intensity for realistic outdoor scenes
             ambient_ratio = ambient.mean() / (sun_int.mean() + 1e-6)
             if ambient_ratio > 0.3:
-                # Penalize if ambient is more than 30% of sun
                 sun_reg_loss = sun_reg_loss + 0.1 * (ambient_ratio - 0.3) ** 2
 
-            # 2. Regularize sun_color_correction to stay near 1.0
-            color_corr = gaussians.sun_model.sun_color_correction[emb_idx]
-            sun_reg_loss = sun_reg_loss + 0.01 * ((color_corr - 1.0) ** 2).mean()
+            if gaussians.sun_model.scene_sh:
+                # 2. SH-specific: regularize color_correction_sh DC near 1.0
+                color_corr_dc = gaussians.sun_model.color_correction_sh[:, 0]
+                target_dc = 1.0 / 0.282095
+                sun_reg_loss = sun_reg_loss + 0.01 * ((color_corr_dc - target_dc) ** 2).mean()
+                # L2 on higher-order terms to keep correction smooth
+                if gaussians.sun_model.n_param_sh_coeffs > 1:
+                    sun_reg_loss = sun_reg_loss + 0.02 * (gaussians.sun_model.color_correction_sh[:, 1:] ** 2).mean()
 
-            # 3. Regularize global sky SH to stay bounded
+                # 3. L2 on higher-order terms of intensity_sh and ambient_sh
+                if gaussians.sun_model.n_param_sh_coeffs > 1:
+                    sun_reg_loss = sun_reg_loss + 0.01 * (gaussians.sun_model.intensity_sh[:, 1:] ** 2).mean()
+                    sun_reg_loss = sun_reg_loss + 0.01 * (gaussians.sun_model.ambient_sh[:, 1:] ** 2).mean()
+            else:
+                # 2. Per-image: regularize color_correction near 1.0
+                color_corr = gaussians.sun_model.sun_color_correction[emb_idx]
+                sun_reg_loss = sun_reg_loss + 0.01 * ((color_corr - 1.0) ** 2).mean()
+
+            # 4. Regularize global sky SH to stay bounded
             if gaussians.sun_model.use_residual_sh:
-                sky_sh = gaussians.sun_model.sky_sh  # Global sky SH [3, n_coeffs]
-                # L2 regularization - sky should be subtle
+                sky_sh = gaussians.sun_model.sky_sh
                 sun_reg_loss = sun_reg_loss + 0.01 * (sky_sh ** 2).mean()
-                # Sky SH DC term should be lower than ambient
-                sky_dc = sky_sh[:, 0].abs().mean() * 0.282095  # DC contribution
+                sky_dc = sky_sh[:, 0].abs().mean() * 0.282095
                 if sky_dc > ambient.mean() * 0.5:
                     sun_reg_loss = sun_reg_loss + 0.05 * (sky_dc - ambient.mean() * 0.5) ** 2
 
@@ -374,6 +406,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 viewpoint_cam, sky_mask, render, pipe, background, override_xyz=override_xyz
             )
             sky_mask_loss = opt.sky_mask_loss_weight * sky_mask_loss_raw
+
+        # Sky distance regularization: push sky gaussians far from scene center
+        # so they form a distant sky dome and don't float between camera and scene
+        sky_dist_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
+        if opt.sky_dist_lambda > 0 and gaussians.use_sun:
+            casts_shadow = gaussians.get_casts_shadow  # [N], 0=sky, 1=solid
+            is_sky = casts_shadow < 0.5
+            if is_sky.any():
+                sky_xyz = gaussians.get_xyz[is_sky]  # [M, 3]
+                dists = sky_xyz.norm(dim=1)  # distance from origin (scene is centered)
+                min_sky_dist = scene.cameras_extent * opt.sky_dist_min_factor
+                # Penalize sky gaussians closer than min_sky_dist
+                violations = torch.clamp(min_sky_dist - dists, min=0.0)
+                sky_dist_loss = opt.sky_dist_lambda * (violations ** 2).mean()
 
         # 2DGS original regularization
         if lambda_normal>0 or lambda_dist>0:
@@ -427,7 +473,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 and iteration >= opt.sun_cal_from_iter and iteration <= opt.sun_cal_until_iter):
             sun_cal_reg_loss = opt.sun_cal_reg_lambda * (viewpoint_cam.delta_sun_dir.norm() ** 2)
 
-        total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss + sky_mask_loss + depth_est_loss + cam_cal_reg_loss + sun_cal_reg_loss
+        total_loss = unshadowed_image_loss + shadowed_image_loss + dist_loss + normal_loss + shadow_loss + sh_gauss_loss + sh_env_loss + consistency_loss + sun_reg_loss + sky_mask_loss + sky_dist_loss + depth_est_loss + cam_cal_reg_loss + sun_cal_reg_loss
 
         # Only backward if we have a loss with gradients
         if torch.is_tensor(total_loss) and total_loss.requires_grad:
@@ -456,6 +502,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     shadow_loss=shadow_loss,
                     sun_reg_loss=sun_reg_loss,
                     sky_mask_loss=sky_mask_loss,
+                    sky_dist_loss=sky_dist_loss,
                     depth_est_loss=depth_est_loss,
                     total_loss=total_loss
                 )
@@ -489,6 +536,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_dict["SunReg"] = f"{_val(sun_reg_loss):.5f}"
                     if sky_masks:
                         loss_dict["SkyMask"] = f"{_val(sky_mask_loss):.5f}"
+                    if opt.sky_dist_lambda > 0:
+                        loss_dict["SkyDist"] = f"{_val(sky_dist_loss):.5f}"
                 if opt.use_depth_est:
                     loss_dict["DepthEst"] = f"{_val(depth_est_loss):.5f}"
                 if dataset.use_cam_cal and scene.cam_cal_enabled:
@@ -504,7 +553,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             psnr_metric = training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background),
                                           appearance_lut=appearance_lut, source_path=dataset.source_path, sky_masks=sky_masks,
-                                          metrics_logger=metrics_logger)
+                                          metrics_logger=metrics_logger,
+                                          eval_config_path=dataset.eval_config_path)
 
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -532,6 +582,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # ---- Late-stage opacity reset + prune (removes floaters after densification ends) ----
+            # Same proven mechanism used during densification: reset all opacities to 0.01,
+            # then after a few hundred iterations of training, gaussians that don't contribute
+            # to reducing the loss stay low-opacity and get pruned.
+            if opt.late_prune and iteration in late_prune_iters:
+                before_count = gaussians.get_xyz.shape[0]
+                # First prune anything already low-opacity
+                prune_mask = (gaussians.get_opacity < opt.late_prune_opacity).squeeze()
+                if prune_mask.any():
+                    gaussians.prune_points(prune_mask)
+                # Then reset opacity so floaters can be caught next pass
+                gaussians.reset_opacity()
+                after_count = gaussians.get_xyz.shape[0]
+                print(f"\n[ITER {iteration}] Late prune + opacity reset: "
+                      f"{before_count} → {after_count} (removed {before_count - after_count})")
+                torch.cuda.empty_cache()
 
             # ---- Adaptive grid-based densification ----
             if (adaptive_grid is not None

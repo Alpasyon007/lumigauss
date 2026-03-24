@@ -56,7 +56,8 @@ class GaussianModel:
 
     def __init__(self, sh_degree : int, with_mlp: bool = False, mlp_W=128, mlp_D=4, N_a = 32,
                  use_sun: bool = False, n_images: int = None, use_residual_sh: bool = True,
-                 full_pbr: bool = False):
+                 full_pbr: bool = False, scene_lighting_sh: bool = False,
+                 sky_sh_degree: int = 1):
 
         # We only implement deg 2 for SH_gauss and SH_env.
         # More on environment map degree: https://cseweb.ucsd.edu/~ravir/papers/envmap/envmap.pdf
@@ -94,6 +95,8 @@ class GaussianModel:
             print("Warning: --full_pbr requires --use_sun. Disabling full_pbr.")
         self.n_images = n_images
         self.use_residual_sh = use_residual_sh  # Whether to use residual SH for environment details
+        self.sky_sh_degree = sky_sh_degree  # Degree of residual sky SH
+        self.scene_lighting_sh = scene_lighting_sh  # Scene-global SH for sun params vs per-image
         self.sun_model = None
 
         self.setup_functions()
@@ -130,7 +133,7 @@ class GaussianModel:
 
     def setup_sun_model(self):
         """
-        Initialize the sun model for explicit directional lighting (no SH).
+        Initialize the sun model for explicit directional lighting.
 
         This model keeps sun as an explicit directional light for:
         - Sharp shadow boundaries (computed separately using geometry)
@@ -138,10 +141,8 @@ class GaussianModel:
         - Residual SH for sky gradients and indirect lighting
 
         Sun direction is obtained from Camera objects at runtime.
-        The model learns:
-        - sun_intensity: Per-image sun intensity [n_images, 3] for RGB channels
-        - ambient_color: Per-image ambient color [n_images, 3] for RGB channels
-        - residual_sh: Per-image residual SH for environment details
+        All lighting parameters (intensity, colour correction, ambient) are
+        scene-global SH functions of the sun direction — not per-image.
 
         Note: Shadowing is handled separately using geometry-based shadow computation.
         """
@@ -151,9 +152,12 @@ class GaussianModel:
         self.sun_model = SunModel(
             n_images=self.n_images,
             device="cuda",
-            use_residual_sh=self.use_residual_sh
+            use_residual_sh=self.use_residual_sh,
+            sh_degree=self.sky_sh_degree,
+            scene_sh=self.scene_lighting_sh
         )
-        print(f"Initialized SunModel for {self.n_images} images (use_residual_sh={self.use_residual_sh})")
+        mode_str = "scene-global SH" if self.scene_lighting_sh else "per-image"
+        print(f"Initialized SunModel for {self.n_images} images, {mode_str} mode (use_residual_sh={self.use_residual_sh})")
 
 
     def capture(self): #MLP and embedding saved separately.
@@ -610,14 +614,20 @@ class GaussianModel:
                                                     max_steps=training_args.position_lr_max_steps)
 
         if self.use_sun:
-            # Sun model: explicit directional lighting + sun color prior + global sky SH
-            # Parameters: sun_intensity_multiplier (per-image), sun_color_correction (per-image),
-            #             ambient_color (per-image), sky_sh (global)
-            l_env = [
-                {'params': [self.sun_model.sun_intensity_multiplier], 'lr': training_args.env_lr * 2.0, "name": "sun_intensity"},
-                {'params': [self.sun_model.sun_color_correction], 'lr': training_args.env_lr * 0.5, "name": "sun_color_correction"},
-                {'params': [self.sun_model.ambient_color], 'lr': training_args.env_lr * 2.0, "name": "ambient_color"},
-            ]
+            if self.sun_model.scene_sh:
+                # Scene-global SH functions of sun direction + global sky SH
+                l_env = [
+                    {'params': [self.sun_model.intensity_sh], 'lr': training_args.env_lr * 2.0, "name": "sun_intensity"},
+                    {'params': [self.sun_model.color_correction_sh], 'lr': training_args.env_lr * 0.5, "name": "sun_color_correction"},
+                    {'params': [self.sun_model.ambient_sh], 'lr': training_args.env_lr * 2.0, "name": "ambient_color"},
+                ]
+            else:
+                # Original per-image parameters
+                l_env = [
+                    {'params': [self.sun_model.sun_intensity_multiplier], 'lr': training_args.env_lr * 2.0, "name": "sun_intensity"},
+                    {'params': [self.sun_model.sun_color_correction], 'lr': training_args.env_lr * 0.5, "name": "sun_color_correction"},
+                    {'params': [self.sun_model.ambient_color], 'lr': training_args.env_lr * 2.0, "name": "ambient_color"},
+                ]
             # Add global sky SH parameters if enabled
             if self.sun_model.use_residual_sh:
                 l_env.append({'params': [self.sun_model.sky_sh], 'lr': training_args.env_lr, "name": "sky_sh"})

@@ -1,6 +1,8 @@
 
 import os
 import json
+import sys
+import importlib
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any
@@ -69,6 +71,7 @@ class LossComponents:
     shadow: float = 0.0
     sun_reg: float = 0.0
     sky_mask: float = 0.0
+    sky_dist: float = 0.0
     depth_est: float = 0.0
     total: float = 0.0
 
@@ -303,6 +306,7 @@ class MetricsLogger:
         self.tb_writer.add_scalar('Loss_Regularization/dist', losses.dist, iteration)
         self.tb_writer.add_scalar('Loss_Regularization/sun_reg', losses.sun_reg, iteration)
         self.tb_writer.add_scalar('Loss_Regularization/sky_mask', losses.sky_mask, iteration)
+        self.tb_writer.add_scalar('Loss_Regularization/sky_dist', losses.sky_dist, iteration)
         self.tb_writer.add_scalar('Loss_Regularization/depth_est', losses.depth_est, iteration)
 
         # Group 4: SH/Lighting Losses
@@ -368,27 +372,41 @@ class MetricsLogger:
             self.tb_writer.add_scalar('Gaussians/sky_ratio', sky_ratio, iteration)
             self.tb_writer.add_histogram('Gaussians/casts_shadow_hist', casts_shadow, iteration)
 
-    def log_sun_model_params(self, iteration: int, sun_model, emb_idx: int = 0):
+    def log_sun_model_params(self, iteration: int, sun_model, sun_direction: torch.Tensor = None, sun_elevation: float = None):
         """Log sun model parameters for use_sun mode."""
         if self.tb_writer is None or sun_model is None:
             return
 
+        if sun_direction is None:
+            # Fallback: use a default zenith direction for logging
+            sun_direction = torch.tensor([0.0, 0.0, 1.0], device=sun_model.device)
+
         # Sun intensity
-        sun_intensity = sun_model.get_sun_intensity(emb_idx)
+        sun_intensity = sun_model.get_sun_intensity(sun_direction, sun_elevation=sun_elevation)
         self.tb_writer.add_scalar('SunModel/intensity_r', sun_intensity[0].item(), iteration)
         self.tb_writer.add_scalar('SunModel/intensity_g', sun_intensity[1].item(), iteration)
         self.tb_writer.add_scalar('SunModel/intensity_b', sun_intensity[2].item(), iteration)
         self.tb_writer.add_scalar('SunModel/intensity_mean', sun_intensity.mean().item(), iteration)
 
         # Ambient color
-        ambient = sun_model.get_ambient(emb_idx)
+        ambient = sun_model.get_ambient(sun_direction, sun_elevation=sun_elevation)
         self.tb_writer.add_scalar('SunModel/ambient_r', ambient[0].item(), iteration)
         self.tb_writer.add_scalar('SunModel/ambient_g', ambient[1].item(), iteration)
         self.tb_writer.add_scalar('SunModel/ambient_b', ambient[2].item(), iteration)
 
-        # Color correction
-        if hasattr(sun_model, 'sun_color_correction'):
-            color_corr = sun_model.sun_color_correction[emb_idx]
+        # Color correction logging
+        if sun_model.scene_sh and hasattr(sun_model, 'color_correction_sh'):
+            color_corr = sun_model._evaluate_sh_at_direction(
+                sun_model.color_correction_sh,
+                sun_direction / (torch.norm(sun_direction) + 1e-8)
+            )
+            color_corr = torch.clamp(color_corr, min=0.5, max=2.0)
+            self.tb_writer.add_scalar('SunModel/color_correction_r', color_corr[0].item(), iteration)
+            self.tb_writer.add_scalar('SunModel/color_correction_g', color_corr[1].item(), iteration)
+            self.tb_writer.add_scalar('SunModel/color_correction_b', color_corr[2].item(), iteration)
+        elif not sun_model.scene_sh and hasattr(sun_model, 'sun_color_correction'):
+            # Per-image mode: log the mean color correction across all images
+            color_corr = sun_model.sun_color_correction.data.mean(dim=0)  # [3]
             self.tb_writer.add_scalar('SunModel/color_correction_r', color_corr[0].item(), iteration)
             self.tb_writer.add_scalar('SunModel/color_correction_g', color_corr[1].item(), iteration)
             self.tb_writer.add_scalar('SunModel/color_correction_b', color_corr[2].item(), iteration)
@@ -528,6 +546,7 @@ def create_loss_components(
     shadow_loss: torch.Tensor,
     sun_reg_loss: torch.Tensor = None,
     sky_mask_loss: torch.Tensor = None,
+    sky_dist_loss: torch.Tensor = None,
     depth_est_loss: torch.Tensor = None,
     total_loss: torch.Tensor = None
 ) -> LossComponents:
@@ -545,6 +564,7 @@ def create_loss_components(
         shadow=shadow_loss.item() if torch.is_tensor(shadow_loss) else shadow_loss,
         sun_reg=sun_reg_loss.item() if sun_reg_loss is not None and torch.is_tensor(sun_reg_loss) else (sun_reg_loss or 0.0),
         sky_mask=sky_mask_loss.item() if sky_mask_loss is not None and torch.is_tensor(sky_mask_loss) else (sky_mask_loss or 0.0),
+        sky_dist=sky_dist_loss.item() if sky_dist_loss is not None and torch.is_tensor(sky_dist_loss) else (sky_dist_loss or 0.0),
         depth_est=depth_est_loss.item() if depth_est_loss is not None and torch.is_tensor(depth_est_loss) else (depth_est_loss or 0.0),
         total=total_loss.item() if total_loss is not None and torch.is_tensor(total_loss) else (total_loss or 0.0)
     )
@@ -702,11 +722,164 @@ def prepare_output_and_logger(args) -> tuple:
     return tb_writer, metrics_logger
 
 
+# ---------------------------------------------------------------------------
+# Eval mask loading from test_config.py (eval_files directory)
+# ---------------------------------------------------------------------------
+
+def _rebase_config_path(path: str, config_dir: str) -> str:
+    """Rebase an absolute path from test_config.py to be relative to config_dir."""
+    if os.path.isfile(path):
+        return path
+    for marker in ('eval_files' + os.sep, 'eval_files/'):
+        idx = path.find(marker)
+        if idx != -1:
+            rebased = os.path.join(config_dir, path[idx + len(marker):])
+            if os.path.isfile(rebased):
+                return rebased
+    basename_path = os.path.join(config_dir, os.path.basename(path))
+    if os.path.isfile(basename_path):
+        return basename_path
+    return path
+
+# Module-level cache so we only load the config once per process
+_eval_config_cache: Dict[str, Any] = {}
+
+
+def _discover_eval_config_path(source_path: str) -> Optional[str]:
+    """Auto-discover eval_files directory as a sibling of the source_path leaf.
+
+    Convention (from run_all.sh):
+        source_path = data/st_colmap/undistorted
+        eval_files  = data/st_colmap/eval_files
+    """
+    if not source_path:
+        return None
+    parent = os.path.dirname(os.path.normpath(source_path))
+    candidate = os.path.join(parent, "eval_files")
+    if os.path.isdir(candidate):
+        return candidate
+    return None
+
+
+def _get_eval_photos(eval_config_path: str, source_path: str = None) -> List[str]:
+    """Load eval image names from eval_photos.txt.
+
+    Returns list of image names, or empty list if unavailable.
+    """
+    cfg_dir = eval_config_path or _discover_eval_config_path(source_path)
+    if cfg_dir is None:
+        return []
+
+    cache_key = cfg_dir + "::photos"
+    if cache_key in _eval_config_cache:
+        return _eval_config_cache[cache_key]
+
+    photos_file = os.path.join(cfg_dir, "eval_photos.txt")
+    if not os.path.isfile(photos_file):
+        _eval_config_cache[cache_key] = []
+        return []
+
+    with open(photos_file, 'r') as f:
+        names = [line.strip() for line in f if line.strip()]
+
+    print(f"Loaded {len(names)} eval photos from {photos_file}")
+    _eval_config_cache[cache_key] = names
+    return names
+
+
+def _get_eval_config(source_path: str, eval_config_path: str = None) -> Optional[dict]:
+    """Load and cache the test_config from eval_files.
+
+    Returns the config dict (image_name -> {mask_path, ...}) or None.
+    """
+    # Resolve path
+    cfg_dir = eval_config_path or _discover_eval_config_path(source_path)
+    if cfg_dir is None:
+        return None
+
+    if cfg_dir in _eval_config_cache:
+        return _eval_config_cache[cfg_dir]
+
+    config_py = os.path.join(cfg_dir, "test_config.py")
+    if not os.path.isfile(config_py):
+        _eval_config_cache[cfg_dir] = None
+        return None
+
+    try:
+        # Import test_config.py from the eval_files directory
+        # (same approach as test_gt_env_map_sun.py)
+        if cfg_dir not in sys.path:
+            sys.path.insert(0, cfg_dir)
+        # Use a unique module name to avoid clashing with other imports
+        spec = importlib.util.spec_from_file_location("_eval_test_config", config_py)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        config = getattr(mod, "config", None)
+        if config is None:
+            print(f"Warning: test_config.py at {config_py} has no 'config' dict")
+            _eval_config_cache[cfg_dir] = None
+            return None
+        _eval_config_cache[cfg_dir] = config
+        print(f"Loaded eval config from {config_py} ({len(config)} images)")
+        return config
+    except Exception as e:
+        print(f"Warning: Failed to load eval config from {config_py}: {e}")
+        _eval_config_cache[cfg_dir] = None
+        return None
+
+
+def _load_eval_mask(image_name: str, gt_image: torch.Tensor,
+                    source_path: str, eval_config_path: str = None) -> Optional[torch.Tensor]:
+    """Load the evaluation mask for an image from eval_files/eval_mask/.
+
+    Looks for eval_mask/<basename>.png in the eval_files directory.
+    Falls back to test_config.py mask_path if eval_mask/ folder doesn't exist.
+
+    Returns:
+        eval_mask [H, W] on gt_image.device, or None if unavailable.
+    """
+    import cv2 as _cv2
+
+    cfg_dir = eval_config_path or _discover_eval_config_path(source_path)
+    if cfg_dir is None:
+        return None
+
+    # Primary: look in eval_mask/ folder using image base name
+    mask_dir = os.path.join(cfg_dir, "eval_mask")
+    if os.path.isdir(mask_dir):
+        base_name = os.path.splitext(image_name)[0] + ".png"
+        mask_path = os.path.join(mask_dir, base_name)
+        if os.path.isfile(mask_path):
+            mask = _cv2.imread(mask_path, _cv2.IMREAD_GRAYSCALE)
+            if mask is not None:
+                mask = _cv2.resize(mask, (gt_image.shape[2], gt_image.shape[1]))
+                kernel = np.ones((5, 5), np.uint8)
+                mask = _cv2.erode(mask, kernel, iterations=1)
+                return torch.from_numpy(mask // 255).to(gt_image.device)
+
+    # Fallback: try test_config.py mask_path
+    config = _get_eval_config(source_path, eval_config_path)
+    if config is not None and image_name in config:
+        mask_path = config[image_name].get("mask_path")
+        if mask_path:
+            mask_path = _rebase_config_path(mask_path, cfg_dir)
+            if os.path.isfile(mask_path):
+                mask = _cv2.imread(mask_path, _cv2.IMREAD_GRAYSCALE)
+                if mask is not None:
+                    mask = _cv2.resize(mask, (gt_image.shape[2], gt_image.shape[1]))
+                    kernel = np.ones((5, 5), np.uint8)
+                    mask = _cv2.erode(mask, kernel, iterations=1)
+                    return torch.from_numpy(mask // 255).to(gt_image.device)
+
+    return None
+
+
 @torch.no_grad()
 def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss, elapsed,
                     testing_iterations, scene: Scene, renderFunc, renderArgs,
                     appearance_lut=None, source_path=None, sky_masks=None,
-                    metrics_logger: Optional[MetricsLogger] = None):
+                    metrics_logger: Optional[MetricsLogger] = None,
+                    eval_config_path: str = None):
     """
     Generate training report with detailed metrics logging.
 
@@ -725,6 +898,9 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
         source_path: Source data path
         sky_masks: Sky masks dictionary
         metrics_logger: MetricsLogger instance for detailed logging
+        eval_config_path: Path to eval_files directory containing test_config.py
+                          for proper evaluation masks. If None, auto-discovered
+                          from source_path.
 
     Returns:
         float: PSNR value from evaluation (or large number if not evaluating)
@@ -736,8 +912,13 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
 
         # Log sun model parameters if in use_sun mode
         if scene.gaussians.use_sun and appearance_lut:
-            first_emb_idx = list(appearance_lut.values())[0]
-            metrics_logger.log_sun_model_params(iteration, scene.gaussians.sun_model, first_emb_idx)
+            # Use the sun direction from the first training camera for logging
+            first_cam = scene.getTrainCameras()[0]
+            sun_dir_log = first_cam.get_adjusted_sun_direction() if hasattr(first_cam, 'get_adjusted_sun_direction') else first_cam.sun_direction
+            sun_elev_log = first_cam.sun_elevation
+            metrics_logger.log_sun_model_params(iteration, scene.gaussians.sun_model,
+                                                sun_direction=sun_dir_log,
+                                                sun_elevation=sun_elev_log)
     elif tb_writer:
         # Fallback to basic logging
         tb_writer.add_scalar('Loss_Image/l1_unshadowed', Ll1_unshadowed, iteration)
@@ -778,21 +959,37 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
             ],
         }
 
-        # Find which dataset we're working with
-        target_names = None
-        if source_path:
-            for key, names in TEST_IMAGES.items():
-                if key in source_path.lower():
-                    target_names = set(names)
-                    break
+        # Determine which images to evaluate on.
+        # Priority: 1) eval_photos.txt from eval_files, 2) hardcoded list, 3) first 5 test cams
+        eval_photo_names = _get_eval_photos(eval_config_path, source_path)
+        target_names = set(eval_photo_names) if eval_photo_names else None
+
+        if not target_names:
+            # Fallback to hardcoded list per dataset
+            if source_path:
+                for key, names in TEST_IMAGES.items():
+                    if key in source_path.lower():
+                        target_names = set(names)
+                        break
 
         if target_names:
-            # Filter to only the hardcoded test images, preserving config order
-            test_cameras_filtered = [c for c in test_cameras if c.image_name in target_names]
+            # Search both test AND train cameras — eval images may be in the training split
+            all_cameras = list(test_cameras) + list(scene.getTrainCameras())
+            seen = set()
+            test_cameras_filtered = []
+            for c in all_cameras:
+                if c.image_name in target_names and c.image_name not in seen:
+                    test_cameras_filtered.append(c)
+                    seen.add(c.image_name)
             if not test_cameras_filtered:
-                print(f"Warning: none of the hardcoded test images found in test set. "
-                      f"Available: {[c.image_name for c in test_cameras[:10]]}")
+                print(f"Warning: none of the eval images found in scene cameras. "
+                      f"Wanted: {sorted(target_names)[:5]}")
                 test_cameras_filtered = sorted(test_cameras, key=lambda c: c.image_name)[:5]
+            else:
+                found = [c.image_name for c in test_cameras_filtered]
+                missing = target_names - set(found)
+                if missing:
+                    print(f"Warning: {len(missing)} eval images not found in scene: {sorted(missing)}")
         else:
             # Unknown dataset — fall back to sorted first 5
             test_cameras_filtered = sorted(test_cameras, key=lambda c: c.image_name)[:5]
@@ -837,6 +1034,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                     shadow_map_vis = None
                     direct_light_vis = None
                     casts_shadow_vis = None
+                    sky_overlay_vis = None
 
                     if scene.gaussians.use_sun:
                         # Directional sun lighting mode - no SH environment
@@ -901,7 +1099,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         # Render direct light only (with shadow applied)
                         casts_shadow_flag = scene.gaussians.get_casts_shadow.unsqueeze(-1)  # [N, 1]
                         is_sky = casts_shadow_flag < 0.5
-                        sun_intensity = scene.gaussians.sun_model.get_sun_intensity(emb_idx, sun_elevation=sun_elev).unsqueeze(0)  # [1, 3]
+                        sun_intensity = scene.gaussians.sun_model.get_sun_intensity(sun_dir, sun_elevation=sun_elev).unsqueeze(0)  # [1, 3]
                         direct_for_vis = torch.where(is_sky, sun_intensity.expand(direct_light.shape[0], -1), direct_light)
                         direct_shadowed = direct_for_vis * shadow_mask  # [N, 3]
                         direct_shadowed_gamma = torch.clamp_min(direct_shadowed, 0.00001) ** (1 / 2.2)
@@ -911,12 +1109,18 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
 
                         # Render casts_shadow visualization as grayscale mask
                         # Black = sky (non-shadow-casting, value 0), White = non-sky (shadow-casting, value 1)
-                        # Use black background for clarity
                         casts_shadow = scene.gaussians.get_casts_shadow  # [N]
-                        # Create grayscale RGB: white for shadow-casting (1), black for non-shadow-casting (0)
                         casts_shadow_rgb = casts_shadow.unsqueeze(-1).expand(-1, 3)  # [N, 3]
                         render_pkg_casts_shadow = renderFunc(viewpoint, scene.gaussians, renderArgs[0], black_bg, override_color=casts_shadow_rgb)
                         casts_shadow_vis = torch.clamp(render_pkg_casts_shadow["render"], 0.0, 1.0)
+
+                        # Render sky gaussian overlay: sky gaussians in cyan, non-sky as albedo
+                        is_sky = (casts_shadow < 0.5).unsqueeze(-1)  # [N, 1]
+                        sky_color = torch.tensor([[0.0, 0.8, 1.0]], device=casts_shadow.device)  # cyan
+                        scene_albedo = scene.gaussians.get_albedo  # [N, 3]
+                        sky_scene_rgb = torch.where(is_sky, sky_color.expand_as(scene_albedo), scene_albedo)
+                        render_pkg_sky_overlay = renderFunc(viewpoint, scene.gaussians, renderArgs[0], black_bg, override_color=sky_scene_rgb)
+                        sky_overlay_vis = torch.clamp(render_pkg_sky_overlay["render"], 0.0, 1.0)
 
                         # Create sky mask comparison visualization
                         sky_mask_vis = None
@@ -1029,58 +1233,64 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                         # (Not available for use_sun mode)
 
                         # BIG TODO remove hardcoded idx! For now, please do it yourself if needed
+                        transfer_image_name = None
                         if "trevi" in source_path:
-                            emb_idx = appearance_lut["00851798_4967549624.jpg"]
+                            transfer_image_name = "00851798_4967549624.jpg"
                         elif "lk2" in source_path:
-                            emb_idx = appearance_lut["C3_DSC_8_3.png"]
+                            transfer_image_name = "C3_DSC_8_3.png"
                         elif "lwp" in source_path:
-                            emb_idx = appearance_lut["23-04_10_00_DSC_1687.jpg"]
+                            transfer_image_name = "23-04_10_00_DSC_1687.jpg"
                         elif "st" in source_path:
-                            emb_idx = appearance_lut["12-04_18_00_DSC_0483.jpg"]
-                        else:
-                            raise("Other datasets than trevi, lk2, lwp, st not implemented. Moreover, viewpoints are hardcoded. Please, for now, fix it by yourself.")
+                            transfer_image_name = "12-04_18_00_DSC_0483.jpg"
 
-                        env_sh = scene.gaussians.compute_env_sh(emb_idx)
-                        env_sh_transfer = shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy(), width=300)
-                        env_sh_transfer = (torch.clamp(torch.tensor(env_sh_transfer** (1 / 2.2)).permute(2,0,1), 0.0, 1.0))
+                        if transfer_image_name and transfer_image_name not in appearance_lut:
+                            # Fallback: use first available training image
+                            transfer_image_name = next(iter(appearance_lut)) if appearance_lut else None
 
-                        #render shadowed
-                        rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
-                        render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
-                        image_shadowed_transfer = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
+                        if transfer_image_name and appearance_lut:
+                            emb_idx = appearance_lut[transfer_image_name]
 
-                        #render unshadowed
-                        rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
-                        render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
-                        image_unshadowed_transfer = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
+                            env_sh = scene.gaussians.compute_env_sh(emb_idx)
+                            env_sh_transfer = shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy(), width=300)
+                            env_sh_transfer = (torch.clamp(torch.tensor(env_sh_transfer** (1 / 2.2)).permute(2,0,1), 0.0, 1.0))
+
+                            #render shadowed
+                            rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
+                            render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
+                            image_shadowed_transfer = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
+
+                            #render unshadowed
+                            rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
+                            render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
+                            image_unshadowed_transfer = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
 
 
-                        # Relightning - visualize render with lightning from external env map
+                            # Relightning - visualize render with lightning from external env map
 
-                        env_sh=torch.tensor(np.array(
-                                [[2.5, 2.389, 2.562],
-                                [0.545, 0.436, 0.373],
-                                [1.46, 1.724, 2.118],
-                                [0.771, 0.623, 0.53],
-                                [0.407, 0.355, 0.313],
-                                [0.667, 0.516, 0.42],
-                                [0.38, 0.314, 0.399],
-                                [0.817, 0.637, 0.517],
-                                [0.193, 0.151, 0.148]]),
-                                dtype=torch.float32, device=scene.gaussians._albedo.device).T
+                            env_sh=torch.tensor(np.array(
+                                    [[2.5, 2.389, 2.562],
+                                    [0.545, 0.436, 0.373],
+                                    [1.46, 1.724, 2.118],
+                                    [0.771, 0.623, 0.53],
+                                    [0.407, 0.355, 0.313],
+                                    [0.667, 0.516, 0.42],
+                                    [0.38, 0.314, 0.399],
+                                    [0.817, 0.637, 0.517],
+                                    [0.193, 0.151, 0.148]]),
+                                    dtype=torch.float32, device=scene.gaussians._albedo.device).T
 
-                        env_sh_external = shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy(), width=300)
-                        env_sh_external = (torch.clamp(torch.tensor(env_sh_external** (1 / 2.2)).permute(2,0,1), 0.0, 1.0))
+                            env_sh_external = shReconstructDiffuseMap(env_sh.T.cpu().detach().numpy(), width=300)
+                            env_sh_external = (torch.clamp(torch.tensor(env_sh_external** (1 / 2.2)).permute(2,0,1), 0.0, 1.0))
 
-                        #render shadowed
-                        rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
-                        render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
-                        image_shadowed_external = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
+                            #render shadowed
+                            rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, multiplier=multiplier)
+                            render_pkg_shadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
+                            image_shadowed_external = torch.clamp(render_pkg_shadowed["render"], 0.0, 1.0)
 
-                        #render unshadowed
-                        rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
-                        render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
-                        image_unshadowed_external = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
+                            #render unshadowed
+                            rgb_precomp,_ = scene.gaussians.compute_gaussian_rgb(env_sh, shadowed=False, normal_vectors=normal_vectors)
+                            render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp)
+                            image_unshadowed_external = torch.clamp(render_pkg_unshadowed["render"], 0.0, 1.0)
 
 
                     if tb_writer:
@@ -1111,6 +1321,8 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                                 tb_writer.add_images(view_tag + "/09_direct_sun_only", direct_light_vis[None], global_step=iteration)
                             if casts_shadow_vis is not None:
                                 tb_writer.add_images(view_tag + "/10_casts_shadow_mask", casts_shadow_vis[None], global_step=iteration)
+                            if sky_overlay_vis is not None:
+                                tb_writer.add_images(view_tag + "/10b_sky_gaussian_overlay", sky_overlay_vis[None], global_step=iteration)
                             if sky_mask_vis is not None:
                                 tb_writer.add_images(view_tag + "/11_sky_mask_gt", sky_mask_vis[None], global_step=iteration)
                             if sky_mask_comparison is not None:
@@ -1134,7 +1346,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             except Exception as e:
                                 print(f"Warning: Could not create sun/camera visualization: {e}")
 
-                        if config["name"]=="train" and not scene.gaussians.use_sun:
+                        if config["name"]=="train" and not scene.gaussians.use_sun and 'image_unshadowed_transfer' in dir():
                             tb_writer.add_images(view_tag + "/07_transfer_unshadowed", image_unshadowed_transfer[None], global_step=iteration)
                             tb_writer.add_images(view_tag + "/08_transfer_shadowed", image_shadowed_transfer[None], global_step=iteration)
                             tb_writer.add_images(view_tag + "/09_env_transfer", env_sh_transfer[None], global_step=iteration)
@@ -1214,27 +1426,26 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
 
                     # ---- Masked evaluation metrics (same formula as test script) ----
                     if config['name'] == 'test' and image_shadowed is not None:
-                        # Use camera's training mask [1, H, W] -> [H, W]
-                        eval_mask = viewpoint.mask.squeeze(0)  # [H, W]
-                        # Erode mask (same 5x5 kernel as test script)
-                        import cv2 as _cv2
-                        mask_np = (eval_mask.cpu().numpy() * 255).astype(np.uint8)
-                        _kernel = np.ones((5, 5), np.uint8)
-                        mask_np = _cv2.erode(mask_np, _kernel, iterations=1)
-                        eval_mask = torch.from_numpy(mask_np // 255).to(gt_image.device)
+                        # Load proper eval mask from eval_files/test_config.py
+                        eval_mask = _load_eval_mask(
+                            viewpoint.image_name, gt_image, source_path, eval_config_path
+                        )
+                        if eval_mask is None and idx == 0:
+                            print(f"[eval_masked] No eval mask for '{viewpoint.image_name}' "
+                                  f"(eval_config_path={eval_config_path})")
+                        if eval_mask is not None:
+                            _mse_val = img2mse(image_shadowed, gt_image, mask=eval_mask)
+                            eval_mse_shadowed.append(float(_mse_val))
+                            eval_psnrs_shadowed.append(float(mse2psnr(_mse_val)))
+                            eval_mae_shadowed.append(float(img2mae(image_shadowed, gt_image, mask=eval_mask)))
 
-                        _mse_val = img2mse(image_shadowed, gt_image, mask=eval_mask)
-                        eval_mse_shadowed.append(float(_mse_val))
-                        eval_psnrs_shadowed.append(float(mse2psnr(_mse_val)))
-                        eval_mae_shadowed.append(float(img2mae(image_shadowed, gt_image, mask=eval_mask)))
-
-                        # SSIM (skimage, masked, matching test script exactly)
-                        _shad_np = image_shadowed.cpu().detach().numpy().transpose(1, 2, 0)
-                        _gt_np = gt_image.cpu().detach().numpy().transpose(1, 2, 0)
-                        _, _full = ssim_skimage(_shad_np, _gt_np, win_size=5,
-                                                channel_axis=2, full=True, data_range=1.0)
-                        _mssim = (torch.tensor(_full).to(gt_image.device) * eval_mask.unsqueeze(-1)).sum() / (3 * eval_mask.sum())
-                        eval_ssim_shadowed.append(float(_mssim))
+                            # SSIM (skimage, masked, matching test script exactly)
+                            _shad_np = image_shadowed.cpu().detach().numpy().transpose(1, 2, 0)
+                            _gt_np = gt_image.cpu().detach().numpy().transpose(1, 2, 0)
+                            _, _full = ssim_skimage(_shad_np, _gt_np, win_size=5,
+                                                    channel_axis=2, full=True, data_range=1.0)
+                            _mssim = (torch.tensor(_full).to(gt_image.device) * eval_mask.unsqueeze(-1)).sum() / (3 * eval_mask.sum())
+                            eval_ssim_shadowed.append(float(_mssim))
 
                 # Compute averages
                 psnr_test /= len(config['cameras'])

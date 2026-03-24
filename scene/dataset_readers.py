@@ -303,7 +303,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir, sun_data=None):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir, sun_data=None, use_sun=False):
     images_folder=os.path.join(path, reading_dir)
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
@@ -336,15 +336,18 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, path, reading_dir, sun_dat
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path)
 
-        # Skip images without sun data when sun data is provided (e.g. PNGs without EXIF)
+        # Load sun data for this image if available
         sun_direction = None
         sun_elevation = None
         if sun_data is not None:
             sun_direction = get_sun_direction_for_image(sun_data, image_name)
             if sun_direction is None:
-                print(f"\nSkipping {image_name} - no sun data available")
-                continue
-            sun_elevation = get_sun_elevation_for_image(sun_data, image_name)
+                if use_sun:
+                    # Only skip images when sun model is actively used
+                    print(f"\nSkipping {image_name} - no sun data available")
+                    continue
+            else:
+                sun_elevation = get_sun_elevation_for_image(sun_data, image_name)
 
         image = Image.open(image_path)
 
@@ -393,7 +396,18 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, eval_file, llffhold=20, sun_json_path=None):
+def _find_eval_photos(source_path, eval_config_path=None):
+    """Look for eval_photos.txt in eval_files/ under source_path or eval_config_path."""
+    candidates = []
+    if eval_config_path:
+        candidates.append(os.path.join(eval_config_path, 'eval_photos.txt'))
+    candidates.append(os.path.join(source_path, 'eval_files', 'eval_photos.txt'))
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+def readColmapSceneInfo(path, images, eval, eval_file, llffhold=20, sun_json_path=None, use_sun=False, eval_config_path=None):
     # load cameras
     print(path)
     try:
@@ -412,7 +426,7 @@ def readColmapSceneInfo(path, images, eval, eval_file, llffhold=20, sun_json_pat
 
     reading_dir = "images" if images == None else images
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics,
-                                            path=path, reading_dir=reading_dir, sun_data=sun_data)
+                                            path=path, reading_dir=reading_dir, sun_data=sun_data, use_sun=use_sun)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
     train_cam_infos = cam_infos
 
@@ -426,8 +440,17 @@ def readColmapSceneInfo(path, images, eval, eval_file, llffhold=20, sun_json_pat
             train_cam_infos = [c for c in cam_infos if c.image_name in train_imgs]
             test_cam_infos = [c for c in cam_infos if c.image_name in test_imgs]
         else:
-            train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-            test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+            # Auto-discover eval_photos.txt — images listed there become the test set
+            eval_photos_path = _find_eval_photos(path, eval_config_path)
+            if eval_photos_path:
+                with open(eval_photos_path, 'r') as f:
+                    test_names = set(line.strip() for line in f if line.strip())
+                print(f"Using eval_photos.txt for split: {len(test_names)} test images from {eval_photos_path}")
+                test_cam_infos = [c for c in cam_infos if c.image_name in test_names]
+                train_cam_infos = [c for c in cam_infos if c.image_name not in test_names]
+            else:
+                train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+                test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []

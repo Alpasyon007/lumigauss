@@ -1,0 +1,24 @@
+% ============================================================================
+\section{Limitations and Future Work}
+\label{sec:limitations}
+% ============================================================================
+
+\paragraph{Single directional light.}
+Our model assumes a single dominant sun direction.
+Overcast conditions with diffuse illumination are handled only through the ambient term, which may be insufficient for accurate relighting under heavily clouded skies or scenes with multiple separate major light sources.
+
+\paragraph{Shadow map resolution.}
+The discrete shadow map introduces aliasing at object boundaries.
+Higher resolutions mitigate this at increased memory cost.
+Percentage-closer filtering or variance shadow maps could improve edge quality.
+
+\paragraph{Static geometry.}
+Like the underlying Gaussian splatting, our method assumes a static scene.
+Transient objects (pedestrians, vehicles) present in the training images are masked out.
+
+\paragraph{Normal quality.}
+Lambert shading quality depends on the accuracy of surfel normals.
+In regions with poor multi-view coverage, normals may be noisy, leading to incorrect N$\cdot$L values and shading artifacts.
+
+\paragraph{Future directions.}
+Promising extensions include learnable shadow bias, cascaded shadow maps for multi-scale scenes, differentiable shadow computation for end-to-end optimization, and integration with sky models for full environment relighting including cloud rendering.

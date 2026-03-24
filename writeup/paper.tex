@@ -17,6 +17,12 @@
 \usepackage{multirow}
 \usepackage{subcaption}
 \usepackage{siunitx}
+\usepackage{dblfloatfix}
+
+\setcounter{dbltopnumber}{2}
+\renewcommand{\dbltopfraction}{0.95}
+\renewcommand{\dblfloatpagefraction}{0.85}
+\renewcommand{\textfraction}{0.05}
 
 % draft helpers
 \newcommand{\todo}[1]{{\color{red}\textbf{[TODO:~#1]}}}
@@ -26,9 +32,9 @@
 \title{\ours{}: Physically-Based Sun Relighting for\\In-the-Wild Outdoor Scenes via Gaussian Splatting}
 
 \author{
-  \todo{Author Names}\\
-  \todo{Affiliations}\\
-  \texttt{\todo{emails}}
+    \IEEEauthorblockN{Alp Bora Orgun, Marco Volino, Adrian Hilton, Jean-Yves Guillemaut}
+    \IEEEauthorblockA{CVSSP, University of Surrey\\
+    \texttt{ao00821@surrey.ac.uk, m.volino@surrey.ac.uk, a.hilton@surrey.ac.uk, j.guillemaut@surrey.ac.uk}}
 }
 
 \begin{document}
@@ -38,14 +44,14 @@
 % ABSTRACT
 % ============================================================================
 \begin{abstract}
-We present \ours{}, a method for relighting outdoor scenes captured in uncontrolled conditions under natural sunlight.
-Built upon 2D Gaussian Splatting (2DGS) with appearance embeddings, we replace the per-image spherical-harmonic environment maps of prior work with an explicit physically-motivated sun lighting model that decomposes illumination into a direct solar term, per-image ambient light, and a shared global sky component represented as low-order spherical harmonics.
-Our explicit decomposition enables three capabilities absent from the baseline:
-(i)~geometry-based shadow computation via differentiable shadow mapping from an orthographic sun camera,
-(ii)~optional Cook-Torrance physically-based rendering with per-Gaussian roughness and metallic parameters, and
-(iii)~realistic day-cycle relighting by simply sweeping the sun direction through a solar trajectory.
-We further introduce a learnable per-Gaussian sky distinction parameter supervised by binary sky masks, an adaptive voxel-based densification strategy driven by per-pixel reconstruction loss with high-frequency awareness, and support for both surfel (2DGS) and classical 3D Gaussian rasterization backends.
-\todo{Quantitative results on NeRF-OSR benchmark.}
+    We present \ours{}, a method for relighting outdoor scenes captured in uncontrolled conditions under natural sunlight.
+    Built upon 2D Gaussian Splatting (2DGS) with appearance embeddings, we replace the per-image spherical-harmonic environment maps of prior work with an explicit physically-motivated sun lighting model that decomposes illumination into a direct solar term, scene-global ambient light parameterised as spherical harmonics of the sun direction, and a shared global sky component.
+    Sun intensity, colour correction, and ambient are all represented as low-order SH functions of the sun direction, reducing lighting parameters to $O(1)$ and enabling evaluation at novel sun positions unseen during training.
+    Our explicit decomposition enables several capabilities absent from the baseline:
+    (i)~geometry-based shadow computation via differentiable shadow mapping from an orthographic sun camera,
+    and (ii)~realistic day-cycle relighting by simply sweeping the sun direction through a solar trajectory.
+    We further introduce learnable per-camera sun direction calibration and a per-Gaussian sky distinction parameter supervised by binary sky masks.
+    On the NeRF-OSR benchmark, \ours{} outperforms NeRF-OSR on all three evaluated scenes and is competitive with LumiGauss, achieving higher PSNR on Landwehrplatz and Staatstheater (18.91 and 17.98 dB versus 18.01 and 17.02), lower MSE on two scenes, and improved SSIM on Ludwigskirche and Staatstheater (0.730 and 0.753 versus 0.700 and 0.729), while enabling explicit geometry-based shadows and relighting at novel sun directions.
 \end{abstract}
 
 % ============================================================================
@@ -57,7 +63,7 @@ Relighting outdoor scenes from uncontrolled photo collections is a long-standing
 Unlike studio environments with known illumination, in-the-wild captures exhibit varying sun position, cloud cover, and atmospheric conditions across images.
 Recent neural scene representations---particularly Neural Radiance Fields (NeRFs)~\cite{mildenhall2020nerf} and Gaussian Splatting~\cite{kerbl20233dgs}---have enabled photorealistic novel-view synthesis, but most methods bake illumination into the scene representation, preventing post-capture relighting.
 
-LumiGauss~\cite{joaxkal2024lumigauss} addresses this for outdoor scenes by combining 2D Gaussian Splatting (2DGS)~\cite{huang20242dgs} with per-image appearance embeddings and spherical-harmonic (SH) environment maps.
+Prior works such as LumiGauss~\cite{joaxkal2024lumigauss} addresses this for outdoor scenes by combining 2D Gaussian Splatting (2DGS)~\cite{huang20242dgs} with per-image appearance embeddings and spherical-harmonic (SH) environment maps.
 Each image is assigned a learnable SH environment that modulates Gaussian colors, enabling factorization of geometry, albedo, and illumination.
 However, the per-image SH representation has important limitations for outdoor relighting:
 \begin{itemize}
@@ -69,15 +75,13 @@ However, the per-image SH representation has important limitations for outdoor r
 We address these limitations with \ours{}, which makes the following contributions:
 
 \begin{enumerate}
-    \item \textbf{Explicit directional sun model} (\S\ref{sec:sun_model}): A physically-motivated lighting decomposition separating direct sunlight (with Lambert shading and an atmospheric color prior), per-image ambient light, and a shared global sky SH, enabling novel illumination synthesis.
+    \item \textbf{Explicit directional sun model with scene-global SH lighting} (\S\ref{sec:sun_model}): A physically-motivated lighting decomposition separating direct sunlight (with Lambert shading and an atmospheric colour prior), ambient light, and a shared global sky SH.  Sun intensity, colour correction, and ambient are represented as low-order SH functions of the sun direction, reducing lighting parameters to $O(1)$, enforcing physical consistency across views, and enabling evaluation at novel sun positions.
 
-    \item \textbf{Geometry-based shadow computation} (\S\ref{sec:shadows}): Multiple shadow algorithms---shadow mapping via orthographic sun projection, volumetric ray marching, and voxel-based tracing---applied to the direct lighting term.
+    \item \textbf{Geometry-based shadow computation} (\S\ref{sec:shadows}): Shadow mapping via orthographic sun projection applied to the direct lighting term.
+
+    \item \textbf{Learnable sun direction calibration} (\S\ref{sec:sun_cal}): Per-camera learnable offsets that jointly refine noisy input sun directions during training.
 
     \item \textbf{Learnable sky-scene distinction} (\S\ref{sec:sky_mask}): A per-Gaussian continuous parameter supervised by sky masks that controls both shadow casting and shadow receiving.
-
-    \item \textbf{Adaptive loss-driven densification} (\S\ref{sec:adaptive_dens}): A voxel grid that accumulates per-pixel photometric loss in 3D, identifies under-reconstructed regions via high-frequency and hole-filling heuristics, and spawns new Gaussians where needed.
-
-    \item \textbf{Optional Cook-Torrance PBR} (\S\ref{sec:pbr}): Per-Gaussian roughness and metallic parameters enabling a microfacet BRDF for scenes with specular materials.
 \end{enumerate}
 
 % ============================================================================
@@ -86,28 +90,24 @@ We address these limitations with \ours{}, which makes the following contributio
 % ============================================================================
 
 \paragraph{Neural Scene Relighting.}
+\todo{}
 NeRF-OSR~\cite{rudnev2022nerfOSR} decomposes outdoor NeRF scenes into albedo and per-image SH lighting, enabling appearance transfer between views.
 NeRF-W~\cite{martinbrualla2021nerfw} handles appearance variation with per-image latent codes.
 More recently, methods based on 3D Gaussian Splatting~\cite{kerbl20233dgs} have achieved real-time rendering while maintaining relighting capability.
 
 \paragraph{Outdoor Illumination Modeling.}
-Modeling outdoor illumination typically involves representing the sun as a directional source and the sky as a hemisphere of diffuse light~\cite{lalonde2012estimating,hold-geoffroy2019deep}.
+\todo{}Modeling outdoor illumination typically involves representing the sun as a directional source and the sky as a hemisphere of diffuse light~\cite{lalonde2012estimating,hold-geoffroy2019deep}.
 The color of sunlight varies with elevation due to atmospheric Rayleigh scattering, producing the characteristic warm tones at sunrise and sunset~\cite{preetham1999practical,nishita1993display}.
 Our sun color prior draws on this atmospheric model.
 
 \paragraph{Shadow Computation.}
-Shadow mapping~\cite{williams1978casting} renders a depth map from the light's viewpoint and compares fragment depths to determine occlusion.
+\todo{}Shadow mapping~\cite{williams1978casting} renders a depth map from the light's viewpoint and compares fragment depths to determine occlusion.
 In the Gaussian splatting setting, the unstructured point-based representation requires adapting shadow mapping to work with splatted depth rather than mesh rasterization.
-We additionally implement volumetric approaches---ray marching through Gaussian fields and voxel-based shadow tracing---as alternatives for different quality/speed trade-offs.
 
 \paragraph{2D Gaussian Splatting.}
-2DGS~\cite{huang20242dgs} represents scene geometry as oriented planar splats (surfels), providing well-defined surface normals from the splat orientation.
+\todo{}2DGS~\cite{huang20242dgs} represents scene geometry as oriented planar splats (surfels), providing well-defined surface normals from the splat orientation.
 LumiGauss~\cite{joaxkal2024lumigauss} builds on 2DGS, leveraging the surfel normals for hemisphere-based SH evaluation.
-We inherit this representation and additionally leverage the normals for Lambert shading (N$\cdot$L) and optional PBR.
-
-\paragraph{Adaptive Densification.}
-The original 3DGS~\cite{kerbl20233dgs} densifies Gaussians based on view-space gradient magnitude, which can miss under-reconstructed regions that happen to have low gradient.
-Several works have proposed improved densification strategies~\cite{ye2024absgs,bulo2024revising}; our approach operates in 3D voxel space and is driven by photometric loss, providing spatial awareness absent from gradient-only methods.
+We inherit this representation and additionally leverage the normals for Lambert shading (N$\cdot$L).
 
 % ============================================================================
 \section{Method}
@@ -134,30 +134,42 @@ Figure~\ref{fig:pipeline} provides an overview.
 We decompose the illumination reaching each Gaussian into three physically-motivated terms:
 
 \begin{equation}
-    L(\mathbf{x}, \mathbf{n}) = \underbrace{C_{\text{sun}}(\theta) \cdot I_i \cdot \max(0, \mathbf{n} \cdot \mathbf{l}_i)}_{\text{direct sunlight}} + \underbrace{\mathbf{c}_i^{\text{amb}}}_{\text{ambient}} + \underbrace{E_{\text{sky}}(\mathbf{n})}_{\text{global sky}}
+    L(\mathbf{x}, \mathbf{n}) = \underbrace{C_{\text{sun}}(\theta) \cdot I(\mathbf{l}_i) \cdot \mathbf{k}(\mathbf{l}_i) \cdot \max(0, \mathbf{n} \cdot \mathbf{l}_i)}_{\text{direct sunlight}} + \underbrace{\mathbf{c}^{\text{amb}}(\mathbf{l}_i)}_{\text{ambient}} + \underbrace{E_{\text{sky}}(\mathbf{n})}_{\text{global sky}}
     \label{eq:lighting}
 \end{equation}
 
 \noindent where $\mathbf{n}$ is the surface normal (derived from the surfel quaternion and scale, \S\ref{sec:normals}), $\mathbf{l}_i$ is the sun direction for image $i$, and:
 
 \paragraph{Sun color prior $C_{\text{sun}}(\theta)$.}
-We model the spectral shift of sunlight with elevation $\theta$ using a simplified Rayleigh scattering model.
-The transmittance per RGB channel is:
+We model the spectral shift of sunlight with elevation $\theta$ using an atmospheric Rayleigh scattering approximation.
+The raw transmittance per RGB channel is:
 \begin{equation}
-    T_c = \exp\!\left(-\beta_R \cdot \text{AM}(\theta) \cdot \left(\frac{\lambda_c}{650}\right)^{-4} \cdot s\right)
+    \hat{T}_c = \exp\!\left(-\beta_R \cdot \text{AM}(\theta) \cdot \left(\frac{\lambda_c}{650}\right)^{-4} \cdot s\right)
     \label{eq:sun_color}
 \end{equation}
-where $\text{AM}(\theta) = 1/\sin(\theta)$ is the air mass, $\lambda_c \in \{650, 550, 450\}$\,nm for R, G, B, $\beta_R = 0.05$ is the Rayleigh coefficient, and $s = 8.0$ is a scattering scale.
+where $\text{AM}(\theta) = 1/\sin(\theta)$ is the air mass (clamped to $10 + 2(5 - \theta)$ for $\theta < 5^\circ$ to avoid singularity at the horizon), $\lambda_c \in \{650, 550, 450\}$\,nm for R, G, B, $\beta_R = 0.0596$ is the Rayleigh extinction coefficient, and $s = 0.15$ is a scattering scale.
+To ensure the prior yields neutral white light at zenith, we normalise by the zenith ($\theta = 90^\circ$) transmittance:
+\begin{equation}
+    C_{\text{sun},c}(\theta) = \operatorname{clamp}\!\left(\frac{\hat{T}_c(\theta)}{\hat{T}_c(90^\circ)},\; 0.1,\; 1.5\right)
+\end{equation}
 This produces physically plausible warm tones at low elevations and neutral white at zenith.
 
-\paragraph{Per-image parameters.}
-Each image has three learnable parameters:
+\paragraph{Scene-global SH lighting parameters.}
+Rather than storing per-image scalars---which cannot generalise to unseen sun positions---we represent the three lighting quantities as low-order spherical-harmonic functions of the \emph{sun direction} $\mathbf{l}$:
+\begin{align}
+    I(\mathbf{l})                       & = \sum_{l=0}^{d}\sum_{m=-l}^{l} a_{lm}\, Y_l^m(\hat{\mathbf{l}}), \label{eq:scene_sh_int}          \\
+    \mathbf{k}(\mathbf{l})              & = \sum_{l=0}^{d}\sum_{m=-l}^{l} \mathbf{b}_{lm}\, Y_l^m(\hat{\mathbf{l}}), \label{eq:scene_sh_col} \\
+    \mathbf{c}^{\text{amb}}(\mathbf{l}) & = \sum_{l=0}^{d}\sum_{m=-l}^{l} \mathbf{d}_{lm}\, Y_l^m(\hat{\mathbf{l}}), \label{eq:scene_sh_amb}
+\end{align}
+where $d = 2$ (9 SH coefficients each) by default, giving:
 \begin{itemize}
-    \item $I_i \in \mathbb{R}^+$: sun intensity scalar (initialized to 4.0)
-    \item $\mathbf{k}_i \in [0.5, 2.0]^3$: color correction multiplier on $C_{\text{sun}}$, accommodating cloud cover and atmospheric variation
-    \item $\mathbf{c}_i^{\text{amb}} \in \mathbb{R}^{3}_+$: ambient/indirect illumination (initialized to 0.15)
+    \item $I(\mathbf{l}) \in \mathbb{R}^+$: sun intensity multiplier (DC initialized to $4.0 / c_0$, $c_0 = 0.282095$)
+    \item $\mathbf{k}(\mathbf{l}) \in [0.5, 2.0]^3$: colour correction on $C_{\text{sun}}$, accommodating cloud cover and atmospheric variation (DC initialized to $1.0 / c_0$)
+    \item $\mathbf{c}^{\text{amb}}(\mathbf{l}) \in \mathbb{R}^{3}_+$: ambient/indirect illumination (DC initialized to $0.15 / c_0$)
 \end{itemize}
-The effective sun color is $C_{\text{sun}}(\theta) \cdot \mathbf{k}_i \cdot I_i$.
+Higher-order SH terms start at zero.
+The effective sun colour is $C_{\text{sun}}(\theta) \cdot \mathbf{k}(\mathbf{l}) \cdot I(\mathbf{l})$.
+This reduces the total lighting parameters to a fixed 39 scalars (9 for intensity, $3{\times}9$ for colour correction and ambient), enforces physical consistency across views with similar sun positions, and---crucially---enables evaluation at novel sun directions unseen during training.
 
 \paragraph{Global sky SH.}
 We represent the directional sky illumination as degree-1 spherical harmonics $E_{\text{sky}} \in \mathbb{R}^{3 \times 4}$, shared across all images.
@@ -198,12 +210,12 @@ This yields consistent camera-facing normals for Lambert shading.
 Shadows are applied exclusively to the direct sunlight term; ambient and sky illumination remain unaffected.
 The shadowed intensity for Gaussian $j$ in image $i$ becomes:
 \begin{equation}
-    L_{\text{shad}} = C_{\text{sun}} \cdot I_i \cdot (\mathbf{n}\cdot\mathbf{l}_i) \cdot \sigma_j + \mathbf{c}_i^{\text{amb}} + E_{\text{sky}}(\mathbf{n})
+    L_{\text{shad}} = C_{\text{sun}} \cdot I(\mathbf{l}_i) \cdot \mathbf{k}(\mathbf{l}_i) \cdot (\mathbf{n}\cdot\mathbf{l}_i) \cdot \sigma_j + \mathbf{c}^{\text{amb}}(\mathbf{l}_i) + E_{\text{sky}}(\mathbf{n})
     \label{eq:shadowed}
 \end{equation}
 where $\sigma_j \in [0, 1]$ is the shadow mask (1 = lit, 0 = shadowed).
 
-We implement three shadow computation methods:
+We implement shadow computation using shadow mapping.
 
 \subsubsection{Shadow Mapping}
 \label{sec:shadow_map}
@@ -224,21 +236,23 @@ For each Gaussian $j$ with world position $\mathbf{x}_j$, we project into the su
 where $d_j$ is the projected depth, $\mathbf{u}_j$ is the UV coordinate, and $b$ is a bias term to prevent self-shadowing.
 Gaussians outside the shadow frustum default to lit.
 
-\subsubsection{Volumetric Ray Marching}
+% ── 3.3b Sun Direction Calibration ─────────────────────────────────────────
+\subsection{Learnable Sun Direction Calibration}
+\label{sec:sun_cal}
 
-For each Gaussian, we march a ray toward the sun through the scene, accumulating opacity contributions from nearby Gaussians using a spatial hash grid for acceleration.
-The shadow factor is:
+Sun directions from metadata (e.g.\ solar position databases or SfM-derived estimates) may be noisy or biased.
+We optionally refine them during training by attaching a learnable offset $\Delta\mathbf{l}_i \in \mathbb{R}^3$ (initialized to zero) to each camera:
 \begin{equation}
-    \sigma_j = \exp\!\left(-2 \sum_{k=1}^{K} o_k(\mathbf{x}_j + k \Delta \mathbf{l})\right)
+    \hat{\mathbf{l}}_i = \frac{\mathbf{l}_i + \Delta\mathbf{l}_i}{\|\mathbf{l}_i + \Delta\mathbf{l}_i\|}
+    \label{eq:sun_cal}
 \end{equation}
-where $o_k$ is the maximum Gaussian opacity contribution at step $k$ and $K$ is the number of march steps.
-This produces naturally soft shadows modulated by Gaussian opacity.
-
-\subsubsection{Voxel-Based Tracing}
-
-The scene is voxelized into a $V^3$ grid by splatting Gaussian opacity weighted by a Gaussian kernel.
-Rays are marched from each Gaussian toward the sun through the voxel grid, accumulating opacity per step.
-This method trades accuracy for speed and is suitable for preview rendering.
+The refined direction $\hat{\mathbf{l}}_i$ replaces $\mathbf{l}_i$ in all downstream computations (Lambert shading, shadow mapping, scene-SH evaluation).
+To prevent unconstrained drift, we apply an L2 regulariser:
+\begin{equation}
+    \mathcal{L}_{\text{sun-cal}} = \lambda_{\text{sc}} \|\Delta\mathbf{l}_i\|^2
+    \label{eq:sun_cal_reg}
+\end{equation}
+Calibration is active only in the window $[T_{\text{sc,start}},\, T_{\text{sc,end}}]$ (default 10\,k--30\,k iterations), giving the geometry time to stabilise before the sun direction is adjusted, and freezing the directions before the final refinement iterations.
 
 % ── 3.4 Learnable Sky Mask ──────────────────────────────────────────────────
 \subsection{Learnable Sky-Scene Distinction}
@@ -259,101 +273,87 @@ Given binary sky masks $M^{\text{sky}}$ (1 = non-sky, 0 = sky), we render each v
 \end{equation}
 This is differentiable through the rasterizer and jointly optimized with all other parameters.
 
-% ── 3.5 Adaptive Densification ──────────────────────────────────────────────
-\subsection{Adaptive Loss-Driven Densification}
-\label{sec:adaptive_dens}
-
-Standard gradient-based densification in 3DGS~\cite{kerbl20233dgs} adds Gaussians where the view-space position gradient is large, but can miss regions with consistent but high reconstruction error, or fail to fill holes in the geometry.
-We propose a complementary voxel-based densification strategy driven directly by the photometric loss.
-
-\subsubsection{Loss Accumulation in 3D}
-
-We maintain a voxel grid $\mathcal{G} \in \mathbb{R}^{G^3}$ (default $G = 48$) spanning the scene's axis-aligned bounding box.
-At each training iteration, for each pixel with loss $\ell > 0$, we unproject it to 3D using the rendered depth and camera intrinsics, then scatter-add the loss to the corresponding voxel:
+\paragraph{Sky distance regularisation.}
+To prevent sky Gaussians from drifting into the scene interior, we add a penalty pushing them away from the scene centre:
 \begin{equation}
-    \mathcal{G}[\text{vox}(\mathbf{x}_{\text{3D}})] \mathrel{+}= \ell(\mathbf{x}_{\text{3D}})
+    \mathcal{L}_{\text{sky-dist}} = \lambda_{\text{sd}} \frac{1}{|\mathcal{S}|}\sum_{j \in \mathcal{S}} \left[\max(0,\; f \cdot r_{\text{scene}} - \|\mathbf{x}_j\|)\right]^2
+    \label{eq:sky_dist}
 \end{equation}
+where $\mathcal{S} = \{j : w_j^{\text{sky}} < 0.5\}$ is the set of identified sky Gaussians, $r_{\text{scene}}$ is the cameras extent, and $f = 4$ (default) is the minimum-distance factor.
 
-\paragraph{High-frequency boosting.}
-Under-reconstructed textured regions should receive higher densification priority.
-We compute a Sobel edge magnitude map on the reference image and boost the loss contribution for pixels exceeding the $q_{\text{hf}}$-quantile of edge magnitude:
-\begin{equation}
-    \ell' = \ell \cdot (1 + \beta_{\text{hf}} \cdot \mathbb{1}[\text{Sobel}(\mathbf{x}) > Q_{q_{\text{hf}}}])
-\end{equation}
-where $\beta_{\text{hf}}$ is the boost factor (default 0.75) and $q_{\text{hf}}$ is the quantile threshold (default 0.6).
+\begin{table*}[!tb]
+    \centering
+    \caption{Quantitative comparison on NeRF-OSR scenes.}
+    \label{tab:nvs}
+    \setlength{\tabcolsep}{3pt}
+    \small
+    \begin{tabular}{l cccc cccc cccc}
+        \toprule
+                                                      & \multicolumn{4}{c}{Landwehrplatz} & \multicolumn{4}{c}{Ludwigskirche} & \multicolumn{4}{c}{Staatstheater}                                                                                    \\
+        \cmidrule(lr){2-5} \cmidrule(lr){6-9} \cmidrule(lr){10-13}
+        Method                                        & PSNR\,$\uparrow$                  & MSE\,$\downarrow$                 & MAE\,$\downarrow$                 & SSIM\,$\uparrow$
+                                                      & PSNR\,$\uparrow$                  & MSE\,$\downarrow$                 & MAE\,$\downarrow$                 & SSIM\,$\uparrow$
+                                                      & PSNR\,$\uparrow$                  & MSE\,$\downarrow$                 & MAE\,$\downarrow$                 & SSIM\,$\uparrow$                                                                 \\
+        \midrule
+        Yu et al.$_{\text{u/s}}$~\cite{yu2021outdoor} & 15.17                             & 0.033                             & 0.133                             & 0.376            & 17.87 & 0.017 & 0.097 & 0.378 & 15.28 & 0.032 & 0.138 & 0.385 \\
+        Philip et al.~\cite{philip2019multiview}      & 12.28                             & 0.062                             & 0.179                             & 0.319            & 16.63 & 0.023 & 0.113 & 0.367 & 12.34 & 0.065 & 0.200 & 0.272 \\
+        NeRF-OSR~\cite{rudnev2022nerfOSR}             & 16.65                             & 0.024                             & 0.114                             & 0.501            & 18.72 & 0.014 & 0.090 & 0.468 & 15.43 & 0.029 & 0.133 & 0.517 \\
+        NeRF-OSR*~\cite{rudnev2022nerfOSR}            & 15.66                             & --                                & --                                & --               & 19.34 & 0.012 & --    & --    & 16.35 & 0.027 & --    & --    \\
+        SR-TensoRF~\cite{jin2023tensoir}              & 16.74                             & 0.024                             & 0.093                             & 0.653            & 17.30 & 0.021 & 0.096 & 0.542 & 15.43 & 0.030 & 0.111 & 0.632 \\
+        FEGR~\cite{fegr2024}                          & 17.57                             & 0.018                             & --                                & --               & 21.53 & 0.007 & --    & --    & 17.00 & --    & --    & --    \\
+        SOL-NeRF~\cite{solnerf2024}                   & 17.58                             & 0.028                             & --                                & 0.618            & 21.23 & 0.008 & --    & \textbf{0.749} & \textbf{18.18} & 0.019 & --    & 0.680 \\
+        NeuSky~\cite{neusky2024}                      & 18.31                             & 0.016                             & --                                & --               & \textbf{22.50} & \textbf{0.005} & --    & --    & 16.66 & 0.023 & --    & --    \\
+        LumiGauss~\cite{joaxkal2024lumigauss}         & 18.01                             & 0.017                             & 0.096                             & \textbf{0.778}  & 19.59 & 0.012 & \textbf{0.085} & 0.700 & 17.02 & 0.021 & 0.107 & 0.729 \\
+        Ours                                          & \textbf{18.91}                   & \textbf{0.015}                   & \textbf{0.091}                   & 0.751            & 19.08 & 0.013 & 0.086 & 0.730 & 17.98 & \textbf{0.017} & \textbf{0.096} & \textbf{0.753} \\
+        % \midrule
+        % Yu et al.~\cite{yu2021outdoor}                          & 15.84                             & 0.028                             & 0.134                             & 0.392            & 18.71   & 0.014   & 0.088   & 0.400   & 15.43   & 0.031   & 0.136   & 0.363   \\
+        % Philip et al.$_{\text{d/s}}$~\cite{philip2019multiview} & 12.85                             & 0.054                             & 0.169                             & 0.414            & 17.37   & 0.018   & 0.110   & 0.429   & 11.85   & 0.073   & 0.210   & 0.184   \\
+        % NeRF-OSR$_{\text{d/s}}$~\cite{rudnev2022nerfOSR}        & 17.38                             & 0.021                             & 0.106                             & 0.576            & 19.86   & 0.011   & 0.080   & 0.626   & 15.83   & 0.026   & 0.133   & 0.556   \\
+        % LumiGauss$_{\text{d/s}}$~\cite{joaxkal2024lumigauss}    & 18.40                             & 0.016                             & 0.094                             & 0.746            & 20.13   & 0.011   & --      & 0.727   & 17.24   & 0.020   & 0.106   & 0.715   \\
+        % \midrule
+        % LumiGauss$\,\dagger$                                    & 15.03                             & 0.034                             & 0.139                             & 0.58             & 19.34   & 0.015   & 0.094   & 0.693   & 16.09   & 0.025   & --      & 0.665   \\
+        % LumiGauss$\,\ddagger$                                   & 17.59                             & 0.019                             & 0.100                             & 0.733            & 19.05   & 0.016   & 0.097   & 0.680   & 16.83   & 0.022   & 0.110   & 0.694   \\
+        % LumiGauss $\setminus\,\ell_{0.1}$                       & 18.30                             & 0.016                             & 0.095                             & 0.744            & 20.15   & 0.010   & 0.080   & 0.734   & 17.25   & 0.020   & 0.106   & 0.712   \\
+        % LumiGauss $\setminus\,\ell_{s}$                         & 17.35                             & 0.020                             & 0.100                             & 0.728            & 20.17   & 0.012   & 0.081   & 0.729   & 17.10   & 0.020   & 0.106   & 0.703   \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
 
-\paragraph{Hole filling.}
-Pixels with zero rendered depth indicate geometric holes.
-For these pixels, we cast a ray through the scene AABB using slab-method ray-AABB intersection and sample random 3D points along the valid ray segment.
-Only holes with loss above a configurable quantile are populated, preventing densification in truly empty regions (e.g., sky).
-
-\subsubsection{Triggering and Budget Allocation}
-
-Every $T$ iterations (default 250), we evaluate the accumulated grid:
-\begin{enumerate}
-    \item Apply temporal EMA smoothing: $\bar{\mathcal{G}} = \max(\mathcal{G}_{\text{avg}}, \alpha\cdot\text{EMA} + (1-\alpha)\cdot\mathcal{G}_{\text{avg}})$
-    \item Select candidate cells: observed, sparse (Gaussian count below threshold), and high-loss (above configurable quantile)
-    \item Optionally filter by camera-center distance to prevent hallucination in poorly observed regions
-    \item Allocate a budget $B$ (default 4096 Gaussians) to selected cells, weighted by loss magnitude and sparsity deficit
-\end{enumerate}
-
-New Gaussians are initialized at random positions within their cell, with small scale, low opacity (0.12), and albedo set to the scene mean, supporting the subsequent optimization to refine them.
-
-% ── 3.6 PBR ────────────────────────────────────────────────────────────────
-\subsection{Cook-Torrance PBR Rendering}
-\label{sec:pbr}
-
-For scenes with specular materials, we optionally augment each Gaussian with roughness $r_j \in [0.04, 1]$ and metallic $m_j \in [0, 1]$ parameters, and replace the Lambert-only shading with a full Cook-Torrance microfacet BRDF:
-
-\begin{equation}
-    f(\mathbf{l}, \mathbf{v}) = \frac{(1 - F)(1 - m)\,\mathbf{a}}{\pi} + \frac{D \cdot G \cdot F}{4(\mathbf{n}\cdot\mathbf{v})(\mathbf{n}\cdot\mathbf{l})}
-    \label{eq:brdf}
-\end{equation}
-
-where:
-\begin{align}
-    D &= \frac{\alpha^2}{\pi\left((\mathbf{n}\cdot\mathbf{h})^2(\alpha^2 - 1) + 1\right)^2} & \text{(GGX NDF)} \\
-    G &= G_1(\mathbf{v})\,G_1(\mathbf{l}), \;\; G_1(\mathbf{x}) = \frac{\mathbf{n}\cdot\mathbf{x}}{\mathbf{n}\cdot\mathbf{x}(1-k)+k} & \text{(Schlick-GGX)} \\
-    F &= F_0 + (1-F_0)(1-\mathbf{v}\cdot\mathbf{h})^5 & \text{(Schlick)}
-\end{align}
-with $\alpha = r^2$, $k = (r+1)^2/8$, $F_0 = 0.04(1-m) + \mathbf{a}\cdot m$, and $\mathbf{h} = (\mathbf{l}+\mathbf{v})/\|\mathbf{l}+\mathbf{v}\|$.
-
-The indirect (ambient + sky) contribution is modulated by material properties:
-\begin{equation}
-    L_{\text{ind}} = \mathbf{a}(1-m)(\mathbf{c}^{\text{amb}} + E_{\text{sky}}) + F_0 \cdot 0.25 \cdot (\mathbf{c}^{\text{amb}} + E_{\text{sky}})
-\end{equation}
 
 % ============================================================================
 \section{Training}
 \label{sec:training}
 % ============================================================================
 
-Training proceeds in three phases to ensure stable optimization:
+\todo{}
 
-\paragraph{Phase 1: Geometry warmup (iterations 0--$T_w$).}
-Only the unshadowed rendering loss is active, using Eq.~\ref{eq:lighting} without shadows.
-This allows the geometry, albedo, sun parameters, and sky SH to converge to a consistent state before introducing the more complex shadowed loss.
+% Training proceeds in three phases.
+% Crucially, the shadowed rendering loss is the \emph{primary} objective from the very first iteration: if the model were trained unshadowed against ground-truth images that contain real shadows, the optimisation would bake shadow patterns into the albedo since no shadow mask is available to explain the dark regions.
 
-\paragraph{Phase 2: Transition ($T_w$--$T_s$).}
-Learning rates for lighting parameters are adjusted.
-Standard gradient-based densification and pruning remain active.
+% \paragraph{Phase 1: Early warmup (iterations 0--$T_w$, default $T_w{=}20{,}000$).}
+% The shadowed photometric loss (Eq.~\ref{eq:shadowed}) is active with weight $\lambda^{\text{shad}} = 1.0$.
+% A small unshadowed regulariser ($\lambda^{\text{unshad}} = 0.01$) encourages clean albedo without overriding the shadow signal.
+% 2DGS surfel regularisation ($\mathcal{L}_{\text{normal}},\, \mathcal{L}_{\text{dist}}$) is enabled after iteration~6\,000.
 
-\paragraph{Phase 3: Shadowed training (iterations $> T_s$).}
-The full shadowed rendering (Eq.~\ref{eq:shadowed}) becomes the primary photometric loss.
-Shadow maps are recomputed each iteration.
-Adaptive densification is activated if enabled.
+% \paragraph{Phase 2: Lighting refinement ($T_w$--$T_s$, default $T_s{=}20{,}500$).}
+% The unshadowed regulariser is turned off ($\lambda^{\text{unshad}} = 0$), and only the shadowed loss drives the optimisation.
+% Shadow maps and lighting parameters are refined jointly.
 
-\paragraph{Loss function.}
-The total loss combines:
-\begin{equation}
-    \mathcal{L} = \lambda_{\text{shad}} \mathcal{L}_{\text{img}}^{\text{shad}} + \lambda_{\text{unshad}} \mathcal{L}_{\text{img}}^{\text{unshad}} + \lambda_{\text{sky}} \mathcal{L}_{\text{sky}} + \lambda_{\text{reg}} \mathcal{L}_{\text{reg}}
-    \label{eq:total_loss}
-\end{equation}
-where $\mathcal{L}_{\text{img}} = (1-\lambda_{\text{ssim}})\mathcal{L}_1 + \lambda_{\text{ssim}}(1-\text{SSIM})$ is the standard photometric loss, $\mathcal{L}_{\text{sky}}$ is Eq.~\ref{eq:sky_loss}, and $\mathcal{L}_{\text{reg}}$ includes:
-\begin{itemize}
-    \item \textbf{Surfel regularization}: normal consistency and depth distortion losses from 2DGS~\cite{huang20242dgs}
-    \item \textbf{Sun regularization}: penalty if ambient-to-sun ratio exceeds 0.3, L2 on color correction toward unity, L2 on sky SH to prevent degenerate solutions
-\end{itemize}
+% \paragraph{Phase 3: Full training (iterations $> T_s$).}
+% The shadowed loss remains the sole image-level objective ($\lambda^{\text{shad}} = 1.0$).
+% Sun direction calibration (\S\ref{sec:sun_cal}), if enabled, is active from iteration~10\,k to~30\,k.
+
+% \paragraph{Loss function.}
+% The total loss combines:
+% \begin{equation}
+%     \mathcal{L} = \lambda^{\text{shad}} \mathcal{L}_{\text{img}}^{\text{shad}} + \lambda^{\text{unshad}} \mathcal{L}_{\text{img}}^{\text{unshad}} + \mathcal{L}_{\text{sky}} + \mathcal{L}_{\text{sky-dist}} + \mathcal{L}_{\text{sun-cal}} + \mathcal{L}_{\text{sun-reg}} + \mathcal{L}_{\text{surfel}}
+%     \label{eq:total_loss}
+% \end{equation}
+% where $\mathcal{L}_{\text{img}} = (1-\lambda_{\text{ssim}})\mathcal{L}_1 + \lambda_{\text{ssim}}(1-\text{SSIM})$ is the standard photometric loss, $\mathcal{L}_{\text{sky}}$ is Eq.~\ref{eq:sky_loss}, $\mathcal{L}_{\text{sky-dist}}$ is Eq.~\ref{eq:sky_dist}, $\mathcal{L}_{\text{sun-cal}}$ is Eq.~\ref{eq:sun_cal_reg}, and:
+% \begin{itemize}
+%     \item \textbf{Surfel regularisation} $\mathcal{L}_{\text{surfel}}$: normal consistency and depth distortion losses from 2DGS~\cite{huang20242dgs}.
+%     \item \textbf{Sun regularisation} $\mathcal{L}_{\text{sun-reg}}$: (a) a penalty if the ambient-to-sun intensity ratio exceeds 0.3, (b) L2 on the colour correction SH DC term toward $1.0/c_0$ and L2 on higher-order SH terms to keep corrections smooth, (c) L2 on sky SH coefficients to prevent degenerate solutions, (d) L2 on higher-order intensity and ambient SH terms, and (e) a penalty when sky SH DC magnitude exceeds half the ambient level.
+% \end{itemize}
 
 % ============================================================================
 \section{Day-Cycle Relighting}
@@ -368,14 +368,13 @@ We provide a day-cycle renderer that:
     \item Produces a video sequence showing realistic time-of-day illumination changes with moving shadows
 \end{enumerate}
 
-Since the sky SH, albedo, and geometry are shared across all images, only the direct term and shadow map change---ambient and sky contributions can be held fixed or adapted to the new sun elevation.
+Since the sky SH, albedo, and geometry are shared across all images, only the direct term and shadow map change.
+The intensity, colour correction, and ambient are evaluated as SH functions of the new sun direction (Eqs.~\ref{eq:scene_sh_int}--\ref{eq:scene_sh_amb}), providing physically consistent lighting at sun positions never seen during training.
 
 % ============================================================================
 \section{Experiments}
 \label{sec:experiments}
 % ============================================================================
-
-\todo{This section to be filled with experimental results.}
 
 \subsection{Datasets}
 
@@ -384,11 +383,13 @@ We use the \texttt{lk2} and \texttt{st} scenes with associated sun direction met
 
 \subsection{Implementation Details}
 
-We train for 40{,}000 iterations with warmup $T_w = 20{,}000$ and shadow start $T_s = 20{,}500$.
-Shadow maps use $8192 \times 8192$ resolution with bias $b = 0.1$.
-The sun model parameters are optimized with learning rate $5 \times 10^{-3}$ for intensities and $1 \times 10^{-3}$ for sky SH.
-Albedo learning rate is $2.5 \times 10^{-3}$.
-When adaptive densification is enabled, we use grid resolution $G = 48$, interval $T = 250$, and budget $B = 4096$.
+\todo{}
+
+% We train for 40{,}000 iterations with warmup $T_w = 20{,}000$ and shadow start $T_s = 20{,}500$.
+% Shadow maps use $512 \times 512$ resolution (default) with depth bias $b = 0.1$.
+% Sun model parameters are optimised with a base environment learning rate of $2 \times 10^{-2}$: intensity and ambient use $2{\times}$ this rate, colour correction uses $0.5{\times}$, and sky SH uses $1{\times}$.
+% Albedo learning rate is $2.5 \times 10^{-3}$.
+% When sun direction calibration is enabled, the per-camera deltas use learning rate $0.1$ with L2 weight $\lambda_{\text{sc}} = 10^{-4}$, active from iteration~10\,k to~30\,k.
 
 \subsection{Baselines}
 
@@ -400,21 +401,6 @@ When adaptive densification is enabled, we use grid resolution $G = 48$, interva
 
 \subsection{Novel-View Synthesis}
 
-\begin{table}[t]
-    \centering
-    \caption{Novel-view synthesis quality on NeRF-OSR scenes.}
-    \label{tab:nvs}
-    \begin{tabular}{lccc}
-        \toprule
-        Method & PSNR $\uparrow$ & SSIM $\uparrow$ & LPIPS $\downarrow$ \\
-        \midrule
-        NeRF-OSR~\cite{rudnev2022nerfOSR} & \todo{} & \todo{} & \todo{} \\
-        LumiGauss~\cite{joaxkal2024lumigauss} & \todo{} & \todo{} & \todo{} \\
-        \ours{} (Lambert) & \todo{} & \todo{} & \todo{} \\
-        \ours{} (PBR) & \todo{} & \todo{} & \todo{} \\
-        \bottomrule
-    \end{tabular}
-\end{table}
 
 \subsection{Relighting Quality}
 
@@ -422,23 +408,7 @@ When adaptive densification is enabled, we use grid resolution $G = 48$, interva
 
 \subsection{Ablation Studies}
 
-\begin{table}[t]
-    \centering
-    \caption{Ablation study on the \texttt{lk2} scene.}
-    \label{tab:ablation}
-    \begin{tabular}{lccc}
-        \toprule
-        Configuration & PSNR $\uparrow$ & SSIM $\uparrow$ & LPIPS $\downarrow$ \\
-        \midrule
-        Full model & \todo{} & \todo{} & \todo{} \\
-        w/o shadows & \todo{} & \todo{} & \todo{} \\
-        w/o sun color prior & \todo{} & \todo{} & \todo{} \\
-        w/o sky mask & \todo{} & \todo{} & \todo{} \\
-        w/o adaptive dens. & \todo{} & \todo{} & \todo{} \\
-        w/o global sky SH & \todo{} & \todo{} & \todo{} \\
-        \bottomrule
-    \end{tabular}
-\end{table}
+\todo{Add ablation studies.}
 
 % ============================================================================
 \section{Limitations and Future Work}
@@ -447,7 +417,7 @@ When adaptive densification is enabled, we use grid resolution $G = 48$, interva
 
 \paragraph{Single directional light.}
 Our model assumes a single dominant sun direction.
-Overcast conditions with diffuse illumination are handled only through the ambient term, which may be insufficient for accurate relighting under heavily clouded skies.
+Overcast conditions with diffuse illumination are handled only through the ambient term, which may be insufficient for accurate relighting under heavily clouded skies or scenes with multiple separate major light sources.
 
 \paragraph{Shadow map resolution.}
 The discrete shadow map introduces aliasing at object boundaries.
@@ -456,7 +426,7 @@ Percentage-closer filtering or variance shadow maps could improve edge quality.
 
 \paragraph{Static geometry.}
 Like the underlying Gaussian splatting, our method assumes a static scene.
-Transient objects (pedestrians, vehicles) present in the training images can cause artifacts and are not explicitly handled.
+Transient objects (pedestrians, vehicles) present in the training images are masked out.
 
 \paragraph{Normal quality.}
 Lambert shading quality depends on the accuracy of surfel normals.
@@ -471,88 +441,97 @@ Promising extensions include learnable shadow bias, cascaded shadow maps for mul
 % ============================================================================
 
 We presented \ours{}, a method for physically-based outdoor scene relighting using Gaussian splatting.
-By replacing unconstrained per-image SH environments with an explicit directional sun model, we enable geometry-based shadow computation, atmospheric color priors, and realistic day-cycle relighting---capabilities that are fundamentally out of reach for per-image latent representations.
-Our adaptive densification and learnable sky distinction further improve reconstruction quality.
+By replacing unconstrained per-image SH environments with an explicit directional sun model, we enable geometry-based shadow computation, atmospheric colour priors, and realistic day-cycle relighting---capabilities that are fundamentally out of reach for per-image latent representations.
+The scene-global SH parameterisation of intensity, colour correction, and ambient further enables evaluation at novel sun directions unseen during training.
+Learnable sun direction calibration and the learnable sky distinction further improve reconstruction quality.
 \todo{Summary of quantitative improvements.}
 
 % ============================================================================
 % REFERENCES
 % ============================================================================
 {\small
-\bibliographystyle{IEEEtran}
-\begin{thebibliography}{99}
+    \bibliographystyle{IEEEtran}
+    \begin{thebibliography}{99}
 
-\bibitem{mildenhall2020nerf}
-B.~Mildenhall, P.~P.~Srinivasan, M.~Tancik, J.~T.~Barron, R.~Ramamoorthi, and R.~Ng,
-``NeRF: Representing scenes as neural radiance fields for view synthesis,''
-in \emph{ECCV}, 2020.
+        \bibitem{mildenhall2020nerf}
+        B.~Mildenhall, P.~P.~Srinivasan, M.~Tancik, J.~T.~Barron, R.~Ramamoorthi, and R.~Ng,
+        ``NeRF: Representing scenes as neural radiance fields for view synthesis,''
+        in \emph{ECCV}, 2020.
 
-\bibitem{kerbl20233dgs}
-B.~Kerbl, G.~Kopanas, T.~Leimk{\"u}hler, and G.~Drettakis,
-``3D Gaussian Splatting for real-time radiance field rendering,''
-\emph{ACM Trans. Graphics}, vol.~42, no.~4, 2023.
+        \bibitem{kerbl20233dgs}
+        B.~Kerbl, G.~Kopanas, T.~Leimk{\"u}hler, and G.~Drettakis,
+        ``3D Gaussian Splatting for real-time radiance field rendering,''
+        \emph{ACM Trans. Graphics}, vol.~42, no.~4, 2023.
 
-\bibitem{huang20242dgs}
-B.~Huang, Z.~Yu, A.~Chen, A.~Geiger, and S.~Gao,
-``2D Gaussian Splatting for geometrically accurate radiance fields,''
-in \emph{SIGGRAPH}, 2024.
+        \bibitem{huang20242dgs}
+        B.~Huang, Z.~Yu, A.~Chen, A.~Geiger, and S.~Gao,
+        ``2D Gaussian Splatting for geometrically accurate radiance fields,''
+        in \emph{SIGGRAPH}, 2024.
 
-\bibitem{joaxkal2024lumigauss}
-J.~Kaleta,
-``LumiGauss: Relightable Gaussian Splatting in the Wild,''
-in \emph{WACV}, 2025.
+        \bibitem{joaxkal2024lumigauss}
+        J.~Kaleta,
+        ``LumiGauss: Relightable Gaussian Splatting in the Wild,''
+        in \emph{WACV}, 2025.
 
-\bibitem{rudnev2022nerfOSR}
-V.~Rudnev, M.~Elgharib, W.~Smith, L.~Liu, V.~Golyanik, and C.~Theobalt,
-``NeRF for outdoor scene relighting,''
-in \emph{ECCV}, 2022.
+        \bibitem{rudnev2022nerfOSR}
+        V.~Rudnev, M.~Elgharib, W.~Smith, L.~Liu, V.~Golyanik, and C.~Theobalt,
+        ``NeRF for outdoor scene relighting,''
+        in \emph{ECCV}, 2022.
 
-\bibitem{martinbrualla2021nerfw}
-R.~Martin-Brualla, N.~Radwan, M.~S.~M.~Sajjadi, J.~T.~Barron, A.~Dosovitskiy, and D.~Duckworth,
-``NeRF in the Wild: Neural radiance fields for unconstrained photo collections,''
-in \emph{CVPR}, 2021.
+        \bibitem{martinbrualla2021nerfw}
+        R.~Martin-Brualla, N.~Radwan, M.~S.~M.~Sajjadi, J.~T.~Barron, A.~Dosovitskiy, and D.~Duckworth,
+        ``NeRF in the Wild: Neural radiance fields for unconstrained photo collections,''
+        in \emph{CVPR}, 2021.
 
-\bibitem{williams1978casting}
-L.~Williams,
-``Casting curved shadows on curved surfaces,''
-\emph{Computer Graphics (SIGGRAPH)}, vol.~12, no.~3, pp.~270--274, 1978.
+        \bibitem{williams1978casting}
+        L.~Williams,
+        ``Casting curved shadows on curved surfaces,''
+        \emph{Computer Graphics (SIGGRAPH)}, vol.~12, no.~3, pp.~270--274, 1978.
 
-\bibitem{preetham1999practical}
-A.~J.~Preetham, P.~Shirley, and B.~Smits,
-``A practical analytic model for daylight,''
-in \emph{SIGGRAPH}, 1999.
+        \bibitem{preetham1999practical}
+        A.~J.~Preetham, P.~Shirley, and B.~Smits,
+        ``A practical analytic model for daylight,''
+        in \emph{SIGGRAPH}, 1999.
 
-\bibitem{nishita1993display}
-T.~Nishita, T.~Sirai, K.~Tadamura, and E.~Nakamae,
-``Display of the earth taking into account atmospheric scattering,''
-in \emph{SIGGRAPH}, 1993.
+        \bibitem{nishita1993display}
+        T.~Nishita, T.~Sirai, K.~Tadamura, and E.~Nakamae,
+        ``Display of the earth taking into account atmospheric scattering,''
+        in \emph{SIGGRAPH}, 1993.
 
-\bibitem{lalonde2012estimating}
-J.-F.~Lalonde, A.~A.~Efros, and S.~G.~Narasimhan,
-``Estimating the natural illumination conditions from a single outdoor image,''
-\emph{IJCV}, vol.~98, no.~2, pp.~123--145, 2012.
+        \bibitem{lalonde2012estimating}
+        J.-F.~Lalonde, A.~A.~Efros, and S.~G.~Narasimhan,
+        ``Estimating the natural illumination conditions from a single outdoor image,''
+        \emph{IJCV}, vol.~98, no.~2, pp.~123--145, 2012.
 
-\bibitem{hold-geoffroy2019deep}
-Y.~Hold-Geoffroy, A.~Athawale, and J.-F.~Lalonde,
-``Deep sky modeling for single image outdoor lighting estimation,''
-in \emph{CVPR}, 2019.
+        \bibitem{hold-geoffroy2019deep}
+        Y.~Hold-Geoffroy, A.~Athawale, and J.-F.~Lalonde,
+        ``Deep sky modeling for single image outdoor lighting estimation,''
+        in \emph{CVPR}, 2019.
 
-\bibitem{meeus1991astronomical}
-J.~Meeus,
-\emph{Astronomical Algorithms}.
-Willmann-Bell, 1991.
+        \bibitem{meeus1991astronomical}
+        J.~Meeus,
+        \emph{Astronomical Algorithms}.
+        Willmann-Bell, 1991.
 
-\bibitem{ye2024absgs}
-Z.~Ye, W.~Li, S.~Liu, P.~Tan, et al.,
-``AbsGS: Recovering fine details for 3D Gaussian Splatting,''
-in \emph{ECCV}, 2024.
+        \bibitem{yu2021outdoor}
+        \todo{Yu et al. -- outdoor relighting reference.}
 
-\bibitem{bulo2024revising}
-S.~R.~Bul{\`o}, L.~Porzi, and P.~Kontschieder,
-``Revising densification in Gaussian Splatting,''
-in \emph{CVPR}, 2024.
+        \bibitem{philip2019multiview}
+        \todo{Philip et al. -- multi-view relighting reference.}
 
-\end{thebibliography}
+        \bibitem{jin2023tensoir}
+        \todo{SR-TensoRF reference.}
+
+        \bibitem{fegr2024}
+        \todo{FEGR reference.}
+
+        \bibitem{solnerf2024}
+        \todo{SOL-NeRF reference.}
+
+        \bibitem{neusky2024}
+        \todo{NeuSky reference.}
+
+    \end{thebibliography}
 }
 
 \end{document}

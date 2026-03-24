@@ -115,11 +115,11 @@ def create_3d_sun_visualization(
         north_offset: North offset for coordinate system alignment
     """
     def swap_yz(arr):
-        """Remap so -Y is up: (x, y, z) -> (x, z, -y)"""
+        """Remap so -Y is up: (x, y, z) -> (x, -z, -y)"""
         if arr.ndim == 1:
-            return np.array([arr[0], arr[2], -arr[1]])
+            return np.array([arr[0], arr[2], arr[1]])
         else:
-            return np.stack([arr[:, 0], arr[:, 2], -arr[:, 1]], axis=1)
+            return np.stack([arr[:, 0], arr[:, 2], arr[:, 1]], axis=1)
 
     def angles_to_direction(az_deg, el_deg, n_offset, fx=True, fy=False, fz=True):
         """Convert orbit angle/elevation to direction vector (-Y is up, orbit in XZ plane)"""
@@ -622,7 +622,7 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
             # Render direct light only (with shadow applied), matching train visualizations
             casts_shadow_flag = gaussians.get_casts_shadow.unsqueeze(-1)  # [N, 1]
             is_sky = casts_shadow_flag < 0.5
-            sun_intensity = gaussians.sun_model.get_sun_intensity(appearance_idx, sun_elevation=elevation).unsqueeze(0)  # [1, 3]
+            sun_intensity = gaussians.sun_model.get_sun_intensity(sun_dir, sun_elevation=elevation).unsqueeze(0)  # [1, 3]
             direct_for_vis = torch.where(is_sky, sun_intensity.expand(direct_light.shape[0], -1), direct_light)
             direct_shadowed = direct_for_vis * shadow_mask
             direct_shadowed_gamma = torch.clamp_min(direct_shadowed, 0.00001) ** (1 / 2.2)
@@ -702,7 +702,38 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
 
                 frame_shadowed_direct_np = np.array(debug_img)
 
-            # Create 3D visualization if enabled
+            # Build 2x2 combined frame: [shadowed | direct sun] / [N·L | normals]
+            sun_dir_comb = sun_dir / (torch.norm(sun_dir) + 1e-8)
+            normals_comb = frame_normals / (torch.norm(frame_normals, dim=-1, keepdim=True) + 1e-8)
+            ndotl_comb = torch.clamp(torch.sum(normals_comb * sun_dir_comb.unsqueeze(0), dim=-1, keepdim=True), 0.0, 1.0)
+
+            ndotl_comb_vis = ndotl_comb.expand(-1, 3)
+            render_pkg_ndotl_c = render(view, gaussians, pipeline, background, override_color=ndotl_comb_vis)
+            ndotl_comb_np = (torch.clamp(render_pkg_ndotl_c["render"], 0.0, 1.0).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+            normal_comb_vis = normals_comb * 0.5 + 0.5
+            render_pkg_norm_c = render(view, gaussians, pipeline, background, override_color=normal_comb_vis)
+            normal_comb_np = (torch.clamp(render_pkg_norm_c["render"], 0.0, 1.0).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+            top_row = np.concatenate([frame_shadowed_np, frame_direct_np], axis=1)
+            bottom_row = np.concatenate([ndotl_comb_np, normal_comb_np], axis=1)
+            grid_frame = np.concatenate([top_row, bottom_row], axis=0)
+
+            # Add labels to the 2x2 grid
+            h_c, w_c = frame_shadowed_np.shape[:2]
+            comb_img = Image.fromarray(grid_frame)
+            draw_comb = ImageDraw.Draw(comb_img)
+            try:
+                comb_font = ImageFont.truetype("arial.ttf", 20)
+            except:
+                comb_font = ImageFont.load_default()
+            for lx, ly, ltxt in [(5, 5, "Shadowed"), (w_c+5, 5, "Direct Sun Only"),
+                                  (5, h_c+5, "N\u00b7L"), (w_c+5, h_c+5, "Normals")]:
+                draw_comb.text((lx+1, ly+1), ltxt, fill=(0, 0, 0), font=comb_font)
+                draw_comb.text((lx, ly), ltxt, fill=(255, 255, 255), font=comb_font)
+            grid_frame = np.array(comb_img)
+
+            # Create 3D visualization and attach on the right
             if show_3d_vis:
                 vis_3d = create_3d_sun_visualization(
                     gaussian_positions,
@@ -718,15 +749,16 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
                     figsize=(5, 5),
                     flip_x=flip_x, flip_y=flip_y, flip_z=flip_z,
                 )
+                combined_frame = combine_render_and_visualization(grid_frame, vis_3d, time_str)
+            else:
+                combined_frame = grid_frame
 
-                # Combine render and visualization
-                combined_frame = combine_render_and_visualization(frame_shadowed_direct_np, vis_3d, time_str)
-                frames_combined.append(combined_frame)
+            frames_combined.append(combined_frame)
 
-                # Save combined frame
-                Image.fromarray(combined_frame).save(
-                    os.path.join(view_render_path, f"frame_{frame_idx:04d}_combined_{time_str}.png")
-                )
+            # Save combined frame
+            Image.fromarray(combined_frame).save(
+                os.path.join(view_render_path, f"frame_{frame_idx:04d}_combined_{time_str}.png")
+            )
 
             # Save side-by-side actual render and direct-light-only render
             Image.fromarray(frame_shadowed_direct_np).save(
@@ -745,15 +777,15 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
 
             frames_shadowed_direct.append(frame_shadowed_direct_np)
 
-        # Save videos
+        # Save videos (loop 3 times for smoother playback)
         if frames_shadowed_direct:
             video_path_shadowed = os.path.join(render_path, f"{view.image_name}_day_shadowed_direct.mp4")
-            imageio.mimsave(video_path_shadowed, frames_shadowed_direct, fps=args.fps)
+            imageio.mimsave(video_path_shadowed, frames_shadowed_direct * 3, fps=args.fps)
             print(f"Saved shadowed+direct video to: {video_path_shadowed}")
 
         if frames_combined:
             video_path_combined = os.path.join(render_path, f"{view.image_name}_day_combined.mp4")
-            imageio.mimsave(video_path_combined, frames_combined, fps=args.fps)
+            imageio.mimsave(video_path_combined, frames_combined * 3, fps=args.fps)
             print(f"Saved combined video to: {video_path_combined}")
 
 
@@ -765,7 +797,9 @@ def render_day(dataset: ModelParams, iteration: int, pipeline: PipelineParams, a
             gaussians = GaussianModel(
                 dataset.sh_degree, dataset.with_mlp, dataset.mlp_W, dataset.mlp_D, dataset.N_a,
                 use_sun=dataset.use_sun, n_images=1700, use_residual_sh=dataset.use_residual_sh,
-                full_pbr=dataset.full_pbr
+                full_pbr=dataset.full_pbr,
+                scene_lighting_sh=dataset.scene_lighting_sh,
+                sky_sh_degree=dataset.sky_sh_degree
             )
         else:
             raise ValueError("render_day.py requires --use_sun flag")

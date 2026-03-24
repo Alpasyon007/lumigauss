@@ -1,0 +1,15 @@
+% ============================================================================
+\section{Day-Cycle Relighting}
+\label{sec:relighting}
+% ============================================================================
+
+Our explicit sun decomposition enables relighting by simply changing the sun direction $\mathbf{l}$ and elevation $\theta$.
+We provide a day-cycle renderer that:
+\begin{enumerate}
+    \item Computes a solar trajectory from geographic coordinates (latitude, day-of-year) using standard solar position equations~\cite{meeus1991astronomical}---declination $\delta = 23.45^\circ \sin(360^\circ(284+d)/365)$, hour angle, and azimuth/elevation conversion
+    \item For each sun position, evaluates the sun color prior (Eq.~\ref{eq:sun_color}), computes N$\cdot$L shading with the new direction, renders a shadow map, and composites the final image
+    \item Produces a video sequence showing realistic time-of-day illumination changes with moving shadows
+\end{enumerate}
+
+Since the sky SH, albedo, and geometry are shared across all images, only the direct term and shadow map change.
+The intensity, colour correction, and ambient are evaluated as SH functions of the new sun direction (Eqs.~\ref{eq:scene_sh_int}--\ref{eq:scene_sh_amb}), providing physically consistent lighting at sun positions never seen during training.

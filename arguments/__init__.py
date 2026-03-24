@@ -64,7 +64,10 @@ class ModelParams(ParamGroup):
         self.full_pbr = False  # Enable full PBR shading path (guarded, use with --use_sun)
         self.sun_json_path = ""  # Path to JSON file with sun positions per image
         self.sky_mask_path = ""  # Path to folder with sky masks (black=sky, white=not sky)
+        self.eval_config_path = ""  # Path to eval_files directory with test_config.py for proper eval masks
         self.use_residual_sh = True  # Use global sky SH for environment (enables relighting)
+        self.sky_sh_degree = 1  # Degree of residual sky SH (1→4 coeffs, 2→9, 3→16)
+        self.scene_lighting_sh = False  # Path to SH lighting data for the scene
         # Camera calibration refinement (jointly optimise camera poses during training)
         self.use_cam_cal = False  # Enable learnable camera pose refinement
         # Sun direction calibration (jointly optimise per-image sun directions during training)
@@ -120,6 +123,10 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+
+        # Late-stage pruning (opacity reset + prune after densification ends)
+        self.late_prune = False                           # Enable late opacity-reset-and-prune passes
+        self.late_prune_opacity = 0.005                   # Remove gaussians with opacity below this (conservative)
 
         # Adaptive grid-based densification (populates empty high-loss regions)
         self.use_adaptive_dens = False
@@ -182,6 +189,8 @@ class OptimizationParams(ParamGroup):
         self.consistency_loss_lambda_final_ratio = 1.0
         self.shadow_loss_lambda=10.0
         self.sky_mask_loss_weight = 0.5
+        self.sky_dist_lambda = 0.1           # Regularization weight pushing sky gaussians far from scene center
+        self.sky_dist_min_factor = 4.0       # Sky gaussians should be at least this × cameras_extent from center
 
         super().__init__(parser, "Optimization Parameters")
 
