@@ -29,33 +29,33 @@ services:
     #command: python ./train.py -s="./data/st_colmap/undistorted" --sun_json_path="./data/st_colmap/sun_directions_blender.json" -m="./output/st_sun_shadow_pbr_sun_cal" --use_sun --use_residual_sh --shadow_method shadow_map --shadow_map_resolution 8192 --sky_mask_path="./data/st_colmap/dynamic_masks/sky" --full_pbr --use_sun_cal
     #command: python ./train.py -s="./data/lk2_colmap/undistorted" --sun_json_path="./data/lk2_colmap/sun_directions_blender.json" -m="./output/lk2_sun_shadow_pbr_sun_cal" --use_sun --use_residual_sh --shadow_method shadow_map --shadow_map_resolution 8192 --sky_mask_path="./data/lk2_colmap/dynamic_masks/sky" --full_pbr --use_sun_cal
     #command: python ./train.py -s="./data/lwp_colmap/undistorted" --sun_json_path="./data/lwp_colmap/sun_directions_blender.json" -m="./output/lwp_sun_shadow_pbr_sun_cal" --use_sun --use_residual_sh --shadow_method shadow_map --shadow_map_resolution 8192 --sky_mask_path="./data/lwp_colmap/dynamic_masks/sky" --full_pbr --use_sun_cal
-    ## ST
-    #command:
-    #  - python
-    #  - ./train.py
-    #  - -s=./data/st_colmap/undistorted
-    #  - --sun_json_path=./data/st_colmap/sun_directions_blender.json
-    #  - -m=./output/st_sun_shadow_sun_cal_sh2_scene_sh_testing
-	#  - --eval_config_path=./data/st_colmap/eval_files
-    #  - --use_sun
-    #  - --use_residual_sh
-    #  - --shadow_method
-    #  - shadow_map
-    #  # 1024, 2048, 4096, 8192
-    #  - --shadow_map_resolution=2048
-    #  - --sky_mask_path=./data/st_colmap/dynamic_masks/sky
-    #  #- --full_pbr
-    #  - --use_sun_cal
-    #  - --scene_lighting_sh
-    #  - --sky_sh_degree=2
-    #  #- --use_ao
-    #  # 1, 2 , 3
-    #  #- --sky_sh_degree=3
-    #  #- --use_manhattan
-    #  #- --use_color_bias
-    #  #- --optimize_casts_shadow
-    #  #- --percent_dense=0.2
-    #  #- --densify_grad_threshold=0.00002
+    # ST
+    command:
+      - python
+      - ./train.py
+      - -s=./data/st_colmap/undistorted
+      - --sun_json_path=./data/st_colmap/sun_directions_blender.json
+      - -m=./output/st_sun_shadow_sun_cal_sh2_scene_sh_testing
+      - --eval_config_path=./data/st_colmap/eval_files
+      - --use_sun
+      - --use_residual_sh
+      - --shadow_method
+      - shadow_map
+      # 1024, 2048, 4096, 8192
+      - --shadow_map_resolution=2048
+      - --sky_mask_path=./data/st_colmap/dynamic_masks/sky
+      #- --full_pbr
+      - --use_sun_cal
+      - --scene_lighting_sh
+      - --sky_sh_degree=2
+      #- --use_ao
+      # 1, 2 , 3
+      #- --sky_sh_degree=3
+      #- --use_manhattan
+      #- --use_color_bias
+      #- --optimize_casts_shadow
+      #- --percent_dense=0.2
+      #- --densify_grad_threshold=0.00002
     ## LK2
     #command:
     #  - python
@@ -79,26 +79,26 @@ services:
     ##  - --late_prune
     #  # Resume from checkpoint 15000 (right after densification ends)
     ##  - --start_checkpoint=./output/lk2_sun_shadow_sun_cal_sh2_scene_sh_testing/chkpnt15000.pth
-    # LWP
-    command:
-      - python
-      - ./train.py
-      - -s=./data/lwp_colmap/undistorted
-      - --sun_json_path=./data/lwp_colmap/sun_directions_blender.json
-      - -m=./output/lwp_sun_shadow_sun_cal_sh2_scene_sh_testing
-      - --eval_config_path=./data/lwp_colmap/eval_files
-      - --use_sun
-      - --use_residual_sh
-      - --shadow_method
-      - shadow_map
-      # 1024, 2048, 4096, 8192
-      - --shadow_map_resolution=2048
-      - --sky_mask_path=./data/lwp_colmap/dynamic_masks
-      #- --full_pbr
-      - --use_sun_cal
-      - --scene_lighting_sh
-      - --sky_sh_degree=2
-      - --eval_config_path=./data/lwp_colmap/eval_files
+    ## LWP
+    #command:
+    #  - python
+    #  - ./train.py
+    #  - -s=./data/lwp_colmap/undistorted
+    #  - --sun_json_path=./data/lwp_colmap/sun_directions_blender.json
+    #  - -m=./output/lwp_sun_shadow_sun_cal_sh2_scene_sh_testing
+    #  - --eval_config_path=./data/lwp_colmap/eval_files
+    #  - --use_sun
+    #  - --use_residual_sh
+    #  - --shadow_method
+    #  - shadow_map
+    #  # 1024, 2048, 4096, 8192
+    #  - --shadow_map_resolution=2048
+    #  - --sky_mask_path=./data/lwp_colmap/dynamic_masks
+    #  #- --full_pbr
+    #  - --use_sun_cal
+    #  - --scene_lighting_sh
+    #  - --sky_sh_degree=2
+    #  - --eval_config_path=./data/lwp_colmap/eval_files
     #command: python optimise_env.py -m output/st_mlp --iteration 40000 --opt_iters 10000 --lr 0.01 --save_images
     #command: python test_gt_env_map.py -s="./data/st_colmap/undistorted" -m="./output/st_mlp" --with_mlp -r 1 --test_config="./data/st_colmap/eval_files"
     #command: python test_gt_env_map.py -s="./data/lk2_colmap/undistorted" -m="./output/lk2_mlp" --with_mlp -r 1 --test_config="./data/lk2_colmap/eval_files"

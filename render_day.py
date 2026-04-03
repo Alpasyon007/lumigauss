@@ -351,12 +351,15 @@ def compute_shadow_mask_fixed(
     sun_camera,
     shadow_depth_map: torch.Tensor,
     shadow_alpha_map: torch.Tensor,
-    bias: float = 0.02,
+    bias: float = 0.05,
+    scene_extent: float = 1.0,
     device: str = "cuda"
 ) -> torch.Tensor:
     """
-    Fixed shadow mask computation with zeros padding and tighter bias.
+    Fixed shadow mask computation using perspective UV lookup (matching the
+    surfel rasterizer) with zeros padding and scene-extent-scaled bias.
     """
+    import math
     N = gaussian_positions.shape[0]
 
     ones = torch.ones(N, 1, device=device, dtype=gaussian_positions.dtype)
@@ -366,13 +369,19 @@ def compute_shadow_mask_fixed(
     view_coords = positions_homo @ sun_camera.world_view_transform
     gaussian_depth = view_coords[:, 2]
 
-    # Clip/NDC for UV lookup
-    clip_coords = positions_homo @ sun_camera.full_proj_transform
-    ndc_coords = clip_coords[:, :3] / (clip_coords[:, 3:4] + 1e-8)
+    # Compute UV using the same perspective projection the rasterizer uses.
+    # The surfel rasterizer projects via focal = resolution / (2 * tan(FoV/2)).
+    tanfovx = math.tan(sun_camera.FoVx * 0.5)
+    tanfovy = math.tan(sun_camera.FoVy * 0.5)
 
-    uv = (ndc_coords[:, :2] + 1.0) * 0.5
+    z_view = gaussian_depth.clamp_min(1e-6)
+    ndc_x = view_coords[:, 0] / (tanfovx * z_view)
+    ndc_y = view_coords[:, 1] / (tanfovy * z_view)
 
-    grid = (uv * 2.0 - 1.0).view(1, 1, N, 2)
+    uv_x = (ndc_x + 1.0) * 0.5
+    uv_y = (ndc_y + 1.0) * 0.5
+
+    grid = torch.stack([ndc_x, ndc_y], dim=-1).view(1, 1, N, 2)
 
     # Use 'zeros' padding instead of 'border' to avoid edge depth leaking
     sampled_depth = torch.nn.functional.grid_sample(
@@ -391,11 +400,11 @@ def compute_shadow_mask_fixed(
         align_corners=False
     ).view(N)
 
-    in_shadow = (gaussian_depth > sampled_depth + bias) & (sampled_alpha > 0.1)
+    in_shadow = (gaussian_depth > sampled_depth + bias * scene_extent) & (sampled_alpha > 0.1)
     shadow_mask = (~in_shadow).float()
 
-    # Out-of-bounds → lit (unchanged logic but now zeros padding handles edges better)
-    out_of_bounds = (uv[:, 0] < 0) | (uv[:, 0] > 1) | (uv[:, 1] < 0) | (uv[:, 1] > 1)
+    # Out-of-bounds → lit
+    out_of_bounds = (uv_x < 0) | (uv_x > 1) | (uv_y < 0) | (uv_y > 1)
     shadow_mask[out_of_bounds] = 1.0
 
     return shadow_mask
@@ -406,7 +415,7 @@ def compute_shadows_fixed(
     sun_direction: torch.Tensor,
     pipe,
     shadow_map_resolution: int = 512,
-    shadow_bias: float = 0.02,
+    shadow_bias: float = 0.05,
     hard_threshold: bool = True,
     ortho_scale: float = 2.0,
     device: str = "cuda"
@@ -454,6 +463,7 @@ def compute_shadows_fixed(
         shadow_depth_map,
         shadow_alpha_map,
         bias=shadow_bias,
+        scene_extent=scene_extent,
         device=device
     )
 
@@ -474,7 +484,7 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
 
     # Shadow fix parameters
     use_shadow_fixes = getattr(args, 'shadow_fixes', False)
-    fix_bias = getattr(args, 'shadow_fix_bias', 0.02)
+    fix_bias = getattr(args, 'shadow_fix_bias', 0.01)
     fix_hard_threshold = getattr(args, 'shadow_fix_hard_threshold', True)
     fix_ortho_scale = getattr(args, 'shadow_fix_ortho_scale', 2.0)
     fix_flip_normals = getattr(args, 'shadow_fix_flip_normals', False)

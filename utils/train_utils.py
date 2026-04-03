@@ -1067,7 +1067,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             renderArgs[0],  # pipe
                             method=viz_shadow_method,
                             shadow_map_resolution=512,
-                            shadow_bias=0.1,
+                            shadow_bias=0.05,
                             device="cuda"
                         )
                         shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]

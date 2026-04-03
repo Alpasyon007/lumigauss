@@ -57,7 +57,7 @@ def create_sun_camera(
 
     # Build rotation matrix (world to camera)
     # diff-surfel-rasterization convention: +Z is forward (p_view.z > 0 for visible points)
-    R = torch.stack([right, up, -forward], dim=0)  # [3, 3]
+    R = torch.stack([right, up, forward], dim=0)  # [3, 3]
 
     # Translation: camera position in world, need to convert to camera space
     T = -R @ cam_pos  # [3]
@@ -238,13 +238,23 @@ def render_shadow_map(
     )
 
     # Extract depth from allmap
-    # allmap[0] is expected depth, allmap[5] is median depth
-    render_depth = allmap[0:1]  # Expected depth
-    render_depth = torch.nan_to_num(render_depth, 0, 0)
-
-    # Normalize by alpha to get proper depth
+    # allmap[0] is expected (alpha-blended) depth, allmap[5] is median depth
+    # For shadow mapping we need the FRONT surface depth, not the alpha-blended average.
+    # The median depth (allmap[5]) better represents the front surface and avoids
+    # systematic bias from alpha-blending multiple overlapping Gaussians.
     render_alpha = torch.nan_to_num(allmap[1:2], 0, 0)
-    shadow_depth = render_depth / render_alpha.clamp_min(1e-6)
+
+    # Use median depth for shadow map (better front-surface estimate)
+    median_depth = allmap[5:6]
+    median_depth = torch.nan_to_num(median_depth, 0, 0)
+
+    # Also get expected depth as fallback where median is zero
+    expected_depth = allmap[0:1]
+    expected_depth = torch.nan_to_num(expected_depth, 0, 0)
+    expected_depth = expected_depth / render_alpha.clamp_min(1e-6)
+
+    # Use median depth where available, fall back to expected depth
+    shadow_depth = torch.where(median_depth > 0, median_depth, expected_depth)
 
     return shadow_depth, render_alpha
 
@@ -255,55 +265,68 @@ def compute_shadow_mask(
     shadow_depth_map: torch.Tensor,
     shadow_alpha_map: torch.Tensor,
     bias: float = 0.05,
+    scene_extent: float = 1.0,
     device: str = "cuda"
 ) -> torch.Tensor:
     """
     Compute shadow mask for each Gaussian by comparing its depth to the shadow map.
+
+    The UV lookup uses the same perspective projection that the surfel rasterizer
+    uses internally (focal length derived from FoV), so pixel positions match
+    exactly between the rendered shadow map and the lookup coordinates.
 
     Args:
         gaussian_positions: World positions of Gaussians [N, 3]
         sun_camera: SunShadowCamera used to render shadow map
         shadow_depth_map: Rendered depth from sun view [1, H, W]
         shadow_alpha_map: Rendered alpha from sun view [1, H, W]
-        bias: Depth bias to avoid self-shadowing artifacts
+        bias: Depth bias as fraction of scene_extent
+        scene_extent: Scene bounding radius, used to scale the bias
         device: Device
 
     Returns:
         Shadow mask [N] where 1=lit, 0=shadowed
     """
     N = gaussian_positions.shape[0]
+    W = sun_camera.image_width
+    H = sun_camera.image_height
 
-    # Transform Gaussian positions to sun camera's view space AND clip space
+    # Transform Gaussian positions to sun camera's view space
     ones = torch.ones(N, 1, device=device, dtype=gaussian_positions.dtype)
     positions_homo = torch.cat([gaussian_positions, ones], dim=1)  # [N, 4]
 
     # View-space positions (for depth comparison with rasterizer output)
     # The rasterizer returns depth in view/camera space, so we must compare in the same space.
-    #view_coords = positions_homo @ sun_camera.world_view_transform  # [N, 4]
-    #gaussian_depth = view_coords[:, 2]  # [N] - z in view space (same space as shadow map)
+    view_coords = positions_homo @ sun_camera.world_view_transform  # [N, 4]
+    gaussian_depth = view_coords[:, 2]  # [N] - z in view space (same space as shadow map)
 
-    # Clip-space positions (for UV lookup into shadow map texture)
-    clip_coords = positions_homo @ sun_camera.full_proj_transform  # [N, 4]
+    # Compute UV using the same perspective projection the rasterizer uses.
+    # The surfel rasterizer projects via: pixel = focal * xy_view / z_view + principal_point
+    # where focal = resolution / (2 * tan(FoV/2)).
+    # Using the orthographic projection matrix for UV lookup is WRONG because
+    # the rasterizer renders with perspective (through intrinsics/focal length).
+    tanfovx = math.tan(sun_camera.FoVx * 0.5)
+    tanfovy = math.tan(sun_camera.FoVy * 0.5)
 
-    # Perspective divide (for orthographic w should be 1, but do it anyway)
-    ndc_coords = clip_coords[:, :3] / (clip_coords[:, 3:4] + 1e-8)  # [N, 3]
+    # Perspective NDC: ndc = xy_view / (tan(fov/2) * z_view), in [-1, 1]
+    z_view = gaussian_depth.clamp_min(1e-6)  # [N]
+    ndc_x = view_coords[:, 0] / (tanfovx * z_view)  # [N]
+    ndc_y = view_coords[:, 1] / (tanfovy * z_view)  # [N]
 
     # NDC to texture coordinates [0, 1]
-    # NDC is in [-1, 1], convert to [0, 1] for sampling
-    uv = (ndc_coords[:, :2] + 1.0) * 0.5  # [N, 2]
-
-    gaussian_depth = ndc_coords[:, 2]
+    uv_x = (ndc_x + 1.0) * 0.5  # [N]
+    uv_y = (ndc_y + 1.0) * 0.5  # [N]
 
     # Sample shadow map at UV coordinates
-    # Need to convert to grid_sample format: [1, 1, N, 2] with values in [-1, 1]
-    grid = (uv * 2.0 - 1.0).view(1, 1, N, 2)  # [1, 1, N, 2]
+    # grid_sample format: [1, 1, N, 2] with values in [-1, 1]
+    grid = torch.stack([ndc_x, ndc_y], dim=-1).view(1, 1, N, 2)  # [1, 1, N, 2]
 
     # Sample depth map
     sampled_depth = torch.nn.functional.grid_sample(
         shadow_depth_map.unsqueeze(0),  # [1, 1, H, W]
         grid,
         mode='bilinear',
-        padding_mode='border',
+        padding_mode='zeros',
         align_corners=False
     ).view(N)  # [N]
 
@@ -312,19 +335,24 @@ def compute_shadow_mask(
         shadow_alpha_map.unsqueeze(0),  # [1, 1, H, W]
         grid,
         mode='bilinear',
-        padding_mode='border',
+        padding_mode='zeros',
         align_corners=False
     ).view(N)  # [N]
 
-    # Compare depths: if gaussian_depth > sampled_depth + bias, it's in shadow
+    # Scale bias by scene extent: the offset between the shadow map depth (median/blended)
+    # and individual Gaussian depth is roughly constant for a given scene, so we scale
+    # the bias by scene_extent rather than per-Gaussian depth.
+    effective_bias = bias * scene_extent
+
+    # Compare depths: if gaussian_depth > sampled_depth + effective_bias, it's in shadow
     # Also check if the sampled location has valid geometry (alpha > threshold)
-    in_shadow = (gaussian_depth > sampled_depth + bias) & (sampled_alpha > 0.1)
+    in_shadow = (gaussian_depth > sampled_depth + effective_bias) & (sampled_alpha > 0.1)
 
     # Shadow mask: 1 = lit, 0 = shadowed
     shadow_mask = (~in_shadow).float()
 
-    # Points outside the shadow map frustum should be lit (or could be marked specially)
-    out_of_bounds = (uv[:, 0] < 0) | (uv[:, 0] > 1) | (uv[:, 1] < 0) | (uv[:, 1] > 1)
+    # Points outside the shadow map frustum should be lit
+    out_of_bounds = (uv_x < 0) | (uv_x > 1) | (uv_y < 0) | (uv_y > 1)
     shadow_mask[out_of_bounds] = 1.0
 
     return shadow_mask
@@ -405,6 +433,7 @@ def compute_shadows_shadow_map(
         shadow_depth_map,
         shadow_alpha_map,
         bias=shadow_bias,
+        scene_extent=scene_extent,
         device=device
     )
 
