@@ -19,6 +19,7 @@ import json
 import numpy as np
 from utils.normal_utils import compute_normal_world_space
 from utils.shadow_utils import compute_shadows_for_gaussians, SunShadowCamera, render_shadow_map
+from utils.normal_utils import quat_to_rot, scale_to_mat
 import imageio
 import matplotlib
 matplotlib.use('Agg')
@@ -353,14 +354,20 @@ def compute_shadow_mask_fixed(
     shadow_alpha_map: torch.Tensor,
     bias: float = 0.05,
     scene_extent: float = 1.0,
+    sun_direction: torch.Tensor = None,
+    gaussian_normals: torch.Tensor = None,
+    pcf_radius: int = 1,
     device: str = "cuda"
 ) -> torch.Tensor:
     """
     Fixed shadow mask computation using perspective UV lookup (matching the
-    surfel rasterizer) with zeros padding and scene-extent-scaled bias.
+    surfel rasterizer) with zeros padding, scene-extent-scaled bias,
+    normal-based slope bias, and PCF.
     """
     import math
     N = gaussian_positions.shape[0]
+    W = sun_camera.image_width
+    H = sun_camera.image_height
 
     ones = torch.ones(N, 1, device=device, dtype=gaussian_positions.dtype)
     positions_homo = torch.cat([gaussian_positions, ones], dim=1)
@@ -381,27 +388,58 @@ def compute_shadow_mask_fixed(
     uv_x = (ndc_x + 1.0) * 0.5
     uv_y = (ndc_y + 1.0) * 0.5
 
-    grid = torch.stack([ndc_x, ndc_y], dim=-1).view(1, 1, N, 2)
+    # Compute per-Gaussian effective bias with optional normal-based slope scaling
+    base_bias = bias * scene_extent
+    if sun_direction is not None and gaussian_normals is not None:
+        sun_dir_norm = sun_direction / (torch.norm(sun_direction) + 1e-8)
+        cos_theta = torch.abs(torch.sum(gaussian_normals * sun_dir_norm.unsqueeze(0), dim=1))
+        effective_bias = base_bias / cos_theta.clamp(min=0.1)
+    else:
+        effective_bias = base_bias
 
-    # Use 'zeros' padding instead of 'border' to avoid edge depth leaking
-    sampled_depth = torch.nn.functional.grid_sample(
-        shadow_depth_map.unsqueeze(0),
-        grid,
-        mode='bilinear',
-        padding_mode='zeros',
-        align_corners=False
-    ).view(N)
+    # PCF: sample a kernel of points around the UV, compare each independently,
+    # then average the binary results for a soft shadow mask.
+    if pcf_radius > 0:
+        pixel_ndc_x = 2.0 / W
+        pixel_ndc_y = 2.0 / H
+        offsets = []
+        for dy in range(-pcf_radius, pcf_radius + 1):
+            for dx in range(-pcf_radius, pcf_radius + 1):
+                offsets.append((dx * pixel_ndc_x, dy * pixel_ndc_y))
 
-    sampled_alpha = torch.nn.functional.grid_sample(
-        shadow_alpha_map.unsqueeze(0),
-        grid,
-        mode='bilinear',
-        padding_mode='zeros',
-        align_corners=False
-    ).view(N)
+        shadow_accum = torch.zeros(N, device=device)
+        for ox, oy in offsets:
+            grid_off = torch.stack([ndc_x + ox, ndc_y + oy], dim=-1).view(1, 1, N, 2)
 
-    in_shadow = (gaussian_depth > sampled_depth + bias * scene_extent) & (sampled_alpha > 0.1)
-    shadow_mask = (~in_shadow).float()
+            sd = torch.nn.functional.grid_sample(
+                shadow_depth_map.unsqueeze(0), grid_off,
+                mode='bilinear', padding_mode='zeros', align_corners=False
+            ).view(N)
+            sa = torch.nn.functional.grid_sample(
+                shadow_alpha_map.unsqueeze(0), grid_off,
+                mode='bilinear', padding_mode='zeros', align_corners=False
+            ).view(N)
+
+            in_shadow_sample = (gaussian_depth > sd + effective_bias) & (sa > 0.1)
+            shadow_accum += in_shadow_sample.float()
+
+        shadow_frac = shadow_accum / len(offsets)
+        shadow_mask = 1.0 - shadow_frac
+    else:
+        grid = torch.stack([ndc_x, ndc_y], dim=-1).view(1, 1, N, 2)
+
+        sampled_depth = torch.nn.functional.grid_sample(
+            shadow_depth_map.unsqueeze(0), grid,
+            mode='bilinear', padding_mode='zeros', align_corners=False
+        ).view(N)
+
+        sampled_alpha = torch.nn.functional.grid_sample(
+            shadow_alpha_map.unsqueeze(0), grid,
+            mode='bilinear', padding_mode='zeros', align_corners=False
+        ).view(N)
+
+        in_shadow = (gaussian_depth > sampled_depth + effective_bias) & (sampled_alpha > 0.1)
+        shadow_mask = (~in_shadow).float()
 
     # Out-of-bounds → lit
     out_of_bounds = (uv_x < 0) | (uv_x > 1) | (uv_y < 0) | (uv_y > 1)
@@ -457,6 +495,15 @@ def compute_shadows_fixed(
     if original_casts_shadow is not None:
         gaussians._casts_shadow.data = original_casts_shadow
 
+    # Compute per-Gaussian world-space normals for slope-dependent bias
+    quaternions = gaussians.get_rotation
+    scales = gaussians.get_scaling
+    R = quat_to_rot(quaternions)
+    S = scale_to_mat(scales)
+    RS = torch.bmm(R, S)
+    normals = RS[:, :, 2]
+    normals = normals / (normals.norm(dim=1, keepdim=True) + 1e-6)
+
     shadow_mask = compute_shadow_mask_fixed(
         positions,
         sun_camera,
@@ -464,6 +511,9 @@ def compute_shadows_fixed(
         shadow_alpha_map,
         bias=shadow_bias,
         scene_extent=scene_extent,
+        sun_direction=sun_direction,
+        gaussian_normals=normals,
+        pcf_radius=1,
         device=device
     )
 

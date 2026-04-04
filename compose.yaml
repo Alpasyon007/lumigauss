@@ -35,7 +35,7 @@ services:
       - ./train.py
       - -s=./data/st_colmap/undistorted
       - --sun_json_path=./data/st_colmap/sun_directions_blender.json
-      - -m=./output/st_sun_shadow_sun_cal_sh2_scene_sh_testing
+      - -m=./output/st_sun_shadow_sun_cal_sh2_scene_sh_testing_2
       - --eval_config_path=./data/st_colmap/eval_files
       - --use_sun
       - --use_residual_sh

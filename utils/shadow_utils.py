@@ -10,6 +10,7 @@ import torch.nn as nn
 import numpy as np
 import math
 from typing import Tuple, Optional
+from utils.normal_utils import quat_to_rot, scale_to_mat
 
 
 def create_sun_camera(
@@ -36,9 +37,12 @@ def create_sun_camera(
     sun_dir = sun_dir.float().to(device)
     scene_center = scene_center.float().to(device)
 
-    # Position the camera far along the sun direction, looking back at scene
-    # Camera is placed at scene_center + sun_dir * distance
-    distance = scene_extent * 3.0  # Place camera far enough to see entire scene
+    # Position the camera far along the sun direction, looking back at scene.
+    # We use a large distance multiplier (30x) to approximate orthographic projection.
+    # The surfel rasterizer always renders with perspective (focal = W / (2*tanfov)),
+    # so placing the camera far away minimizes the perspective distortion across the
+    # scene's depth range. At 30x, edge distortion drops from ~28% to ~2%.
+    distance = scene_extent * 30.0
     cam_pos = scene_center + sun_dir * distance
 
     # Camera looks toward scene center (opposite of sun direction)
@@ -266,6 +270,9 @@ def compute_shadow_mask(
     shadow_alpha_map: torch.Tensor,
     bias: float = 0.05,
     scene_extent: float = 1.0,
+    sun_direction: torch.Tensor = None,
+    gaussian_normals: torch.Tensor = None,
+    pcf_radius: int = 1,
     device: str = "cuda"
 ) -> torch.Tensor:
     """
@@ -282,6 +289,9 @@ def compute_shadow_mask(
         shadow_alpha_map: Rendered alpha from sun view [1, H, W]
         bias: Depth bias as fraction of scene_extent
         scene_extent: Scene bounding radius, used to scale the bias
+        sun_direction: Direction toward the sun [3], for normal-based slope bias
+        gaussian_normals: Per-Gaussian world-space normals [N, 3], for slope bias
+        pcf_radius: PCF kernel half-size (0=off, 1=3x3, 2=5x5)
         device: Device
 
     Returns:
@@ -303,8 +313,6 @@ def compute_shadow_mask(
     # Compute UV using the same perspective projection the rasterizer uses.
     # The surfel rasterizer projects via: pixel = focal * xy_view / z_view + principal_point
     # where focal = resolution / (2 * tan(FoV/2)).
-    # Using the orthographic projection matrix for UV lookup is WRONG because
-    # the rasterizer renders with perspective (through intrinsics/focal length).
     tanfovx = math.tan(sun_camera.FoVx * 0.5)
     tanfovy = math.tan(sun_camera.FoVy * 0.5)
 
@@ -317,39 +325,64 @@ def compute_shadow_mask(
     uv_x = (ndc_x + 1.0) * 0.5  # [N]
     uv_y = (ndc_y + 1.0) * 0.5  # [N]
 
-    # Sample shadow map at UV coordinates
-    # grid_sample format: [1, 1, N, 2] with values in [-1, 1]
-    grid = torch.stack([ndc_x, ndc_y], dim=-1).view(1, 1, N, 2)  # [1, 1, N, 2]
+    # Compute per-Gaussian effective bias with optional normal-based slope scaling.
+    # Surfaces nearly parallel to sun rays get a larger bias to avoid self-shadowing.
+    base_bias = bias * scene_extent
+    if sun_direction is not None and gaussian_normals is not None:
+        sun_dir_norm = sun_direction / (torch.norm(sun_direction) + 1e-8)
+        cos_theta = torch.abs(torch.sum(gaussian_normals * sun_dir_norm.unsqueeze(0), dim=1))  # [N]
+        # Clamp to avoid division by zero; max bias is 10x base for very grazing angles
+        effective_bias = base_bias / cos_theta.clamp(min=0.1)
+    else:
+        effective_bias = base_bias
 
-    # Sample depth map
-    sampled_depth = torch.nn.functional.grid_sample(
-        shadow_depth_map.unsqueeze(0),  # [1, 1, H, W]
-        grid,
-        mode='bilinear',
-        padding_mode='zeros',
-        align_corners=False
-    ).view(N)  # [N]
+    # PCF: sample a kernel of points around the UV, compare each independently,
+    # then average the binary results for a soft shadow mask.
+    if pcf_radius > 0:
+        # Pixel size in NDC space
+        pixel_ndc_x = 2.0 / W
+        pixel_ndc_y = 2.0 / H
+        kernel_size = 2 * pcf_radius + 1
+        offsets = []
+        for dy in range(-pcf_radius, pcf_radius + 1):
+            for dx in range(-pcf_radius, pcf_radius + 1):
+                offsets.append((dx * pixel_ndc_x, dy * pixel_ndc_y))
 
-    # Sample alpha map (to check if there's geometry at this location)
-    sampled_alpha = torch.nn.functional.grid_sample(
-        shadow_alpha_map.unsqueeze(0),  # [1, 1, H, W]
-        grid,
-        mode='bilinear',
-        padding_mode='zeros',
-        align_corners=False
-    ).view(N)  # [N]
+        shadow_accum = torch.zeros(N, device=device)
+        for ox, oy in offsets:
+            grid_off = torch.stack([ndc_x + ox, ndc_y + oy], dim=-1).view(1, 1, N, 2)
 
-    # Scale bias by scene extent: the offset between the shadow map depth (median/blended)
-    # and individual Gaussian depth is roughly constant for a given scene, so we scale
-    # the bias by scene_extent rather than per-Gaussian depth.
-    effective_bias = bias * scene_extent
+            sd = torch.nn.functional.grid_sample(
+                shadow_depth_map.unsqueeze(0), grid_off,
+                mode='bilinear', padding_mode='zeros', align_corners=False
+            ).view(N)
+            sa = torch.nn.functional.grid_sample(
+                shadow_alpha_map.unsqueeze(0), grid_off,
+                mode='bilinear', padding_mode='zeros', align_corners=False
+            ).view(N)
 
-    # Compare depths: if gaussian_depth > sampled_depth + effective_bias, it's in shadow
-    # Also check if the sampled location has valid geometry (alpha > threshold)
-    in_shadow = (gaussian_depth > sampled_depth + effective_bias) & (sampled_alpha > 0.1)
+            in_shadow_sample = (gaussian_depth > sd + effective_bias) & (sa > 0.1)
+            shadow_accum += in_shadow_sample.float()
 
-    # Shadow mask: 1 = lit, 0 = shadowed
-    shadow_mask = (~in_shadow).float()
+        # Average: 0 = fully lit, 1 = fully shadowed
+        shadow_frac = shadow_accum / len(offsets)
+        shadow_mask = 1.0 - shadow_frac
+    else:
+        # Single-sample path (no PCF)
+        grid = torch.stack([ndc_x, ndc_y], dim=-1).view(1, 1, N, 2)
+
+        sampled_depth = torch.nn.functional.grid_sample(
+            shadow_depth_map.unsqueeze(0), grid,
+            mode='bilinear', padding_mode='zeros', align_corners=False
+        ).view(N)
+
+        sampled_alpha = torch.nn.functional.grid_sample(
+            shadow_alpha_map.unsqueeze(0), grid,
+            mode='bilinear', padding_mode='zeros', align_corners=False
+        ).view(N)
+
+        in_shadow = (gaussian_depth > sampled_depth + effective_bias) & (sampled_alpha > 0.1)
+        shadow_mask = (~in_shadow).float()
 
     # Points outside the shadow map frustum should be lit
     out_of_bounds = (uv_x < 0) | (uv_x > 1) | (uv_y < 0) | (uv_y > 1)
@@ -427,6 +460,15 @@ def compute_shadows_shadow_map(
         sun_camera, gaussians, pipe, device
     )
 
+    # Compute per-Gaussian world-space normals for slope-dependent bias
+    quaternions = gaussians.get_rotation
+    scales = gaussians.get_scaling
+    R = quat_to_rot(quaternions)
+    S = scale_to_mat(scales)
+    RS = torch.bmm(R, S)
+    normals = RS[:, :, 2]  # surfel normal = 3rd column of R@S
+    normals = normals / (normals.norm(dim=1, keepdim=True) + 1e-6)
+
     shadow_mask = compute_shadow_mask(
         positions,
         sun_camera,
@@ -434,6 +476,9 @@ def compute_shadows_shadow_map(
         shadow_alpha_map,
         bias=shadow_bias,
         scene_extent=scene_extent,
+        sun_direction=sun_direction,
+        gaussian_normals=normals,
+        pcf_radius=1,
         device=device
     )
 
