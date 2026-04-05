@@ -446,15 +446,21 @@ class SunModel(torch.nn.Module):
 
     def forward(self, image_idx: int, normal_vectors: torch.Tensor,
                 sun_direction: torch.Tensor = None,
-                sun_elevation: float = None) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+                sun_elevation: float = None,
+                normal_multiplier: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Compute direct illumination.
 
         Args:
             image_idx: Image index (used only in per-image mode).
-            normal_vectors: Surface normals [N, 3].
+            normal_vectors: Surface normals [N, 3] (may be camera-flipped).
             sun_direction: Sun direction vector [3] from camera.  Required.
             sun_elevation: Sun elevation in degrees.  None → 45°.
+            normal_multiplier: Per-gaussian sign [N] from compute_normal_world_space.
+                +1 = normal was already facing camera (geometric normal unchanged),
+                -1 = normal was flipped to face camera (geometric normal is opposite).
+                When provided, N·L is corrected to use the geometric normal so that
+                surfaces truly facing away from the sun receive zero direct light.
 
         Returns:
             (intensity [N,3], sun_direction [3], lighting_components dict)
@@ -474,8 +480,17 @@ class SunModel(torch.nn.Module):
             image_idx, sun_direction, sun_elevation
         )
 
-        # Lambert N·L
+        # Lambert N·L using camera-flipped normals
         n_dot_l = torch.sum(normals_norm * sun_dir_norm.unsqueeze(0), dim=-1, keepdim=True)
+
+        # Correct for camera-based normal flipping: recover geometric N·L.
+        # The geometric (true) normal = multiplier * flipped_normal, so
+        # geometric_n_dot_l = multiplier * flipped_n_dot_l.
+        # Without this correction, surfaces facing away from both the camera
+        # AND the sun get a spuriously positive N·L after the camera flip.
+        if normal_multiplier is not None:
+            n_dot_l = n_dot_l * normal_multiplier.unsqueeze(-1)  # [N, 1]
+
         n_dot_l = torch.clamp(n_dot_l, min=0.0)
 
         direct_light = n_dot_l * sun_int.unsqueeze(0)

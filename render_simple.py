@@ -93,7 +93,7 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                         appearance_idx, normal_vectors, sun_dir, view.camera_center, sun_elevation=sun_elev
                     )
                 else:
-                    rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
+                    rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir, sun_elevation=sun_elev, normal_multiplier=multiplier)
                 render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                 rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                 combined_rendering = torch.cat((view.original_image, rendering), 2)
@@ -109,7 +109,8 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                     shadow_bias=shadow_bias,
                     ray_march_steps=ray_march_steps,
                     voxel_resolution=voxel_resolution,
-                    device="cuda"
+                    device="cuda",
+                    normal_vectors=normal_vectors,
                 )
                 shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 
@@ -195,7 +196,7 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                             appearance_idx, normal_vectors, sun_dir, view.camera_center, sun_elevation=sun_elev
                         )
                     else:
-                        rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
+                        rgb_precomp_unshadowed, intensity, sun_dir, components = gaussians.compute_directional_rgb(appearance_idx, normal_vectors, sun_dir, sun_elevation=sun_elev, normal_multiplier=multiplier)
                     render_pkg = render(view, gaussians, pipeline, background, override_color=rgb_precomp_unshadowed)
                     rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     combined_rendering = torch.cat((view.original_image, app_image.squeeze(), rendering), 2)
@@ -211,7 +212,8 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                         shadow_bias=shadow_bias,
                         ray_march_steps=ray_march_steps,
                         voxel_resolution=voxel_resolution,
-                        device="cuda"
+                        device="cuda",
+                        normal_vectors=normal_vectors,
                     )
                     shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 

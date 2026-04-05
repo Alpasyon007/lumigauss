@@ -131,7 +131,8 @@ def render_shadowed_sun(gaussians, viewpoint_cam, pipeline, background,
         )
     else:
         rgb_unshadowed, _, sun_dir_out, components = gaussians.compute_directional_rgb(
-            emb_idx, normal_vectors, sun_direction, sun_elevation=sun_elevation
+            emb_idx, normal_vectors, sun_direction, sun_elevation=sun_elevation,
+            normal_multiplier=multiplier
         )
     render_pkg_unshadowed = render(viewpoint_cam, gaussians, pipeline, background,
                                    override_color=rgb_unshadowed)
@@ -152,7 +153,8 @@ def render_shadowed_sun(gaussians, viewpoint_cam, pipeline, background,
         shadow_bias=shadow_bias,
         ray_march_steps=ray_march_steps,
         voxel_resolution=voxel_resolution,
-        device="cuda"
+        device="cuda",
+        normal_vectors=normal_vectors,
     )
     shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 

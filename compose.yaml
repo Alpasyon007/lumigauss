@@ -42,7 +42,7 @@ services:
       - --shadow_method
       - shadow_map
       # 1024, 2048, 4096, 8192
-      - --shadow_map_resolution=2048
+      - --shadow_map_resolution=4096
       - --sky_mask_path=./data/st_colmap/dynamic_masks/sky
       #- --full_pbr
       - --use_sun_cal

@@ -603,7 +603,8 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
                     shadow_bias=shadow_bias,
                     ray_march_steps=ray_march_steps,
                     voxel_resolution=voxel_resolution,
-                    device="cuda"
+                    device="cuda",
+                    normal_vectors=frame_normals,
                 )
             shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 

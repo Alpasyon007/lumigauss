@@ -1051,7 +1051,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                                 emb_idx, normal_vectors, viewpoint.sun_direction, viewpoint.camera_center, sun_elevation=sun_elev
                             )
                         else:
-                            rgb_precomp_unshadowed, intensity, sun_dir, components = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, viewpoint.sun_direction, sun_elevation=sun_elev)
+                            rgb_precomp_unshadowed, intensity, sun_dir, components = scene.gaussians.compute_directional_rgb(emb_idx, normal_vectors, viewpoint.sun_direction, sun_elevation=sun_elev, normal_multiplier=multiplier)
 
                         # render unshadowed with directional lighting
                         render_pkg_unshadowed = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=rgb_precomp_unshadowed)
@@ -1066,9 +1066,10 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             sun_dir,
                             renderArgs[0],  # pipe
                             method=viz_shadow_method,
-                            shadow_map_resolution=512,
+                            shadow_map_resolution=1024,
                             shadow_bias=0.05,
-                            device="cuda"
+                            device="cuda",
+                            normal_vectors=normal_vectors,
                         )
                         shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
                         albedo = scene.gaussians.get_albedo

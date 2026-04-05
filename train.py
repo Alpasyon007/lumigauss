@@ -257,7 +257,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         emb_idx, normal_vectors, sun_dir, viewpoint_cam.camera_center, sun_elevation=sun_elev
                     )
                 else:
-                    rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
+                    rgb_precomp_unshadowed, _, sun_dir, _ = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev, normal_multiplier=multiplier)
             else:
                 rgb_precomp_unshadowed, _ = gaussians.compute_gaussian_rgb(sh_env+sh_random_noise, shadowed=False, normal_vectors=normal_vectors)
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=rgb_precomp_unshadowed, override_xyz=override_xyz)
@@ -292,7 +292,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     shadow_bias=dataset.shadow_bias,
                     ray_march_steps=dataset.ray_march_steps,
                     voxel_resolution=dataset.voxel_resolution,
-                    device="cuda"
+                    device="cuda",
+                    normal_vectors=normal_vectors,
                 )
                 shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
                 if gaussians.full_pbr:
@@ -302,7 +303,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     )
                 else:
                     # Use explicit directional lighting with sun color prior
-                    _, _, sun_dir, components = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev)
+                    _, _, sun_dir, components = gaussians.compute_directional_rgb(emb_idx, normal_vectors, sun_dir, sun_elevation=sun_elev, normal_multiplier=multiplier)
 
                     # Apply shadow to direct lighting only (ambient and residual remain unaffected)
                     direct_light = components['direct']

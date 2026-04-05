@@ -77,7 +77,7 @@ class ModelParams(ParamGroup):
         self.progressive_resolution = False  # Enable progressive resolution training
         self.progressive_switch_iter = 15000  # Iteration to switch from low-res to full-res
         self.shadow_method = "shadow_map"
-        self.shadow_map_resolution = 512  # Resolution for shadow mapping
+        self.shadow_map_resolution = 1024  # Resolution for shadow mapping
         self.shadow_bias = 0.05  # Depth bias as fraction of scene_extent (0.05 = 5% of scene radius)
         self.ray_march_steps = 64  # Number of steps for ray marching
         self.voxel_resolution = 128  # Resolution for voxel grid

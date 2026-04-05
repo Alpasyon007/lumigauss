@@ -316,7 +316,7 @@ class GaussianModel:
 
         return rgb, intensity
 
-    def compute_directional_rgb(self, emb_idx, normal_vectors, sun_direction, sun_elevation=None):
+    def compute_directional_rgb(self, emb_idx, normal_vectors, sun_direction, sun_elevation=None, normal_multiplier=None):
         """
         Compute RGB using explicit directional sun lighting with sun color prior.
 
@@ -331,6 +331,8 @@ class GaussianModel:
             normal_vectors: Surface normals [N, 3]
             sun_direction: Sun direction vector [3] from camera
             sun_elevation: Sun elevation angle in degrees (for color prior)
+            normal_multiplier: Per-gaussian sign [N] from compute_normal_world_space
+                for correcting camera-flipped normals in N·L computation.
 
         Returns:
             rgb: Final RGB values [N, 3]
@@ -345,7 +347,8 @@ class GaussianModel:
 
         # Compute directional lighting (unshadowed) with sun color prior
         intensity_hdr, sun_dir, components = self.sun_model(
-            emb_idx, normal_vectors, sun_direction=sun_direction, sun_elevation=sun_elevation
+            emb_idx, normal_vectors, sun_direction=sun_direction,
+            sun_elevation=sun_elevation, normal_multiplier=normal_multiplier
         )
 
         # Sky gaussians (casts_shadow < 0.5) are emissive — not affected by sun direction or shadows.
