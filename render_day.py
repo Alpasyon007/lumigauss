@@ -481,6 +481,9 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
     shadow_bias = getattr(args, 'shadow_bias', 0.1)
     ray_march_steps = getattr(args, 'ray_march_steps', 64)
     voxel_resolution = getattr(args, 'voxel_resolution', 128)
+    shadow_scale_modifier = getattr(args, 'shadow_scale_modifier', 1.5)
+    shadow_dilation_kernel = getattr(args, 'shadow_dilation_kernel', 5)
+    shadow_alpha_threshold = getattr(args, 'shadow_alpha_threshold', 0.01)
 
     # Shadow fix parameters
     use_shadow_fixes = getattr(args, 'shadow_fixes', False)
@@ -605,6 +608,9 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
                     voxel_resolution=voxel_resolution,
                     device="cuda",
                     normal_vectors=frame_normals,
+                    shadow_scale_modifier=shadow_scale_modifier,
+                    shadow_dilation_kernel=shadow_dilation_kernel,
+                    alpha_threshold=shadow_alpha_threshold,
                 )
             shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 

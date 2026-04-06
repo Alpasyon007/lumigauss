@@ -112,7 +112,9 @@ def render_shadowed_sun(gaussians, viewpoint_cam, pipeline, background,
                         normal_vectors, multiplier, emb_idx,
                         sun_direction, sun_elevation,
                         shadow_method, shadow_map_resolution, shadow_bias,
-                        ray_march_steps, voxel_resolution):
+                        ray_march_steps, voxel_resolution,
+                        shadow_scale_modifier=1.5, shadow_dilation_kernel=5,
+                        shadow_alpha_threshold=0.01):
     """
     Render a shadowed image using the sun model (directional or PBR).
 
@@ -155,6 +157,9 @@ def render_shadowed_sun(gaussians, viewpoint_cam, pipeline, background,
         voxel_resolution=voxel_resolution,
         device="cuda",
         normal_vectors=normal_vectors,
+        shadow_scale_modifier=shadow_scale_modifier,
+        shadow_dilation_kernel=shadow_dilation_kernel,
+        alpha_threshold=shadow_alpha_threshold,
     )
     shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 

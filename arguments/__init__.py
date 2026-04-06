@@ -78,7 +78,10 @@ class ModelParams(ParamGroup):
         self.progressive_switch_iter = 15000  # Iteration to switch from low-res to full-res
         self.shadow_method = "shadow_map"
         self.shadow_map_resolution = 1024  # Resolution for shadow mapping
-        self.shadow_bias = 0.05  # Depth bias as fraction of scene_extent (0.05 = 5% of scene radius)
+        self.shadow_bias = 0.05  # Depth bias as fraction of scene_extent; Higher: fewer shadow acne artifacts but shadows shrink/detach; Lower: tighter shadows but more self-shadowing noise
+        self.shadow_scale_modifier = 10  # Factor to enlarge gaussians during shadow map render; Higher: fewer light leaks through gaps but shadows bloat; Lower: tighter shadows but more light bleeding
+        self.shadow_dilation_kernel = 20  # Morphological dilation kernel size for shadow map (0=off); Higher: closes more gaps between surfels but over-shadows fine detail; Lower: preserves detail but more light leaks
+        self.shadow_alpha_threshold = 0.001  # Min alpha to treat as valid occluder in shadow map; Higher: ignores semi-transparent surfels (cleaner but misses thin occluders); Lower: treats nearly-transparent surfels as blockers (fewer leaks but noisier)
         self.ray_march_steps = 64  # Number of steps for ray marching
         self.voxel_resolution = 128  # Resolution for voxel grid
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -178,10 +181,10 @@ class OptimizationParams(ParamGroup):
         self.albedo_lr= 0.0025
         # Sun direction calibration learning rates
         #self.sun_cal_lr = 0.001         # Learning rate for sun direction deltas
-        self.sun_cal_lr = 0.1
-        self.sun_cal_from_iter = 10000    # Start sun calibration after this iteration
+        self.sun_cal_lr = 0.5		  # Higher LR for sun direction calibration (often noisy gradients, needs stronger updates)
+        self.sun_cal_from_iter = 2000    # Start sun calibration after this iteration
         self.sun_cal_until_iter = 30000 # Stop sun calibration at this iteration
-        self.sun_cal_reg_lambda = 0.0001  # L2 regularization pulling delta_sun_dir toward zero (higher = tighter to input)
+        self.sun_cal_reg_lambda = 0.00001  # L2 regularization pulling delta_sun_dir toward zero (higher = tighter to input)
 
         self.gauss_loss_lambda = 0.001
         self.env_loss_lambda = 0.05

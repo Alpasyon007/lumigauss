@@ -169,7 +169,9 @@ def render_shadow_map(
     sun_camera: SunShadowCamera,
     gaussians,
     pipe,
-    device: str = "cuda"
+    device: str = "cuda",
+    shadow_scale_modifier: float = 1.5,
+    shadow_dilation_kernel: int = 5,
 ) -> torch.Tensor:
     """
     Render a depth/shadow map from the sun's viewpoint.
@@ -179,6 +181,12 @@ def render_shadow_map(
         gaussians: GaussianModel instance
         pipe: Pipeline parameters
         device: Device
+        shadow_scale_modifier: Factor to enlarge gaussians when rendering the
+            shadow map.  Values > 1 make each surfel cover more area from the
+            sun's perspective, reducing light leaking between surfels.
+        shadow_dilation_kernel: Kernel size for morphological dilation of the
+            shadow map alpha and depth.  Fills small gaps left between inflated
+            surfels.  0 disables dilation.
 
     Returns:
         Shadow depth map [1, H, W]
@@ -198,7 +206,7 @@ def render_shadow_map(
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
-        scale_modifier=1.0,
+        scale_modifier=shadow_scale_modifier,
         viewmatrix=sun_camera.world_view_transform,
         projmatrix=sun_camera.full_proj_transform,
         sh_degree=0,  # Don't need SH for shadow map
@@ -256,6 +264,36 @@ def render_shadow_map(
     # Use median depth where available, fall back to expected depth
     shadow_depth = torch.where(median_depth > 0, median_depth, expected_depth)
 
+    # --- Morphological dilation of shadow map ---
+    # Inflated scales still leave tiny gaps between surfels.  A small dilation
+    # of the alpha map (max-pool) and depth map (min-pool = propagate closest
+    # depth into gaps) closes the remaining holes without blurring shadow edges
+    # more than the PCF kernel already does.
+    if shadow_dilation_kernel > 0:
+        K = shadow_dilation_kernel
+        pad = K // 2
+        H, W = shadow_depth.shape[1], shadow_depth.shape[2]
+
+        # Remember which pixels were originally valid
+        valid_before = (render_alpha > 0.05)  # [1, H, W]
+
+        # Dilate alpha: expand coverage into empty gaps
+        render_alpha = torch.nn.functional.max_pool2d(
+            render_alpha.unsqueeze(0), kernel_size=K, stride=1, padding=pad
+        ).squeeze(0)[:, :H, :W]
+
+        # Propagate the minimum (closest/occluding) depth into newly-covered pixels.
+        # Replace zero depth with a large value so it doesn't "win" the min operation.
+        large_depth = shadow_depth.max() + 1.0
+        depth_for_min = torch.where(valid_before, shadow_depth, large_depth)  # [1, H, W]
+        # Min-pool = -max_pool(-x)
+        depth_dilated = -torch.nn.functional.max_pool2d(
+            -depth_for_min.unsqueeze(0), kernel_size=K, stride=1, padding=pad
+        ).squeeze(0)[:, :H, :W]
+
+        # Keep original depth where it was already valid; use dilated depth in new pixels
+        shadow_depth = torch.where(valid_before, shadow_depth, depth_dilated)
+
     return shadow_depth, render_alpha
 
 
@@ -270,6 +308,7 @@ def compute_shadow_mask(
     normal_vectors: torch.Tensor = None,
     sun_direction: torch.Tensor = None,
     pcf_radius: int = 2,
+    alpha_threshold: float = 0.01,
 ) -> torch.Tensor:
     """
     Compute shadow mask for each Gaussian by comparing its depth to the shadow map.
@@ -298,6 +337,8 @@ def compute_shadow_mask(
             and normal-offset
         sun_direction: Optional sun direction [3] for slope-scaled bias
         pcf_radius: Half-size of the PCF kernel (0=no PCF, 1=3x3, 2=5x5)
+        alpha_threshold: Minimum shadow map alpha to consider a pixel as valid
+            occluder geometry.  Lower values catch translucent aggregated surfels.
 
     Returns:
         Shadow mask [N] where 1=lit, 0=shadowed
@@ -394,7 +435,7 @@ def compute_shadow_mask(
                 mode='nearest', padding_mode='zeros', align_corners=False
             ).view(N)
 
-            in_shadow_sample = (gaussian_depth > sampled_depth + per_gaussian_bias) & (sampled_alpha > 0.1)
+            in_shadow_sample = (gaussian_depth > sampled_depth + per_gaussian_bias) & (sampled_alpha > alpha_threshold)
             shadow_accum += in_shadow_sample.float()
 
         # Fraction of samples that are shadowed → soft shadow factor
@@ -414,7 +455,7 @@ def compute_shadow_mask(
             mode='bilinear', padding_mode='zeros', align_corners=False
         ).view(N)
 
-        in_shadow = (gaussian_depth > sampled_depth + per_gaussian_bias) & (sampled_alpha > 0.1)
+        in_shadow = (gaussian_depth > sampled_depth + per_gaussian_bias) & (sampled_alpha > alpha_threshold)
         shadow_mask = (~in_shadow).float()
 
     # Points outside the shadow map frustum should be lit
@@ -462,6 +503,9 @@ def compute_shadows_shadow_map(
     device: str = "cuda",
     normal_vectors: torch.Tensor = None,
     pcf_radius: int = 2,
+    shadow_scale_modifier: float = 1.5,
+    shadow_dilation_kernel: int = 5,
+    alpha_threshold: float = 0.01,
 ) -> Tuple[torch.Tensor, torch.Tensor, SunShadowCamera]:
     """
     Shadow mapping - render depth from sun's viewpoint and compare.
@@ -480,6 +524,9 @@ def compute_shadows_shadow_map(
         normal_vectors: Optional surface normals [N, 3] for slope-scaled bias
             and normal-offset (pass from compute_normal_world_space)
         pcf_radius: PCF kernel half-size (0=off, 1=3x3, 2=5x5)
+        shadow_scale_modifier: Factor to enlarge gaussians when rendering shadow map
+        shadow_dilation_kernel: Morphological dilation kernel size (0=off)
+        alpha_threshold: Min alpha to treat as valid occluder
 
     Returns:
         Tuple of (shadow_mask, shadow_depth_map, sun_camera)
@@ -497,7 +544,9 @@ def compute_shadows_shadow_map(
     )
 
     shadow_depth_map, shadow_alpha_map = render_shadow_map(
-        sun_camera, gaussians, pipe, device
+        sun_camera, gaussians, pipe, device,
+        shadow_scale_modifier=shadow_scale_modifier,
+        shadow_dilation_kernel=shadow_dilation_kernel,
     )
 
     shadow_mask = compute_shadow_mask(
@@ -511,6 +560,7 @@ def compute_shadows_shadow_map(
         normal_vectors=normal_vectors,
         sun_direction=sun_direction,
         pcf_radius=pcf_radius,
+        alpha_threshold=alpha_threshold,
     )
 
     return shadow_mask, shadow_depth_map, sun_camera
@@ -802,6 +852,9 @@ def compute_shadows_for_gaussians(
     device: str = "cuda",
     normal_vectors: torch.Tensor = None,
     pcf_radius: int = 2,
+    shadow_scale_modifier: float = 1.5,
+    shadow_dilation_kernel: int = 5,
+    alpha_threshold: float = 0.01,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[SunShadowCamera]]:
     """
     Unified interface for computing shadows using different methods.
@@ -823,6 +876,9 @@ def compute_shadows_for_gaussians(
         normal_vectors: Optional surface normals [N, 3] for improved shadow mapping
             (enables slope-scaled bias, normal-offset, and backface-aware shadows)
         pcf_radius: PCF kernel half-size for shadow_map method (0=off, 2=5x5)
+        shadow_scale_modifier: Factor to enlarge gaussians during shadow map render
+        shadow_dilation_kernel: Morphological dilation kernel size (0=off)
+        alpha_threshold: Min alpha to treat as valid occluder
 
     Returns:
         Tuple of:
@@ -846,7 +902,10 @@ def compute_shadows_for_gaussians(
             shadow_mask, shadow_depth_map, sun_camera = compute_shadows_shadow_map(
                 gaussians, sun_direction, pipe,
                 shadow_map_resolution, shadow_bias, device,
-                normal_vectors=normal_vectors, pcf_radius=pcf_radius
+                normal_vectors=normal_vectors, pcf_radius=pcf_radius,
+                shadow_scale_modifier=shadow_scale_modifier,
+                shadow_dilation_kernel=shadow_dilation_kernel,
+                alpha_threshold=alpha_threshold,
             )
 
     elif method == "ray_march":

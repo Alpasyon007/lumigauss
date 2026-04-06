@@ -294,6 +294,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     voxel_resolution=dataset.voxel_resolution,
                     device="cuda",
                     normal_vectors=normal_vectors,
+                    shadow_scale_modifier=dataset.shadow_scale_modifier,
+                    shadow_dilation_kernel=dataset.shadow_dilation_kernel,
+                    alpha_threshold=dataset.shadow_alpha_threshold,
                 )
                 shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
                 if gaussians.full_pbr:
