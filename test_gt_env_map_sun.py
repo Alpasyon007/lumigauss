@@ -306,7 +306,7 @@ def render_set(dataset: ModelParams, iteration: int, pipeline: PipelineParams,
 
         # ---- Sun direction ----
         # Use camera's own sun direction (matches training_report behavior)
-        base_sun_dir = viewpoint_cam.sun_direction
+        base_sun_dir = viewpoint_cam.get_adjusted_sun_direction()
         sun_elevation = viewpoint_cam.sun_elevation  # Pass as-is (can be None, like training)
 
         if base_sun_dir is None:

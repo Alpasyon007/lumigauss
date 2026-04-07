@@ -82,8 +82,8 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
             appearance_idx = appearance_lut[view.image_name]
 
             if gaussians.use_sun:
-                # Get sun direction and elevation from camera
-                sun_dir = view.sun_direction
+                # Get sun direction and elevation from camera (uses calibrated delta if available)
+                sun_dir = view.get_adjusted_sun_direction()
                 sun_elev = view.sun_elevation
                 if sun_dir is None:
                     print(f"Warning: No sun direction for {view.image_name}, skipping")
@@ -183,9 +183,9 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                 appearance_idx = appearance_lut[app_name]
                 app_image = [c.original_image for c in train_cameras if c.image_name == app_name][0]
 
-                # Get sun direction from source appearance camera
+                # Get sun direction from source appearance camera (uses calibrated delta if available)
                 app_camera = [c for c in train_cameras if c.image_name == app_name][0]
-                sun_dir = app_camera.sun_direction
+                sun_dir = app_camera.get_adjusted_sun_direction()
                 if sun_dir is None:
                     print(f"Warning: No sun direction for {app_name}, skipping")
                     continue

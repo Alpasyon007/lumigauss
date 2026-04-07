@@ -146,6 +146,12 @@ class Scene:
         self.sun_cal_enabled = False
         self.optimizer_sun_cal = None
 
+        # Auto-load sun calibration deltas when loading a checkpoint
+        if self.loaded_iter:
+            sun_cal_path = os.path.join(self.model_path, f"chkpnt_sun_cal{self.loaded_iter}.pth")
+            if os.path.exists(sun_cal_path):
+                self.load_sun_cal(self.loaded_iter)
+
     def setup_cam_cal(self, opt):
         """Enable learnable camera pose refinement for all training cameras.
 
@@ -245,17 +251,25 @@ class Scene:
         print(f"[Camera Calibration] Loaded deltas for {len(cam_cal_state)} cameras from iter {iteration}")
 
     def load_sun_cal(self, iteration):
-        """Load sun direction calibration deltas from a checkpoint."""
+        """Load sun direction calibration deltas from a checkpoint.
+
+        Also enables sun_cal on each camera so that
+        ``get_adjusted_sun_direction()`` returns the calibrated value.
+        """
         path = os.path.join(self.model_path, f"chkpnt_sun_cal{iteration}.pth")
         if not os.path.exists(path):
             print(f"[Sun Calibration] No checkpoint found at {path}")
             return
         sun_cal_state = torch.load(path, weights_only=True)
+        loaded = 0
         for cam in self.getTrainCameras():
             if cam.image_name in sun_cal_state:
                 entry = sun_cal_state[cam.image_name]
                 cam.delta_sun_dir.data.copy_(entry["delta_sun_dir"].cuda())
-        print(f"[Sun Calibration] Loaded deltas for {len(sun_cal_state)} cameras from iter {iteration}")
+                cam.enable_sun_cal()
+                loaded += 1
+        self.sun_cal_enabled = True
+        print(f"[Sun Calibration] Loaded deltas for {loaded}/{len(sun_cal_state)} cameras from iter {iteration}")
 
 
     def getTrainCameras(self, scale=1.0):
