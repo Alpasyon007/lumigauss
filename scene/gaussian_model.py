@@ -226,9 +226,9 @@ class GaussianModel:
         # Ensure PBR material params are trainable only when full_pbr is enabled.
         self._roughness = nn.Parameter(self._roughness.detach().requires_grad_(self.full_pbr))
         self._metallic = nn.Parameter(self._metallic.detach().requires_grad_(self.full_pbr))
-        # Reinitialize _casts_shadow as learnable parameter with correct size (default: all shadow-casting)
-        # Will be optimized via sky mask loss during training
-        self._casts_shadow = nn.Parameter(torch.ones(self._xyz.shape[0], device="cuda", dtype=torch.float32).requires_grad_(True))
+        # Reinitialize _casts_shadow as learnable parameter with correct size (default: non-shadow-casting)
+        # Will be initialized from sky masks and further optimized via sky mask loss during training
+        self._casts_shadow = nn.Parameter(torch.zeros(self._xyz.shape[0], device="cuda", dtype=torch.float32).requires_grad_(True))
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -289,6 +289,61 @@ class GaussianModel:
         """Get per-gaussian shadow casting flag (1=casts shadow, 0=sky/transparent)"""
         # Clamp to [0, 1] since it's now a learnable parameter
         return torch.clamp(self._casts_shadow, 0.0, 1.0)
+
+    def init_casts_shadow_from_sky_masks(self, cameras, sky_masks):
+        """Initialize _casts_shadow by projecting gaussians into views and sampling sky masks.
+
+        Gaussians that project into non-sky regions (mask=1) in ANY view are
+        marked as shadow-casting (1.0).  The rest stay at 0.0.
+
+        Args:
+            cameras: List of training Camera objects.
+            sky_masks: Dict mapping image_name → [H, W] tensor (0=sky, 1=not sky).
+        """
+        import torch.nn.functional as F
+
+        xyz = self._xyz.detach()  # [N, 3]
+        N = xyz.shape[0]
+        votes = torch.zeros(N, device="cuda")
+
+        cams = [c for c in cameras if c.image_name in sky_masks]
+
+        ones = torch.ones(N, 1, device="cuda")
+        xyz_h = torch.cat([xyz, ones], dim=-1)  # [N, 4]
+
+        for cam in cams:
+            mask = sky_masks[cam.image_name]  # [H, W], 0=sky, 1=not-sky
+            H, W = mask.shape
+
+            # Project: clip coords = xyz_h @ full_proj_transform
+            proj = xyz_h @ cam.full_proj_transform  # [N, 4]
+            w = proj[:, 3:4].clamp(min=1e-6)
+            ndc = proj[:, :3] / w  # [N, 3]
+
+            # NDC → pixel coords
+            px = ((ndc[:, 0] + 1.0) * 0.5 * W).long()
+            py = ((ndc[:, 1] + 1.0) * 0.5 * H).long()
+
+            # Valid: in front of camera and inside image bounds
+            valid = (w.squeeze(-1) > 0.1) & (px >= 0) & (px < W) & (py >= 0) & (py < H)
+
+            # Sample sky mask at projected positions
+            px_valid = px[valid]
+            py_valid = py[valid]
+            mask_vals = mask[py_valid, px_valid]  # 1 = not sky
+
+            # Any view saying "not sky" → this gaussian casts shadow
+            votes[valid] += mask_vals
+
+        # Mark as shadow-casting if any view voted not-sky
+        init_val = (votes > 0).float()
+
+        with torch.no_grad():
+            self._casts_shadow.data.copy_(init_val)
+
+        n_shadow = int(init_val.sum().item())
+        print(f"[casts_shadow init] {n_shadow}/{N} gaussians marked as shadow-casting "
+              f"from {len(cams)} camera views")
 
     def compute_embedding(self, emb_idx):
         return self.embedding(torch.full((1,),emb_idx).cuda())
@@ -585,8 +640,8 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        # Initialize all gaussians as shadow-casting (1.0), learnable via sky mask loss
-        self._casts_shadow = nn.Parameter(torch.ones((fused_point_cloud.shape[0],), dtype=torch.float32, device="cuda").requires_grad_(True))
+        # Initialize all gaussians as non-shadow-casting (0.0); will be set from sky masks
+        self._casts_shadow = nn.Parameter(torch.zeros((fused_point_cloud.shape[0],), dtype=torch.float32, device="cuda").requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
 
@@ -883,9 +938,9 @@ class GaussianModel:
                               new_features_dc_negative, new_features_rest_negative,
                               new_albedo, new_opacities, new_scaling, new_rotation, new_casts_shadow=None,
                               new_roughness=None, new_metallic=None):
-        # Default new gaussians to shadow-casting (1.0)
+        # Default new gaussians to non-shadow-casting (0.0); sky mask loss will refine
         if new_casts_shadow is None:
-            new_casts_shadow = torch.ones(new_xyz.shape[0], device="cuda", dtype=torch.float32)
+            new_casts_shadow = torch.zeros(new_xyz.shape[0], device="cuda", dtype=torch.float32)
         if new_roughness is None:
             new_roughness = torch.full((new_xyz.shape[0], 1), 0.6, device="cuda", dtype=torch.float32)
         if new_metallic is None:
