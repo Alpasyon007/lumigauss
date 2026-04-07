@@ -1073,6 +1073,7 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             shadow_scale_modifier=1.5,
                             shadow_dilation_kernel=5,
                             alpha_threshold=0.01,
+                            normal_multiplier=multiplier,
                         )
                         shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
                         albedo = scene.gaussians.get_albedo

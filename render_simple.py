@@ -117,6 +117,7 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                     shadow_scale_modifier=shadow_scale_modifier,
                     shadow_dilation_kernel=shadow_dilation_kernel,
                     alpha_threshold=shadow_alpha_threshold,
+                    normal_multiplier=multiplier,
                 )
                 shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 
@@ -223,6 +224,7 @@ def render_set(model_path, imgs_subset, iteration, views, train_cameras, gaussia
                         shadow_scale_modifier=shadow_scale_modifier,
                         shadow_dilation_kernel=shadow_dilation_kernel,
                         alpha_threshold=shadow_alpha_threshold,
+                        normal_multiplier=multiplier,
                     )
                     shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 

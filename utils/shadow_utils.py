@@ -309,13 +309,16 @@ def compute_shadow_mask(
     sun_direction: torch.Tensor = None,
     pcf_radius: int = 2,
     alpha_threshold: float = 0.01,
+    normal_multiplier: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Compute shadow mask for each Gaussian by comparing its depth to the shadow map.
 
-    The UV lookup uses the same perspective projection that the surfel rasterizer
-    uses internally (focal length derived from FoV), so pixel positions match
-    exactly between the rendered shadow map and the lookup coordinates.
+    The UV lookup uses perspective projection matching the surfel rasterizer's
+    internal projection (focal length derived from FoV).  Even though the
+    shadow camera has an orthographic projection matrix, the diff-surfel
+    rasterizer always positions pixels via focal_x·x/z + cx, so the lookup
+    must use the same perspective formula.
 
     Improvements over basic shadow mapping:
     - PCF (Percentage Closer Filtering): samples a kernel around each lookup
@@ -333,12 +336,16 @@ def compute_shadow_mask(
         bias: Depth bias as fraction of scene_extent
         scene_extent: Scene bounding radius, used to scale the bias
         device: Device
-        normal_vectors: Optional surface normals [N, 3] for slope-scaled bias
-            and normal-offset
+        normal_vectors: Optional surface normals [N, 3] (may be camera-flipped)
+            for slope-scaled bias
         sun_direction: Optional sun direction [3] for slope-scaled bias
         pcf_radius: Half-size of the PCF kernel (0=no PCF, 1=3x3, 2=5x5)
         alpha_threshold: Minimum shadow map alpha to consider a pixel as valid
             occluder geometry.  Lower values catch translucent aggregated surfels.
+        normal_multiplier: Optional [N] tensor of +1/-1 from compute_normal_world_space.
+            +1 = geometric normal already faced the camera (no flip needed).
+            -1 = geometric normal was flipped to face camera.
+            Used to recover the true geometric N·L and force backfaces into shadow.
 
     Returns:
         Shadow mask [N] where 1=lit, 0=shadowed
@@ -347,23 +354,28 @@ def compute_shadow_mask(
     W = sun_camera.image_width
     H = sun_camera.image_height
 
-    # --- Normal-offset bias: shift positions along surface normal before projection ---
-    # This moves the lookup point slightly above the surface, preventing self-shadowing
-    # on surfaces that are nearly tangent to the light direction.
+    # --- Sun-direction offset bias: shift lookup position toward the sun ---
+    # This moves the sample point slightly toward the light source, preventing
+    # self-shadowing on surfaces close to the sun direction.
+    # We offset along the sun direction rather than the surface normal because
+    # the normals passed here are camera-flipped (facing the viewing camera, not
+    # necessarily their true geometric direction).  Using camera-flipped normals
+    # for an offset would push backface lookups toward the camera, incorrectly
+    # sampling lit regions of the shadow map.
     positions = gaussian_positions
+    if sun_direction is not None:
+        sun_dir = sun_direction / (torch.norm(sun_direction) + 1e-8)
+        sun_offset = scene_extent * 0.005  # small constant offset toward sun
+        positions = gaussian_positions + sun_dir.unsqueeze(0) * sun_offset
+
+    # Pre-compute cos_theta for slope-scaled bias (needs normals + sun_dir)
+    cos_theta = None
     if normal_vectors is not None and sun_direction is not None:
         sun_dir = sun_direction / (torch.norm(sun_direction) + 1e-8)
         normals_norm = normal_vectors / (torch.norm(normal_vectors, dim=-1, keepdim=True) + 1e-8)
-
-        # Offset proportional to how much the surface faces away from the light
-        # Surfaces at grazing angles get a larger offset
         cos_theta = torch.clamp(
             torch.sum(normals_norm * sun_dir.unsqueeze(0), dim=-1, keepdim=True), min=0.0, max=1.0
         )
-        # sin(theta) ≈ sqrt(1 - cos²) — larger for grazing angles
-        sin_theta = torch.sqrt(1.0 - cos_theta * cos_theta + 1e-8)
-        normal_offset_scale = scene_extent * 0.01 * sin_theta  # [N, 1]
-        positions = gaussian_positions + normals_norm * normal_offset_scale
 
     # Transform Gaussian positions to sun camera's view space
     ones = torch.ones(N, 1, device=device, dtype=positions.dtype)
@@ -374,15 +386,13 @@ def compute_shadow_mask(
     view_coords = positions_homo @ sun_camera.world_view_transform  # [N, 4]
     gaussian_depth = view_coords[:, 2]  # [N] - z in view space (same space as shadow map)
 
-    # Compute UV using the same perspective projection the rasterizer uses.
-    # The surfel rasterizer projects via: pixel = focal * xy_view / z_view + principal_point
+    # Compute UV using the same perspective projection the surfel rasterizer uses
+    # internally.  The rasterizer places pixels via:
+    #   pixel = focal * xy_view / z_view + principal_point
     # where focal = resolution / (2 * tan(FoV/2)).
-    # Using the orthographic projection matrix for UV lookup is WRONG because
-    # the rasterizer renders with perspective (through intrinsics/focal length).
+    # In NDC [-1, 1]:  ndc = xy_view / (tan(FoV/2) * z_view)
     tanfovx = math.tan(sun_camera.FoVx * 0.5)
     tanfovy = math.tan(sun_camera.FoVy * 0.5)
-
-    # Perspective NDC: ndc = xy_view / (tan(fov/2) * z_view), in [-1, 1]
     z_view = gaussian_depth.clamp_min(1e-6)  # [N]
     ndc_x = view_coords[:, 0] / (tanfovx * z_view)  # [N]
     ndc_y = view_coords[:, 1] / (tanfovy * z_view)  # [N]
@@ -395,7 +405,7 @@ def compute_shadow_mask(
     # Surfaces at grazing angles to the sun have a larger depth gradient per texel,
     # so they need a proportionally larger bias to avoid shadow acne.
     effective_bias = bias * scene_extent
-    if normal_vectors is not None and sun_direction is not None:
+    if cos_theta is not None:
         # cos_theta already computed above; reuse
         # At grazing angles (cos→0), scale bias up to ~3×
         slope_factor = torch.clamp(1.0 / (cos_theta.squeeze(-1) + 0.1), 1.0, 3.0)  # [N]
@@ -462,6 +472,20 @@ def compute_shadow_mask(
     out_of_bounds = (uv_x < 0) | (uv_x > 1) | (uv_y < 0) | (uv_y > 1)
     shadow_mask[out_of_bounds] = 1.0
 
+    # --- Backface darkening ---
+    # Surfaces whose true geometric normal faces away from the sun should be
+    # fully in shadow regardless of the shadow map result.
+    # The normals passed here are camera-flipped (from compute_normal_world_space).
+    # To recover the geometric N·L:  geometric_ndotl = camera_flipped_ndotl * multiplier
+    if normal_multiplier is not None and normal_vectors is not None and sun_direction is not None:
+        sun_dir = sun_direction / (torch.norm(sun_direction) + 1e-8)
+        normals_norm = normal_vectors / (torch.norm(normal_vectors, dim=-1, keepdim=True) + 1e-8)
+        flipped_ndotl = torch.sum(normals_norm * sun_dir.unsqueeze(0), dim=-1)  # [N]
+        geometric_ndotl = flipped_ndotl * normal_multiplier  # [N] — true geometric dot product
+        # Backfaces: geometric_ndotl < 0 → force shadow_mask to 0
+        backface_mask = (geometric_ndotl < 0.0)
+        shadow_mask[backface_mask] = 0.0
+
     return shadow_mask
 
 
@@ -506,6 +530,7 @@ def compute_shadows_shadow_map(
     shadow_scale_modifier: float = 1.5,
     shadow_dilation_kernel: int = 5,
     alpha_threshold: float = 0.01,
+    normal_multiplier: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, SunShadowCamera]:
     """
     Shadow mapping - render depth from sun's viewpoint and compare.
@@ -561,6 +586,7 @@ def compute_shadows_shadow_map(
         sun_direction=sun_direction,
         pcf_radius=pcf_radius,
         alpha_threshold=alpha_threshold,
+        normal_multiplier=normal_multiplier,
     )
 
     return shadow_mask, shadow_depth_map, sun_camera
@@ -855,6 +881,7 @@ def compute_shadows_for_gaussians(
     shadow_scale_modifier: float = 1.5,
     shadow_dilation_kernel: int = 5,
     alpha_threshold: float = 0.01,
+    normal_multiplier: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[SunShadowCamera]]:
     """
     Unified interface for computing shadows using different methods.
@@ -874,11 +901,13 @@ def compute_shadows_for_gaussians(
         voxel_resolution: Resolution for voxel grid
         device: Device
         normal_vectors: Optional surface normals [N, 3] for improved shadow mapping
-            (enables slope-scaled bias, normal-offset, and backface-aware shadows)
+            (enables slope-scaled bias and backface-aware shadows)
         pcf_radius: PCF kernel half-size for shadow_map method (0=off, 2=5x5)
         shadow_scale_modifier: Factor to enlarge gaussians during shadow map render
         shadow_dilation_kernel: Morphological dilation kernel size (0=off)
         alpha_threshold: Min alpha to treat as valid occluder
+        normal_multiplier: Optional [N] tensor of +1/-1 from compute_normal_world_space
+            for recovering geometric normals and forcing backfaces into shadow
 
     Returns:
         Tuple of:
@@ -906,6 +935,7 @@ def compute_shadows_for_gaussians(
                 shadow_scale_modifier=shadow_scale_modifier,
                 shadow_dilation_kernel=shadow_dilation_kernel,
                 alpha_threshold=alpha_threshold,
+                normal_multiplier=normal_multiplier,
             )
 
     elif method == "ray_march":

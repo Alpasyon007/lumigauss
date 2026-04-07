@@ -611,6 +611,7 @@ def render_day_sequence(model_path, iteration, views, train_cameras, gaussians, 
                     shadow_scale_modifier=shadow_scale_modifier,
                     shadow_dilation_kernel=shadow_dilation_kernel,
                     alpha_threshold=shadow_alpha_threshold,
+                    normal_multiplier=multiplier,
                 )
             shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 

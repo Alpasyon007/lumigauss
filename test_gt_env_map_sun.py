@@ -160,6 +160,7 @@ def render_shadowed_sun(gaussians, viewpoint_cam, pipeline, background,
         shadow_scale_modifier=shadow_scale_modifier,
         shadow_dilation_kernel=shadow_dilation_kernel,
         alpha_threshold=shadow_alpha_threshold,
+        normal_multiplier=multiplier,
     )
     shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
 

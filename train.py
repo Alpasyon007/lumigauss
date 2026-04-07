@@ -297,6 +297,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     shadow_scale_modifier=dataset.shadow_scale_modifier,
                     shadow_dilation_kernel=dataset.shadow_dilation_kernel,
                     alpha_threshold=dataset.shadow_alpha_threshold,
+                    normal_multiplier=multiplier,
                 )
                 shadow_mask = shadow_mask.unsqueeze(-1)  # [N, 1]
                 if gaussians.full_pbr:
