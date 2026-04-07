@@ -36,9 +36,12 @@ def create_sun_camera(
     sun_dir = sun_dir.float().to(device)
     scene_center = scene_center.float().to(device)
 
-    # Position the camera far along the sun direction, looking back at scene
-    # Camera is placed at scene_center + sun_dir * distance
-    distance = scene_extent * 3.0  # Place camera far enough to see entire scene
+    # Position the camera far along the sun direction, looking back at scene.
+    # The rasterizer always uses perspective pixel placement (focal * x/z),
+    # so placing the camera far away makes the perspective approximate
+    # orthographic projection.  At 50x extent the front-to-back distortion
+    # ratio is only ~1.04 (4%) instead of 2.0 (100%) at 3x extent.
+    distance = scene_extent * 50.0
     cam_pos = scene_center + sun_dir * distance
 
     # Camera looks toward scene center (opposite of sun direction)
@@ -94,6 +97,11 @@ def create_sun_camera(
         'znear': znear,
         'zfar': zfar,
         'ortho_size': ortho_size,
+        'distance': distance,
+        # FoV sized so the nearest scene plane (distance - extent) maps
+        # ortho_size to exactly ndc=1.  This guarantees full coverage.
+        'FoVx': 2.0 * math.atan(ortho_size / (distance - scene_extent)),
+        'FoVy': 2.0 * math.atan(ortho_size / (distance - scene_extent)),
     }
 
 
@@ -159,10 +167,10 @@ class SunShadowCamera:
         self.zfar = cam_params['zfar']
         self.ortho_size = cam_params['ortho_size']
 
-        # For orthographic, FoV is not really used but rasterizer needs it
-        # Use a value that approximates the orthographic frustum
-        self.FoVx = 2.0 * math.atan(cam_params['ortho_size'] / (cam_params['zfar'] / 2))
-        self.FoVy = self.FoVx
+        # FoV computed in create_sun_camera to give near-orthographic
+        # perspective when the sun camera is placed far from the scene.
+        self.FoVx = cam_params['FoVx']
+        self.FoVy = cam_params['FoVy']
 
 
 def render_shadow_map(
