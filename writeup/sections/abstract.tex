@@ -1,8 +1,0 @@
-We present \ours{}, a method for relighting outdoor scenes captured in uncontrolled conditions under natural sunlight.
-Built upon 2D Gaussian Splatting (2DGS) with appearance embeddings, we replace the per-image spherical-harmonic environment maps of prior work with an explicit physically-motivated sun lighting model that decomposes illumination into a direct solar term, scene-global ambient light parameterised as spherical harmonics of the sun direction, and a shared global sky component.
-Sun intensity, colour correction, and ambient are all represented as low-order SH functions of the sun direction, reducing lighting parameters to $O(1)$ and enabling evaluation at novel sun positions unseen during training.
-Our explicit decomposition enables several capabilities absent from the baseline:
-(i)~geometry-based shadow computation via differentiable shadow mapping from an orthographic sun camera,
-and (ii)~realistic day-cycle relighting by simply sweeping the sun direction through a solar trajectory.
-We further introduce learnable per-camera sun direction calibration and a per-Gaussian sky distinction parameter supervised by binary sky masks.
-On the NeRF-OSR benchmark, \ours{} outperforms NeRF-OSR on all three evaluated scenes and is competitive with LumiGauss, achieving higher PSNR on Landwehrplatz and Staatstheater (18.91 and 17.98 dB versus 18.01 and 17.02), lower MSE on two scenes, and improved SSIM on Ludwigskirche and Staatstheater (0.730 and 0.753 versus 0.700 and 0.729), while enabling explicit geometry-based shadows and relighting at novel sun directions.

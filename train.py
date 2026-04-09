@@ -823,7 +823,8 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    iter_list = [1, 500, 1000, 1500, 2000, *list(range(2500, 1000001, 2500))] #[30000]
+    iter_list = [1, *list(range(500, 1000001, 500))] #[30000]
+    #iter_list = [1, 500, 1000, 1500, 2000, *list(range(2500, 1000001, 2500))] #[30000]
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)

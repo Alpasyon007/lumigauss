@@ -1,5 +1,5 @@
 # Fdb version 4
-["pdflatex"] 1774303790.96192 "d:/PhD/InTheWildRelight/lumigaussSun2/writeup/paper.tex" "paper.pdf" "paper" 1774303793.46299 0
+["pdflatex"] 1775693936.89663 "d:/PhD/InTheWildRelight/lumigaussSun2/writeup/paper.tex" "paper.pdf" "paper" 1775693938.84707 0
   "c:/Program Files/texlive/2025/texmf-dist/fonts/enc/dvips/base/8r.enc" 1753465059 4850 80dc9bab7f31fb78a000ccfed0e27cab ""
   "c:/Program Files/texlive/2025/texmf-dist/fonts/map/fontname/texfonts.map" 1753465292 3524 cb3e574dea2d1052e39280babc910dc8 ""
   "c:/Program Files/texlive/2025/texmf-dist/fonts/tfm/adobe/courier/pcrr7t.tfm" 1753464894 960 379cc0019370a9e0208a0a3f949f847a ""
@@ -130,10 +130,10 @@
   "c:/Program Files/texlive/2025/texmf-var/fonts/map/pdftex/updmap/pdftex.map" 1753467366 5569621 95bdcd3e18cca5d0a16cc56ca1802bbd ""
   "c:/Program Files/texlive/2025/texmf-var/web2c/pdftex/pdflatex.fmt" 1753467416 3604526 9435c4bc106191ed908babbe7e2ca228 ""
   "c:/Program Files/texlive/2025/texmf.cnf" 1753467353 713 e69b156964470283e0530f5060668171 ""
-  "d:/PhD/InTheWildRelight/lumigaussSun2/writeup/paper.tex" 1774290580 38598 eb88fa5431c3b5253d326e7b030f2f58 ""
-  "paper.aux" 1774303793 9636 c355c8ccde0159bacc6e162a98f92ed2 "pdflatex"
-  "paper.out" 1774303793 3028 a2f11cb83e0b68fb00a7bc6b2442deee "pdflatex"
-  "paper.tex" 1774290580 38598 eb88fa5431c3b5253d326e7b030f2f58 ""
+  "d:/PhD/InTheWildRelight/lumigaussSun2/writeup/paper.tex" 1775693933 39393 64200cb724c3df310110d9ecd712241b ""
+  "paper.aux" 1775693938 9636 c355c8ccde0159bacc6e162a98f92ed2 "pdflatex"
+  "paper.out" 1775693938 3028 a2f11cb83e0b68fb00a7bc6b2442deee "pdflatex"
+  "paper.tex" 1775693933 39393 64200cb724c3df310110d9ecd712241b ""
   (generated)
   "paper.aux"
   "paper.log"

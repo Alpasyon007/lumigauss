@@ -431,11 +431,11 @@ class SunModel(torch.nn.Module):
             color_correction = self._evaluate_sh_at_direction(self.color_correction_sh, sun_dir_norm)  # [3]
             color_correction = torch.clamp(color_correction, min=0.5, max=2.0)
             ambient = self._evaluate_sh_at_direction(self.ambient_sh, sun_dir_norm)  # [3]
-            ambient = torch.clamp(ambient, min=0.01)
+            ambient = torch.clamp(ambient, min=0.01, max=0.5)
         else:
             intensity_mult = torch.clamp(self.sun_intensity_multiplier[image_idx], min=0.01)  # [1]
             color_correction = torch.clamp(self.sun_color_correction[image_idx], min=0.5, max=2.0)  # [3]
-            ambient = torch.clamp(self.ambient_color[image_idx], min=0.01)  # [3]
+            ambient = torch.clamp(self.ambient_color[image_idx], min=0.01, max=0.5)  # [3]
 
         sun_int = sun_color_prior * color_correction * intensity_mult  # [3]
         return sun_int, ambient, sun_color_prior
