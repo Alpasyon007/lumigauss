@@ -391,15 +391,17 @@ def compute_shadow_mask(
 
     # View-space positions (for depth comparison with rasterizer output)
     # The rasterizer returns depth in view/camera space, so we must compare in the same space.
-    #view_coords = positions_homo @ sun_camera.world_view_transform  # [N, 4]
-    #gaussian_depth = view_coords[:, 2]  # [N] - z in view space (same space as shadow map)
+    view_coords = positions_homo @ sun_camera.world_view_transform  # [N, 4]
+    gaussian_depth = view_coords[:, 2]  # [N] - z in view space (same space as shadow map)
 
-    # Clip-space positions (for UV lookup into shadow map texture)
-    clip_coords = positions_homo @ sun_camera.full_proj_transform  # [N, 4]
+    ## Clip-space positions (for UV lookup into shadow map texture)
+    #clip_coords = positions_homo @ sun_camera.full_proj_transform  # [N, 4]
 
-    # Perspective divide (for orthographic w should be 1, but do it anyway)
-    ndc_coords = clip_coords[:, :3] / (clip_coords[:, 3:4] + 1e-8)  # [N, 3]
-    gaussian_depth = ndc_coords[:, 2]
+    ## Perspective divide (for orthographic w should be 1, but do it anyway)
+    #ndc_coords = clip_coords[:, :3] / (clip_coords[:, 3:4] + 1e-8)  # [N, 3]
+    #gaussian_depth = ndc_coords[:, 2]
+    #view_coords = ndc_coords
+
     # Compute UV using the same perspective projection the surfel rasterizer uses
     # internally.  The rasterizer places pixels via:
     #   pixel = focal * xy_view / z_view + principal_point
@@ -408,8 +410,8 @@ def compute_shadow_mask(
     tanfovx = math.tan(sun_camera.FoVx * 0.5)
     tanfovy = math.tan(sun_camera.FoVy * 0.5)
     z_view = gaussian_depth.clamp_min(1e-6)  # [N]
-    ndc_x = ndc_coords[:, 0] / (tanfovx * z_view)  # [N]
-    ndc_y = ndc_coords[:, 1] / (tanfovy * z_view)  # [N]
+    ndc_x = view_coords[:, 0] / (tanfovx * z_view)  # [N]
+    ndc_y = view_coords[:, 1] / (tanfovy * z_view)  # [N]
 
     # NDC to texture coordinates [0, 1]
     uv_x = (ndc_x + 1.0) * 0.5  # [N]
