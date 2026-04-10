@@ -82,7 +82,9 @@ class ModelParams(ParamGroup):
         self.shadow_scale_modifier = 1.5  # Factor to enlarge gaussians during shadow map render
         self.shadow_dilation_kernel = 5  # Morphological dilation kernel size for shadow map (0=off)
         self.shadow_alpha_threshold = 0.01  # Min alpha to treat as valid occluder in shadow map
-        self.shadow_sharpness = 50.0  # Sharpness of soft shadow sigmoid (higher = harder edges, 0 = use hard boolean)
+        self.shadow_sharpness = 15.0  # Sharpness of soft shadow sigmoid (higher = harder edges)
+        self.shadow_min = 0.05  # Minimum shadow value (prevents pitch-black shadows, reduces gamma artifacts)
+        self.shadow_sky_factor = 0.65  # Fraction of sky/residual light remaining in full shadow (1.0 = no sky occlusion, 0.0 = full occlusion)
         self.ray_march_steps = 64  # Number of steps for ray marching
         self.voxel_resolution = 128  # Resolution for voxel grid
         super().__init__(parser, "Loading Parameters", sentinel)

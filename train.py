@@ -318,10 +318,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     ambient_light = components['ambient']
                     residual_light = components['residual']
 
-                    # Shadowed intensity = direct * shadow + ambient + residual
-                    intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                    # Floor shadow_mask so shadows are never pitch-black (reduces gamma artifacts)
+                    shadow_min = getattr(dataset, 'shadow_min', 0.05)
+                    shadow_mask_clamped = torch.clamp(shadow_mask, min=shadow_min)
+                    shadow_sky_factor = getattr(dataset, 'shadow_sky_factor', 0.65)
+
+                    # Compute unshadowed intensity in HDR, apply gamma, then shadow in sRGB.
+                    # Applying shadow after gamma avoids amplifying shadow-boundary contrast
+                    # through the nonlinear gamma curve, which improves SSIM at shadow edges.
+                    intensity_hdr_unshadowed = direct_light + ambient_light + residual_light
+                    intensity_hdr_unshadowed = torch.clamp_min(intensity_hdr_unshadowed, 0.00001)
+                    intensity_unshadowed = intensity_hdr_unshadowed ** (1 / 2.2)  # gamma to sRGB
+
+                    # Partial sky occlusion: cast shadows also block part of the sky hemisphere,
+                    # so residual (sky) light is partially attenuated in shadowed regions.
+                    residual_factor = shadow_sky_factor + (1.0 - shadow_sky_factor) * shadow_mask_clamped
+
+                    # Shadow ratio: what fraction of light remains after shadowing direct component
+                    intensity_hdr_shadowed = direct_light * shadow_mask_clamped + ambient_light + residual_light * residual_factor
                     intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
-                    intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)  # gamma correction
+                    shadow_ratio = intensity_hdr_shadowed / intensity_hdr_unshadowed
+
+                    # Apply shadow ratio in sRGB space (after gamma)
+                    intensity_shadowed = intensity_unshadowed * shadow_ratio
 
                     albedo = gaussians.get_albedo
                     rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
@@ -402,10 +421,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # 4. Regularize global sky SH to stay bounded
             if gaussians.sun_model.use_residual_sh:
                 sky_sh = gaussians.sun_model.sky_sh
-                sun_reg_loss = sun_reg_loss + 0.01 * (sky_sh ** 2).mean()
+                sun_reg_loss = sun_reg_loss + 0.05 * (sky_sh ** 2).mean()
+                # Penalize higher-order sky SH terms more to keep sky lighting smooth
+                if sky_sh.shape[1] > 1:
+                    sun_reg_loss = sun_reg_loss + 0.03 * (sky_sh[:, 1:] ** 2).mean()
                 sky_dc = sky_sh[:, 0].abs().mean() * 0.282095
                 if sky_dc > ambient.mean() * 0.5:
-                    sun_reg_loss = sun_reg_loss + 0.05 * (sky_dc - ambient.mean() * 0.5) ** 2
+                    sun_reg_loss = sun_reg_loss + 0.1 * (sky_dc - ambient.mean() * 0.5) ** 2
 
         # Sky mask loss: train _casts_shadow to match sky mask via rendering
         sky_mask_loss = torch.tensor(0.0, device="cuda", dtype=torch.float32)
@@ -765,7 +787,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if param_group["name"] == "ambient_color":
                         param_group['lr'] = opt.env_lr * 2.0
                     if param_group["name"] == "sky_sh":
-                        param_group['lr'] = opt.env_lr
+                        param_group['lr'] = opt.env_lr * 0.3
 
                 for param_group in gaussians.optimizer.param_groups:
                     if param_group["name"] == "rotation":

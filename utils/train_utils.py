@@ -1090,9 +1090,20 @@ def training_report(tb_writer, iteration, Ll1_unshadowed, Ll1_shadowed, l1_loss,
                             ambient_light = components['ambient']
                             residual_light = components['residual']
 
-                            intensity_hdr_shadowed = direct_light * shadow_mask + ambient_light + residual_light
+                            shadow_min = 0.05
+                            shadow_mask_clamped = torch.clamp(shadow_mask, min=shadow_min)
+                            shadow_sky_factor = 0.65
+
+                            intensity_hdr_unshadowed = direct_light + ambient_light + residual_light
+                            intensity_hdr_unshadowed = torch.clamp_min(intensity_hdr_unshadowed, 0.00001)
+                            intensity_unshadowed = intensity_hdr_unshadowed ** (1 / 2.2)
+
+                            residual_factor = shadow_sky_factor + (1.0 - shadow_sky_factor) * shadow_mask_clamped
+                            intensity_hdr_shadowed = direct_light * shadow_mask_clamped + ambient_light + residual_light * residual_factor
                             intensity_hdr_shadowed = torch.clamp_min(intensity_hdr_shadowed, 0.00001)
-                            intensity_shadowed = intensity_hdr_shadowed ** (1 / 2.2)
+                            shadow_ratio = intensity_hdr_shadowed / intensity_hdr_unshadowed
+
+                            intensity_shadowed = intensity_unshadowed * shadow_ratio
 
                             rgb_precomp_shadowed = torch.clamp(intensity_shadowed * albedo, 0.0)
 
