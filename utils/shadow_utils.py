@@ -318,6 +318,7 @@ def compute_shadow_mask(
     pcf_radius: int = 2,
     alpha_threshold: float = 0.01,
     normal_multiplier: torch.Tensor = None,
+    shadow_sharpness: float = 50.0,
 ) -> torch.Tensor:
     """
     Compute shadow mask for each Gaussian by comparing its depth to the shadow map.
@@ -461,8 +462,13 @@ def compute_shadow_mask(
                 mode='nearest', padding_mode='zeros', align_corners=False
             ).view(N)
 
-            in_shadow_sample = (gaussian_depth > sampled_depth + per_gaussian_bias) & (sampled_alpha > alpha_threshold)
-            shadow_accum += in_shadow_sample.float()
+            # Soft differentiable shadow test using sigmoid instead of hard boolean.
+            # depth_diff > 0 means gaussian is behind the shadow map → in shadow.
+            # sigmoid(-k * depth_diff) → 0 when in shadow, → 1 when lit.
+            depth_diff = (gaussian_depth - sampled_depth - per_gaussian_bias) / (scene_extent + 1e-8)
+            alpha_factor = torch.sigmoid(shadow_sharpness * (sampled_alpha - alpha_threshold))
+            shadow_sample = (1.0 - torch.sigmoid(-shadow_sharpness * depth_diff)) * alpha_factor
+            shadow_accum += shadow_sample
 
         # Fraction of samples that are shadowed → soft shadow factor
         shadow_fraction = shadow_accum / num_samples
@@ -481,8 +487,11 @@ def compute_shadow_mask(
             mode='bilinear', padding_mode='zeros', align_corners=False
         ).view(N)
 
-        in_shadow = (gaussian_depth > sampled_depth + per_gaussian_bias) & (sampled_alpha > alpha_threshold)
-        shadow_mask = (~in_shadow).float()
+        # Soft differentiable shadow test using sigmoid instead of hard boolean.
+        depth_diff = (gaussian_depth - sampled_depth - per_gaussian_bias) / (scene_extent + 1e-8)
+        alpha_factor = torch.sigmoid(shadow_sharpness * (sampled_alpha - alpha_threshold))
+        in_shadow_soft = (1.0 - torch.sigmoid(-shadow_sharpness * depth_diff)) * alpha_factor
+        shadow_mask = 1.0 - in_shadow_soft
 
     # Points outside the shadow map frustum should be lit
     out_of_bounds = (uv_x < 0) | (uv_x > 1) | (uv_y < 0) | (uv_y > 1)
@@ -498,9 +507,9 @@ def compute_shadow_mask(
         normals_norm = normal_vectors / (torch.norm(normal_vectors, dim=-1, keepdim=True) + 1e-8)
         flipped_ndotl = torch.sum(normals_norm * sun_dir.unsqueeze(0), dim=-1)  # [N]
         geometric_ndotl = flipped_ndotl * normal_multiplier  # [N] — true geometric dot product
-        # Backfaces: geometric_ndotl < 0 → force shadow_mask to 0
-        backface_mask = (geometric_ndotl < 0.0)
-        shadow_mask[backface_mask] = 0.0
+        # Backfaces: geometric_ndotl < 0 → force shadow_mask toward 0 (soft transition)
+        backface_shadow = torch.sigmoid(-shadow_sharpness * geometric_ndotl)
+        shadow_mask = shadow_mask * (1.0 - backface_shadow)
 
     return shadow_mask
 
@@ -547,6 +556,7 @@ def compute_shadows_shadow_map(
     shadow_dilation_kernel: int = 5,
     alpha_threshold: float = 0.01,
     normal_multiplier: torch.Tensor = None,
+    shadow_sharpness: float = 50.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, SunShadowCamera]:
     """
     Shadow mapping - render depth from sun's viewpoint and compare.
@@ -598,6 +608,7 @@ def compute_shadows_shadow_map(
         bias=shadow_bias,
         scene_extent=scene_extent,
         device=device,
+        shadow_sharpness=shadow_sharpness,
         normal_vectors=normal_vectors,
         sun_direction=sun_direction,
         pcf_radius=pcf_radius,
@@ -898,6 +909,7 @@ def compute_shadows_for_gaussians(
     shadow_dilation_kernel: int = 5,
     alpha_threshold: float = 0.01,
     normal_multiplier: torch.Tensor = None,
+    shadow_sharpness: float = 50.0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[SunShadowCamera]]:
     """
     Unified interface for computing shadows using different methods.
@@ -952,6 +964,7 @@ def compute_shadows_for_gaussians(
                 shadow_dilation_kernel=shadow_dilation_kernel,
                 alpha_threshold=alpha_threshold,
                 normal_multiplier=normal_multiplier,
+                shadow_sharpness=shadow_sharpness,
             )
 
     elif method == "ray_march":
